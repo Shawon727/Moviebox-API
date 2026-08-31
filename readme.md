@@ -2,6 +2,8 @@
   <img src="https://h5-static.aoneroom.com/ssrStatic/mbOfficial/public/_nuxt/web-logo.apJjVir2.svg" alt="LOGO" width="200"/>
 </p>
 
+«Note: MovieBox has recently moved toward a paid model, and the API no longer appears to provide 1080p streams, with 480p being the highest available quality. As a result, this project is being archived and is no longer actively maintained.»
+
 # 🎬 MovieBox API (v1.0.0)
 
 [![FastAPI](https://img.shields.io/badge/FastAPI-005571?style=for-the-badge&logo=fastapi)](https://fastapi.tiangolo.com/)
