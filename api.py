@@ -414,6 +414,133 @@ def _pixeldrain_api(url: str) -> Optional[str]:
     except Exception:
         return None
 
+def _pixeldrain_bypass_urls(api_url: str) -> List[str]:
+    """Alternate hosts that often work when pixeldrain rate-limits hotlinking."""
+    urls = [api_url]
+    try:
+        p = urlparse(api_url)
+        fid = p.path.split("/api/file/")[-1].split("?")[0].strip("/")
+        if fid:
+            # common community bypass / mirror patterns
+            urls.append(f"https://pixeldrain.com/api/file/{fid}?download")
+            urls.append(f"https://pixeldrain.dev/api/file/{fid}?download")
+    except Exception:
+        pass
+    # dedupe
+    out, seen = [], set()
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+async def preflight_url(url: str, headers: Optional[dict] = None) -> Optional[str]:
+    """Range probe — only accept non-HTML binary responses (TUI-style)."""
+    h = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Range": "bytes=0-2047",
+        "Accept": "*/*",
+    }
+    if headers:
+        h.update({k: v for k, v in headers.items() if k.lower() != "range"})
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
+            r = await client.get(url, headers=h)
+            if r.status_code not in (200, 206):
+                return None
+            if len(r.content) < 64:
+                return None
+            ctype = (r.headers.get("content-type") or "").lower()
+            if "text/html" in ctype or "text/plain" in ctype and len(r.content) < 500:
+                return None
+            # reject if body looks like HTML
+            head = r.content[:200].lstrip().lower()
+            if head.startswith(b"<!doctype") or head.startswith(b"<html"):
+                return None
+            final = str(r.url)
+            if not _is_playable_direct(final):
+                return None
+            return final
+    except Exception:
+        return None
+    return None
+
+
+async def collect_4k_mirrors(title: str, se: int = 0, ep: int = 0, limit: int = 12) -> List[dict]:
+    """Search 4KHDHub by title → releases → HubCloud resolve → preflight working links only."""
+    mirrors: List[dict] = []
+    clean = re.sub(r"\[[^\]]*\]", " ", title or "")
+    clean = re.sub(r"\([^)]*\)", " ", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    if not clean:
+        return []
+    try:
+        html = await fk_fetch(f"?s={clean}")
+        items = fk_parse_search(html)
+    except Exception:
+        return []
+    if not items:
+        return []
+    # pick best match page
+    page_id = items[0].get("id")
+    if not page_id:
+        return []
+    try:
+        page_html = await fk_fetch(page_id)
+        releases = fk_parse_releases(page_html, se if se else 0, ep if ep else 0)
+    except Exception:
+        return []
+    for rel in releases[:8]:
+        for mirror in (rel.get("mirrors") or [])[:6]:
+            if len(mirrors) >= limit:
+                break
+            url = mirror.get("url") or ""
+            label = mirror.get("label") or "Mirror"
+            fname = rel.get("filename") or rel.get("title") or ""
+            direct_list = []
+            if mirror.get("needs_resolve") or ("hubcloud." in url and "/drive/" in url):
+                try:
+                    direct_list = await resolve_any(url)
+                except Exception:
+                    direct_list = []
+            elif url.startswith("https://"):
+                direct_list = [{"url": url, "label": label, "headers": {"User-Agent": FK_UA, "Referer": url}}]
+            for d in direct_list:
+                du = d.get("url") or ""
+                if not du:
+                    continue
+                # expand pixeldrain variants
+                variants = _pixeldrain_bypass_urls(du) if "pixeldrain." in du else [du]
+                ok = None
+                hdrs = d.get("headers") or {"User-Agent": FK_UA}
+                for v in variants:
+                    ok = await preflight_url(v, hdrs)
+                    if ok:
+                        du = ok
+                        break
+                if not ok:
+                    continue
+                # browser-playable preference
+                low = du.lower()
+                fmt = "MP4" if ".mp4" in low else ("MKV" if ".mkv" in low else "FILE")
+                mirrors.append({
+                    "provider": "4khdhub",
+                    "label": f"{fname[:40] + ' · ' if fname else ''}{d.get('label') or label}"[:70],
+                    "url": du,
+                    "format": fmt,
+                    "type": "direct",
+                    "headers": hdrs,
+                    "play_url": None,  # filled later if needs proxy; file hosts usually not
+                    "filename": fname,
+                })
+                if len(mirrors) >= limit:
+                    break
+        if len(mirrors) >= limit:
+            break
+    return mirrors
+
+
 
 def _unwrap_pages_dev(url: str) -> Optional[str]:
     try:
@@ -434,42 +561,40 @@ def _unwrap_pages_dev(url: str) -> Optional[str]:
 
 
 def _is_playable_direct(url: str) -> bool:
-    """Only real file hosts — reject ads, VPN tips, telegram, random sites."""
+    """Only CDN / file hosts — reject ads, telegram, intermediate download pages."""
     try:
         p = urlparse(url)
         if p.scheme != "https" or not p.hostname:
             return False
         host = p.hostname.lower()
         path = p.path.lower()
+        full = url.lower()
         if host in ("localhost",) or host.endswith(".local"):
             return False
-        if path.endswith(".zip") or "login.php" in path or "logout" in path:
+        if path.endswith((".zip", ".rar", ".7z")) or "login.php" in path or "logout" in path:
             return False
         if "hubcloud." in host and path.startswith("/drive/"):
             return False
-        # junk / non-file hosts
         block = (
-            "google.com", "google.", "t.me", "telegram", "tinyurl.", "bit.ly",
-            "one.one.one.one", "cloudflare.com", "hdhub4u", "facebook.", "youtube.",
-            "instagram.", "twitter.", "x.com", "reddit.", "idm", "how-to",
+            "t.me", "telegram.", "tinyurl.", "bit.ly", "one.one.one.one",
+            "cloudflare.com", "hdhub4u", "facebook.", "youtube.", "instagram.",
+            "twitter.", "x.com", "reddit.", "gamerxyt.", "how-to", "vpn",
+            "idm.", "chrome.", "play.google.",
         )
         if any(b in host for b in block):
             return False
-        label_noise = path in ("/", "") and not any(
-            x in host for x in ("pixeldrain.", "workers.dev", "r2.", "googleapis.com", "cloudflarestorage")
-        )
-        # Prefer hosts that look like CDNs / file storage
+        if "telegram" in full or "t.me/" in full:
+            return False
+        # Allowed CDN / storage hosts (MovieBox-TUI priority list)
         good = (
-            "pixeldrain.", "workers.dev", "r2.dev", "cloudflarestorage", "googleapis.com",
-            "hubcloud.", "gofile.", "workupload.", "streamtape.", "cdn.",
+            "pixeldrain.", "workers.dev", "r2.dev", "cloudflarestorage",
+            "googleusercontent.com", "storage.googleapis.com", "googleapis.com",
+            "gofile.", "workupload.", "streamtape.", "pixel.",
+            "download.", "cdn.", "hubcloud.fans", "hubcloud.cx",
         )
         if any(g in host for g in good):
             return True
-        # file extension in path
         if any(path.endswith(ext) for ext in (".mp4", ".mkv", ".m3u8", ".mpd", ".avi", ".mov", ".webm")):
-            return True
-        # long path often means signed download
-        if len(path) > 40:
             return True
         return False
     except Exception:
@@ -1753,16 +1878,31 @@ async def api_play(
                                 u = L.get("url") or ""
                                 if not u or not _is_playable_direct(u):
                                     continue
+                                # pixeldrain → api download URL variants
+                                candidates = _pixeldrain_bypass_urls(u) if "pixeldrain." in u else [u]
+                                ok = None
+                                hdrs = L.get("headers") or {"User-Agent": FK_UA, "Referer": murl}
+                                for cand in candidates:
+                                    ok = await preflight_url(cand, hdrs)
+                                    if ok:
+                                        u = ok
+                                        break
+                                if not ok or not _is_playable_direct(ok):
+                                    continue  # only working links
+                                u = ok
+                                low = u.lower()
+                                fmt = "MP4" if ".mp4" in low else ("MKV" if ".mkv" in low else "FILE")
                                 hub_links.append({
-                                    "label": f"{rel.get('quality') or '?'} · {(L.get('label') or 'CDN')[:40]}",
+                                    "label": f"{rel.get('quality') or '?'} · {(L.get('label') or 'CDN')[:40]} · {fmt}",
                                     "filename": (rel.get("filename") or "")[:120],
                                     "quality": rel.get("quality"),
                                     "size": rel.get("size"),
                                     "url": u,
                                     "play_url": u,
                                     "type": "hub",
-                                    "format": "FILE",
+                                    "format": fmt,
                                     "provider": "4khdhub",
+                                    "headers": hdrs,
                                 })
                                 if len(hub_links) >= 8:
                                     break
@@ -1794,9 +1934,8 @@ async def api_play(
             "type": "direct",
             "headers": {},
         })
-    # Prefer Hub files when MovieBox is HEVC-only (browser often audio-only)
-    only_hevc = mb_list and all(s.get("hevc") for s in mb_list)
-    uniq = (hub_src + mb_list) if only_hevc else (mb_list + hub_src)
+    # Hub/Pixeldrain first (progressive files), then MovieBox DASH/HEVC
+    uniq = hub_src + mb_list
 
     return {
         "subject_id": sid,
@@ -2070,12 +2209,25 @@ async function watch(media,id,se,ep){
     <select id="qsel" class="se-select" style="display:none;margin:0 6px"></select><div id="hevcTip" style="display:none;width:100%;color:#ffa502;font-size:.8rem;margin-top:6px">This MovieBox stream is HEVC (H.265). Many phones play audio only. Use desktop Chrome/Safari, or open the stream in VLC.</div>
     <button class="src" type="button" onclick="window.__nx()">Next source ↻</button><a class="src" id="extPlay" href="#" target="_blank" rel="noopener">Open stream URL</a>
     <a class="src" href="#/title/${media}/${id}">Details</a></div>
-    <div id="srcs" style="display:flex;flex-wrap:wrap;gap:6px"></div><div id="eps"></div></div>`;
+    <div id="srcs" style="display:flex;flex-wrap:wrap;gap:6px"></div><div id="hublist"></div><div id="eps"></div></div>`;
   try{
     const d=await api(`/api/play?subject_id=${encodeURIComponent(id)}&media=${media}&se=${PS.se}&ep=${PS.ep}`);
     PS.sources=d.sources||[];
     PS.hub=d.hub_links||[];
-    document.getElementById('srcs').innerHTML=PS.sources.map((s,i)=>`<button type="button" class="src ${i===0?'on':''}" data-i="${i}" onclick="PS.idx=${i};renderP()">${esc(s.label)}</button>`).join('')||'<span class="err">No streams</span>';
+    const hub=PS.sources.filter(s=>s.provider==='4khdhub');
+    const other=PS.sources;
+    document.getElementById('srcs').innerHTML=
+      (other.length?('<div style="width:100%;font-size:.75rem;color:var(--mute);margin:4px 0">Sources</div>'):'')+
+      other.map((s,i)=>`<button type="button" class="src ${i===0?'on':''}" data-i="${i}" onclick="PS.idx=${i};renderP()">${esc(s.label)}</button>`).join('')
+      ||'<span class="err">No streams</span>';
+    const hubEl=document.getElementById('hublist');
+    if(hubEl){
+      const hubs=PS.sources.map((s,i)=>({s,i})).filter(x=>x.s.provider==='4khdhub');
+      hubEl.innerHTML=hubs.length
+        ? ('<div style="margin-top:12px"><div style="font-size:.8rem;color:var(--mute);margin-bottom:6px">Hub / Pixeldrain mirrors (working only)</div>'+
+           hubs.map(({s,i})=>`<button type="button" class="src" style="display:block;width:100%;text-align:left;margin:4px 0" onclick="PS.idx=${i};renderP()">▶ ${esc(s.label)} · ${esc(s.format||'')}</button>`).join('')+'</div>')
+        : '';
+    }
     // HubCloud direct file list
     let hubHtml='';
     if(PS.hub.length){
