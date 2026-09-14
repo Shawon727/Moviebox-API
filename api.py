@@ -185,7 +185,7 @@ async def _mb_login(client: httpx.AsyncClient) -> str:
 async def mb_request(method: str, path: str, body: Optional[dict] = None) -> Any:
     global _mb_token, _mb_idx
     body_str = json.dumps(body, separators=(",", ":")) if body is not None else None
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=25.0) as client:
         if not _mb_token:
             await _mb_login(client)
         for attempt in range(2):
@@ -729,51 +729,46 @@ async def health():
 # ----- MovieBo
 
 
+
 # =============================================================================
-# STREAM PROXY — token bag avoids huge Cookie in query string
+# STREAM PROXY — stateless token (base64 payload, works on multi-worker hosts)
 # =============================================================================
-_PROXY_BAG: dict = {}
-_PROXY_BAG_TS: dict = {}
+
+def _b64url_encode(obj: dict) -> str:
+    raw = json.dumps(obj, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
-def _proxy_bag_put(url: str, cookie: str, referer: str, ua: str) -> str:
-    import secrets
-    tok = secrets.token_urlsafe(12)
-    _PROXY_BAG[tok] = {
-        "url": url,
-        "cookie": cookie or "",
-        "referer": referer or "https://sportslive.wine",
-        "ua": ua or _mb_ua or "Mozilla/5.0",
-    }
-    _PROXY_BAG_TS[tok] = time.time()
-    # prune old (>30 min)
-    cutoff = time.time() - 1800
-    for k, ts in list(_PROXY_BAG_TS.items()):
-        if ts < cutoff:
-            _PROXY_BAG.pop(k, None)
-            _PROXY_BAG_TS.pop(k, None)
-    return tok
+def _b64url_decode(s: str) -> dict:
+    pad = "=" * ((4 - len(s) % 4) % 4)
+    return json.loads(base64.urlsafe_b64decode(s + pad))
 
 
 def _proxy_url(src: dict, base: str = "") -> str:
     if src.get("type") != "direct" or not src.get("url"):
         return src.get("url") or ""
     h = src.get("headers") or {}
-    tok = _proxy_bag_put(
-        src["url"],
-        h.get("Cookie") or h.get("cookie") or "",
-        h.get("Referer") or h.get("referer") or "https://sportslive.wine",
-        h.get("User-Agent") or h.get("user-agent") or "",
-    )
+    tok = _b64url_encode({
+        "u": src["url"],
+        "c": h.get("Cookie") or h.get("cookie") or "",
+        "r": h.get("Referer") or h.get("referer") or "https://sportslive.wine",
+        "a": h.get("User-Agent") or h.get("user-agent") or (_mb_ua or "Mozilla/5.0"),
+    })
     return f"/proxy/{tok}"
 
 
 @app.get("/proxy/{token}", tags=["Playback"])
 async def proxy_stream_token(token: str):
-    meta = _PROXY_BAG.get(token)
-    if not meta:
-        raise HTTPException(404, "proxy token expired — reopen play")
-    return await _proxy_fetch(meta["url"], meta["cookie"], meta["referer"], meta["ua"], token)
+    try:
+        meta = _b64url_decode(token)
+    except Exception:
+        raise HTTPException(400, "bad proxy token")
+    return await _proxy_fetch(
+        meta.get("u") or "",
+        meta.get("c") or "",
+        meta.get("r") or "https://sportslive.wine",
+        meta.get("a") or "Mozilla/5.0",
+    )
 
 
 @app.get("/proxy", tags=["Playback"])
@@ -782,17 +777,13 @@ async def proxy_stream_qs(
     cookie: str = Query(""),
     referer: str = Query(""),
     ua: str = Query(""),
-    token: str = Query(""),
 ):
-    if token and token in _PROXY_BAG:
-        meta = _PROXY_BAG[token]
-        return await _proxy_fetch(meta["url"], meta["cookie"], meta["referer"], meta["ua"], token)
     if not url:
-        raise HTTPException(400, "url or token required")
-    return await _proxy_fetch(url, cookie, referer or "https://sportslive.wine", ua or _mb_ua, None)
+        raise HTTPException(400, "url required")
+    return await _proxy_fetch(url, cookie, referer or "https://sportslive.wine", ua or _mb_ua or "Mozilla/5.0")
 
 
-async def _proxy_fetch(url: str, cookie: str, referer: str, ua: str, parent_token: Optional[str]):
+async def _proxy_fetch(url: str, cookie: str, referer: str, ua: str):
     if not url.startswith(("https://", "http://")):
         raise HTTPException(400, "Only http(s) upstream")
     headers = {
@@ -818,17 +809,22 @@ async def _proxy_fetch(url: str, cookie: str, referer: str, ua: str, parent_toke
         is_m3u = ".m3u8" in url.lower() or "mpegurl" in ctype or body[:7] == b"#EXTM3U"
 
         def make_prox(u: str) -> str:
-            u = u.strip().strip('"').strip("'")
+            u = (u or "").strip().strip('"').strip("'")
             if not u or u.startswith("data:"):
                 return u
             if u.startswith("//"):
                 u = "https:" + u
             elif u.startswith("/"):
-                p = urlparse(final_url)
-                u = f"{p.scheme}://{p.netloc}{u}"
+                pr = urlparse(final_url)
+                u = f"{pr.scheme}://{pr.netloc}{u}"
             elif not u.startswith("http"):
                 u = final_url.rsplit("/", 1)[0] + "/" + u
-            tok = _proxy_bag_put(u, cookie, referer, ua)
+            tok = _b64url_encode({
+                "u": u,
+                "c": cookie or "",
+                "r": referer or "https://sportslive.wine",
+                "a": ua or "Mozilla/5.0",
+            })
             return f"/proxy/{tok}"
 
         if is_mpd or is_m3u:
@@ -877,20 +873,21 @@ async def _proxy_fetch(url: str, cookie: str, referer: str, ua: str, parent_toke
         return Response(
             content=body,
             media_type=media_type,
-            headers={
-                "cache-control": "no-store",
-                "access-control-allow-origin": "*",
-            },
+            headers={"cache-control": "no-store", "access-control-allow-origin": "*"},
         )
 
 
 async def _tmdb_search_id(title: str, media: str = "movie"):
     key = os.environ.get("TMDB_API_KEY", "3fd2be6f0c70a2a598f084ddfb75487f")
+    # strip [Hindi], (2024), etc for better match
+    clean = re.sub(r"\[[^\]]*\]", " ", title or "")
+    clean = re.sub(r"\([^)]*\)", " ", clean)
+    clean = re.sub(r"\s+", " ", clean).strip() or (title or "")
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(
                 "https://api.themoviedb.org/3/search/" + ("tv" if media == "tv" else "movie"),
-                params={"api_key": key, "query": title},
+                params={"api_key": key, "query": clean},
             )
             if r.status_code != 200:
                 return None
@@ -1496,7 +1493,7 @@ async def api_play(
         else:
             s["play_url"] = s.get("url")
 
-    # Embed failover via TMDB title lookup when few/no directs
+    # Always try embed backups (more reliable on cloud hosts)
     title = q or ""
     if not title and sid:
         try:
@@ -1505,17 +1502,14 @@ async def api_play(
             title = sub.get("title") or sub.get("name") or ""
         except Exception:
             pass
-    if title and len([x for x in sources if x.get("type") == "direct"]) < 1:
+    if title:
         tid = await _tmdb_search_id(title, media)
         if tid:
             sources.extend(_embed_sources(tid, media, se or 1, ep or 1))
         else:
-            errors["embed"] = "no tmdb match for embeds"
-    elif title:
-        # still append embeds as lower-priority backups
-        tid = await _tmdb_search_id(title, media)
-        if tid:
-            sources.extend(_embed_sources(tid, media, se or 1, ep or 1))
+            errors["embed"] = "no tmdb match for title: " + title[:60]
+    else:
+        errors["embed"] = "no title for embed lookup"
 
     seen = set()
     uniq = []
@@ -1614,9 +1608,18 @@ document.getElementById('mb').onclick=e=>{e.stopPropagation();document.getElemen
 document.onclick=()=>document.getElementById('menu').classList.remove('open');
 document.getElementById('q').onkeydown=e=>{if(e.key==='Enter'&&e.target.value.trim())location.hash='#/search/'+encodeURIComponent(e.target.value.trim())};
 const esc=s=>String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function api(p){const r=await fetch(p);const tx=await r.text();let j=null;try{j=JSON.parse(tx)}catch(e){throw new Error(r.ok?'Invalid JSON from API':('HTTP '+r.status+' — API error'))}if(!r.ok)throw new Error((j&&(j.detail||j.error))||('HTTP '+r.status));return j}catch{throw new Error(text.slice(0,200)||r.status)}
-  if(!r.ok) throw new Error((data&&data.detail)||text.slice(0,200)||('HTTP '+r.status));
-  return data;
+async function api(p){
+  const r=await fetch(p);
+  const tx=await r.text();
+  let j=null;
+  try{ j=JSON.parse(tx); }catch(e){
+    throw new Error(r.ok ? 'Invalid JSON from API' : ('HTTP '+r.status));
+  }
+  if(!r.ok){
+    const d=(j&&(j.detail||j.error||j.message))||('HTTP '+r.status);
+    throw new Error(typeof d==='string'?d:JSON.stringify(d));
+  }
+  return j;
 }
 function card(i){
   const t=i.type||'movie';
