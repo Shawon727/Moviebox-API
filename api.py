@@ -1,6 +1,5 @@
-# StreamHub API v4.0.0
-# MovieBox (mobile HMAC) + 4KHDHub (HTML scrape)
-# Full single-file FastAPI application
+# StreamHub API v4.1.0
+# MovieBox (HMAC) + 4KHDHub + HubCloud direct resolve
 
 import os
 import re
@@ -10,8 +9,8 @@ import hashlib
 import hmac
 import base64
 import random
-from urllib.parse import urlparse, parse_qsl, urlencode, urljoin
-from typing import Optional, Any, List, Dict
+from urllib.parse import urlparse, parse_qsl, urlencode, urljoin, unquote
+from typing import Optional, Any, List, Dict, Tuple
 
 import httpx
 from bs4 import BeautifulSoup
@@ -21,8 +20,13 @@ from fastapi.responses import HTMLResponse
 
 app = FastAPI(
     title="StreamHub API",
-    description="MovieBox + 4KHDHub multi-provider streaming API",
-    version="4.0.0",
+    description=(
+        "Multi-provider streaming API\n\n"
+        "**MovieBox** (`/mb/*`) — search, metadata, DASH/MP4 streams\n"
+        "**4KHDHub** (`/fk/*`) — search, releases, HubCloud resolve\n"
+        "**Tools** (`/tools/*`) — HubCloud/HubDrive direct-link resolver"
+    ),
+    version="4.1.0",
     docs_url="/docs",
 )
 app.add_middleware(
@@ -33,7 +37,7 @@ app.add_middleware(
 )
 
 # =============================================================================
-# MOVIEBOX — mobile API + HMAC-MD5 (from MovieBox-TUI)
+# MOVIEBOX
 # =============================================================================
 
 MB_HOSTS = [
@@ -56,8 +60,7 @@ _mb_ip: str = ""
 
 
 def _b64_decode(s: str) -> bytes:
-    pad = (4 - len(s) % 4) % 4
-    return base64.b64decode(s + ("=" * pad))
+    return base64.b64decode(s + "=" * ((4 - len(s) % 4) % 4))
 
 
 def _md5_hex(data: bytes) -> str:
@@ -69,35 +72,19 @@ def _random_hex(n: int) -> str:
 
 
 def _random_uuid() -> str:
-    return (
-        f"{_random_hex(8)}-{_random_hex(4)}-{_random_hex(4)}-"
-        f"{_random_hex(4)}-{_random_hex(12)}"
-    )
+    return f"{_random_hex(8)}-{_random_hex(4)}-{_random_hex(4)}-{_random_hex(4)}-{_random_hex(12)}"
 
 
 def _ensure_mb_identity() -> None:
     global _mb_ua, _mb_info, _mb_ip
     if _mb_ua:
         return
-    android = random.choice(
-        [
-            ("11", "RP1A.200720.011"),
-            ("12", "S1B.220414.015"),
-            ("13", "TQ2A.230405.003"),
-        ]
-    )
-    device = random.choice(
-        [
-            ("23078RKD5C", "Redmi"),
-            ("2201117TY", "Redmi"),
-            ("M2012K11AG", "Redmi"),
-        ]
-    )
+    android = random.choice([("12", "S1B.220414.015"), ("13", "TQ2A.230405.003")])
+    device = random.choice([("23078RKD5C", "Redmi"), ("M2012K11AG", "Redmi")])
     vcode = random.choice([50020117, 50020118, 50020119, 50020120, 50020121])
     _mb_ua = (
-        f"com.community.oneroom/{vcode} "
-        f"(Linux; U; Android {android[0]}; en_US; {device[0]}; "
-        f"Build/{android[1]}; Cronet/135.0.7012.3)"
+        f"com.community.oneroom/{vcode} (Linux; U; Android {android[0]}; en_US; "
+        f"{device[0]}; Build/{android[1]}; Cronet/135.0.7012.3)"
     )
     _mb_info = json.dumps(
         {
@@ -121,7 +108,7 @@ def _ensure_mb_identity() -> None:
         },
         separators=(",", ":"),
     )
-    prefix = random.choice(["103.241", "49.36", "117.195", "106.198", "122.162"])
+    prefix = random.choice(["103.241", "49.36", "117.195", "106.198"])
     _mb_ip = f"{prefix}.{random.randint(1, 253)}.{random.randint(1, 253)}"
 
 
@@ -136,31 +123,17 @@ def _canonical_string(method: str, url: str, body: Optional[str], ts: int) -> st
     path = parsed.path or "/"
     query = _sorted_query(url)
     canonical_url = f"{path}?{query}" if query else path
-    body_hash = ""
-    body_len = ""
+    body_hash = body_len = ""
     if body is not None:
         raw = body.encode()
         body_hash = _md5_hex(raw[:102400])
         body_len = str(len(raw))
     return "\n".join(
-        [
-            method.upper(),
-            "application/json",
-            "application/json",
-            body_len,
-            str(ts),
-            body_hash,
-            canonical_url,
-        ]
+        [method.upper(), "application/json", "application/json", body_len, str(ts), body_hash, canonical_url]
     )
 
 
-def _mb_headers(
-    method: str,
-    url: str,
-    body: Optional[str] = None,
-    token: Optional[str] = None,
-) -> dict:
+def _mb_headers(method: str, url: str, body: Optional[str] = None, token: Optional[str] = None) -> dict:
     _ensure_mb_identity()
     ts = int(time.time() * 1000)
     canonical = _canonical_string(method, url, body, ts)
@@ -189,12 +162,7 @@ async def _mb_login(client: httpx.AsyncClient) -> str:
         idx = (_mb_idx + i) % len(MB_HOSTS)
         url = MB_HOSTS[idx] + path
         try:
-            resp = await client.post(
-                url,
-                headers=_mb_headers("POST", url, body),
-                content=body,
-                timeout=12.0,
-            )
+            resp = await client.post(url, headers=_mb_headers("POST", url, body), content=body, timeout=12.0)
             if resp.status_code in RETRY_CODES:
                 continue
             data = resp.json()
@@ -211,7 +179,7 @@ async def _mb_login(client: httpx.AsyncClient) -> str:
                 return token
         except Exception:
             continue
-    raise HTTPException(status_code=502, detail="MovieBox visitor-login failed (all hosts)")
+    raise HTTPException(status_code=502, detail="MovieBox visitor-login failed")
 
 
 async def mb_request(method: str, path: str, body: Optional[dict] = None) -> Any:
@@ -228,34 +196,26 @@ async def mb_request(method: str, path: str, body: Optional[dict] = None) -> Any
                 try:
                     headers = _mb_headers(method, url, body_str, _mb_token)
                     if method.upper() == "POST":
-                        resp = await client.post(
-                            url, headers=headers, content=body_str or "{}"
-                        )
+                        resp = await client.post(url, headers=headers, content=body_str or "{}")
                     else:
                         resp = await client.get(url, headers=headers)
-
                     x_user = resp.headers.get("x-user")
                     if x_user:
                         try:
-                            new_tok = json.loads(x_user).get("token")
-                            if new_tok:
-                                _mb_token = new_tok
+                            nt = json.loads(x_user).get("token")
+                            if nt:
+                                _mb_token = nt
                         except Exception:
                             pass
-
                     if resp.status_code in (401, 403) and attempt == 0:
                         _mb_token = None
                         await _mb_login(client)
                         break
-
                     if resp.status_code in RETRY_CODES or resp.status_code != 200:
                         continue
-
                     data = resp.json()
                     _mb_idx = idx
-                    if isinstance(data, dict) and "data" in data:
-                        return data["data"]
-                    return data
+                    return data.get("data", data) if isinstance(data, dict) else data
                 except HTTPException:
                     raise
                 except Exception:
@@ -277,44 +237,34 @@ def _is_dummy_url(url: str) -> bool:
     ]
     if any(m in u for m in markers):
         return True
-    if "macdn.aoneroom.com" in u and "/other/" in u:
-        return True
-    return False
+    return "macdn.aoneroom.com" in u and "/other/" in u
 
 
 def _dash_from_sign_cookie(cookie: str) -> Optional[str]:
-    """Extract real DASH/HLS URL from CloudFront-Policy or urlprefix= (MovieBox-TUI)."""
     if not cookie:
         return None
-
     for part in cookie.split(";"):
         trimmed = part.strip()
         if not trimmed.startswith("CloudFront-Policy="):
             continue
         raw = trimmed[len("CloudFront-Policy=") :].strip()
-        normalized = (
-            raw.replace("-", "+").replace("_", "=").replace("~", "/")
-        )
+        normalized = raw.replace("-", "+").replace("_", "=").replace("~", "/")
         try:
             pad = (4 - len(normalized) % 4) % 4
-            decoded = base64.b64decode(normalized + ("=" * pad))
-            policy = json.loads(decoded)
+            policy = json.loads(base64.b64decode(normalized + ("=" * pad)))
             resource = policy["Statement"][0]["Resource"]
             base = resource.rstrip("*").rstrip("/")
-            if base.startswith("http://") or base.startswith("https://"):
+            if base.startswith("http"):
                 return f"{base}/index.mpd"
         except Exception:
             continue
-
     if "urlprefix=" in cookie:
         try:
             part = cookie.split("urlprefix=")[1].split("&")[0].split(";")[0]
             pad = (4 - len(part) % 4) % 4
             base = base64.b64decode(part + ("=" * pad)).decode("utf-8", errors="ignore")
             if base.startswith("http"):
-                if base.endswith((".mpd", ".m3u8")):
-                    return base
-                return base.rstrip("/") + "/index.mpd"
+                return base if base.endswith((".mpd", ".m3u8")) else base.rstrip("/") + "/index.mpd"
         except Exception:
             pass
     return None
@@ -326,7 +276,6 @@ def _parse_mb_play_info(data: dict, user_agent: str) -> List[dict]:
     streams = data.get("streams") or data.get("streamList") or []
     if not isinstance(streams, list):
         streams = []
-
     for stream in streams:
         if not isinstance(stream, dict):
             continue
@@ -338,37 +287,16 @@ def _parse_mb_play_info(data: dict, user_agent: str) -> List[dict]:
         if not playable or playable in seen:
             continue
         seen.add(playable)
-
-        res = (
-            stream.get("resolutions")
-            or stream.get("resolution")
-            or stream.get("quality")
-            or "?"
+        res = stream.get("resolutions") or stream.get("resolution") or stream.get("quality") or "?"
+        fmt = stream.get("format") or (
+            "DASH" if ".mpd" in playable else "HLS" if ".m3u8" in playable else "MP4"
         )
-        fmt = stream.get("format")
-        if not fmt:
-            if ".mpd" in playable:
-                fmt = "DASH"
-            elif ".m3u8" in playable:
-                fmt = "HLS"
-            else:
-                fmt = "MP4"
-
-        headers = {
-            "User-Agent": user_agent or _mb_ua,
-            "Referer": "https://sportslive.wine",
-        }
+        headers = {"User-Agent": user_agent or _mb_ua, "Referer": "https://sportslive.wine"}
         if cookie:
-            clean = "; ".join(
-                p.strip() for p in cookie.strip(";").split(";") if p.strip()
-            )
-            headers["Cookie"] = clean
-
+            headers["Cookie"] = "; ".join(p.strip() for p in cookie.strip(";").split(";") if p.strip())
         out.append(
             {
-                "resolution": f"{res}p"
-                if str(res).replace(",", "").isdigit()
-                else str(res),
+                "resolution": f"{res}p" if str(res).replace(",", "").isdigit() else str(res),
                 "format": fmt,
                 "url": playable,
                 "size": stream.get("size"),
@@ -379,7 +307,6 @@ def _parse_mb_play_info(data: dict, user_agent: str) -> List[dict]:
                 "source": "play-info",
             }
         )
-
     for detector in data.get("resourceDetectors") or []:
         if not isinstance(detector, dict):
             continue
@@ -399,7 +326,6 @@ def _parse_mb_play_info(data: dict, user_agent: str) -> List[dict]:
                     "source": "resourceDetector",
                 }
             )
-
     for key in ("dash", "hls"):
         for item in data.get(key) or []:
             if not isinstance(item, dict):
@@ -417,17 +343,13 @@ def _parse_mb_play_info(data: dict, user_agent: str) -> List[dict]:
                     "source": key,
                 }
             )
-
     return out
 
 
 async def _mb_resource_links(subject_id: str, se: int, ep: int) -> List[dict]:
     try:
         if se == 0 and ep == 0:
-            path = (
-                f"/wefeed-mobile-bff/subject-api/resource"
-                f"?subjectId={subject_id}&page=1&perPage=30"
-            )
+            path = f"/wefeed-mobile-bff/subject-api/resource?subjectId={subject_id}&page=1&perPage=30"
         else:
             path = (
                 f"/wefeed-mobile-bff/subject-api/resource"
@@ -444,14 +366,7 @@ async def _mb_resource_links(subject_id: str, se: int, ep: int) -> List[dict]:
             if not link or link in seen or _is_dummy_url(link):
                 continue
             seen.add(link)
-            if ".mpd" in link:
-                fmt = "DASH"
-            elif ".m3u8" in link:
-                fmt = "HLS"
-            elif ".mp4" in link:
-                fmt = "MP4"
-            else:
-                fmt = "FILE"
+            fmt = "DASH" if ".mpd" in link else "HLS" if ".m3u8" in link else "MP4" if ".mp4" in link else "FILE"
             out.append(
                 {
                     "resolution": f"{item.get('resolution', '?')}p",
@@ -470,7 +385,220 @@ async def _mb_resource_links(subject_id: str, se: int, ep: int) -> List[dict]:
 
 
 # =============================================================================
-# 4KHDHub — HTML scrape (from MovieBox-TUI selectors)
+# HUBCLOUD / HUBDRIVE RESOLVER
+# =============================================================================
+
+FK_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def _pixeldrain_api(url: str) -> Optional[str]:
+    try:
+        p = urlparse(url)
+        if "pixeldrain." not in (p.hostname or ""):
+            return None
+        path = p.path
+        if path.startswith("/u/"):
+            fid = path[3:].strip("/")
+        elif path.startswith("/api/file/"):
+            fid = path[len("/api/file/") :].strip("/")
+        else:
+            return None
+        if not fid or not re.match(r"^[\w\-]+$", fid):
+            return None
+        host = p.hostname
+        return f"https://{host}/api/file/{fid}?download"
+    except Exception:
+        return None
+
+
+def _unwrap_pages_dev(url: str) -> Optional[str]:
+    try:
+        p = urlparse(url)
+        if not p.hostname or "pages.dev" not in p.hostname:
+            return None
+        qs = dict(parse_qsl(p.query))
+        b64 = qs.get("u")
+        if not b64:
+            return None
+        pad = (4 - len(b64) % 4) % 4
+        decoded = base64.b64decode(b64 + ("=" * pad)).decode("utf-8", errors="ignore")
+        if decoded.startswith("https://"):
+            return decoded
+    except Exception:
+        pass
+    return None
+
+
+def _is_playable_direct(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        if p.scheme != "https" or not p.hostname:
+            return False
+        host = p.hostname.lower()
+        path = p.path.lower()
+        if host in ("localhost",) or host.endswith(".local"):
+            return False
+        if path.endswith(".zip") or "login.php" in path or "logout" in path:
+            return False
+        if "hubcloud." in host and path.startswith("/drive/"):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _score_mirror(url: str, label: str) -> int:
+    v = f"{url} {label}".lower()
+    if any(
+        x in v
+        for x in (
+            "cloudflarestorage.com",
+            "r2.cloudflarestorage.com",
+            "r2.dev",
+            "workers.dev",
+            "fsl server",
+            "watch online",
+        )
+    ):
+        return 0
+    if any(x in v for x in ("storage.googleapis.com", "hubcloud.cx/re/", "hubcloud.fans/re/")):
+        return 1
+    if "pixeldrain" in v:
+        return 2
+    if any(x in v for x in ("googleusercontent.com", "googlevideo.com", "testzip.php", "gpdl.")):
+        return 3
+    return 4
+
+
+async def resolve_hubcloud(drive_url: str) -> List[dict]:
+    """
+    hubcloud.*/drive/xxx  →  direct download / stream URLs
+    """
+    if "hubcloud." not in drive_url or "/drive/" not in drive_url:
+        raise HTTPException(400, "Not a HubCloud /drive/ URL")
+
+    headers = {"User-Agent": FK_UA, "Referer": drive_url}
+    async with httpx.AsyncClient(follow_redirects=True, timeout=25.0, headers=headers) as client:
+        r1 = await client.get(drive_url)
+        if r1.status_code != 200:
+            raise HTTPException(502, f"HubCloud page HTTP {r1.status_code}")
+        soup1 = BeautifulSoup(r1.text, "html.parser")
+
+        resolver_url = None
+        for a in soup1.select(
+            "a#download, a.btn-primary, a.btn-success, a.btn[href*='/download/'], "
+            "a[href*='/download/'], a[href*='gamerxyt.com'], a[href*='hubcloud.php']"
+        ):
+            href = a.get("href") or ""
+            if href.startswith("https://"):
+                resolver_url = href
+                break
+        if not resolver_url:
+            m = re.search(r"var\s+url\s*=\s*['\"](https://[^'\"]+)['\"]", r1.text)
+            if m:
+                resolver_url = m.group(1)
+        if not resolver_url:
+            raise HTTPException(502, "HubCloud: download button not found")
+
+        r2 = await client.get(resolver_url, headers={**headers, "Referer": drive_url})
+        if r2.status_code != 200:
+            raise HTTPException(502, f"HubCloud resolver HTTP {r2.status_code}")
+        html2 = r2.text
+        soup2 = BeautifulSoup(html2, "html.parser")
+
+        candidates: List[Tuple[int, str, str]] = []
+
+        for prefix in (
+            "https://pixeldrain.dev/u/",
+            "https://pixeldrain.com/u/",
+            "https://pixeldrain.dev/api/file/",
+            "https://pixeldrain.com/api/file/",
+        ):
+            pos = 0
+            while True:
+                i = html2.find(prefix, pos)
+                if i < 0:
+                    break
+                end = i
+                while end < len(html2) and html2[end] not in "\"' \t\n\r<>\\":
+                    end += 1
+                chunk = html2[i:end]
+                api = _pixeldrain_api(chunk)
+                if api:
+                    candidates.append((_score_mirror(api, "PixelDrain"), api, "PixelDrain"))
+                pos = end
+
+        for a in soup2.select("a[href]"):
+            href = (a.get("href") or "").strip()
+            if not href.startswith("https://"):
+                continue
+            label = a.get_text(" ", strip=True) or "Direct"
+            unwrapped = _unwrap_pages_dev(href)
+            if unwrapped and _is_playable_direct(unwrapped):
+                candidates.append((_score_mirror(unwrapped, "Watch Online"), unwrapped, "Watch Online"))
+                continue
+            pd = _pixeldrain_api(href)
+            if pd:
+                candidates.append((_score_mirror(pd, label), pd, "PixelDrain"))
+                continue
+            if _is_playable_direct(href):
+                candidates.append((_score_mirror(href, label), href, label[:80]))
+
+        for a in soup2.select("a#fsl, a[id*=fsl]"):
+            href = a.get("href") or ""
+            if href.startswith("https://") and _is_playable_direct(href):
+                candidates.append((0, href, "FSL Server"))
+
+        candidates.sort(key=lambda x: x[0])
+        seen = set()
+        results = []
+        for score, url, label in candidates:
+            if url in seen:
+                continue
+            seen.add(url)
+            results.append(
+                {
+                    "label": label,
+                    "url": url,
+                    "priority": score,
+                    "direct": True,
+                }
+            )
+        if not results:
+            raise HTTPException(502, "HubCloud: no direct links extracted")
+        return results
+
+
+async def resolve_hubdrive(file_url: str) -> List[dict]:
+    if "hubdrive." not in file_url:
+        raise HTTPException(400, "Not a HubDrive URL")
+    headers = {"User-Agent": FK_UA, "Referer": file_url}
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20.0, headers=headers) as client:
+        r = await client.get(file_url)
+        if r.status_code != 200:
+            raise HTTPException(502, f"HubDrive HTTP {r.status_code}")
+        soup = BeautifulSoup(r.text, "html.parser")
+        for a in soup.select("a[href]"):
+            href = a.get("href") or ""
+            if "hubcloud." in href and "/drive/" in href:
+                return await resolve_hubcloud(href)
+    raise HTTPException(502, "HubDrive: no HubCloud mirror found")
+
+
+async def resolve_any(url: str) -> List[dict]:
+    u = url.strip()
+    if "hubcloud." in u and "/drive/" in u:
+        return await resolve_hubcloud(u)
+    if "hubdrive." in u:
+        return await resolve_hubdrive(u)
+    raise HTTPException(400, "Supported: hubcloud.*/drive/... or hubdrive.*/file/...")
+
+
+# =============================================================================
+# 4KHDHub scrape
 # =============================================================================
 
 FK_BASES = [
@@ -479,45 +607,33 @@ FK_BASES = [
     "https://4khdhub.click/",
     "https://4khdhub.ink/",
 ]
-FK_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
 _fk_base = FK_BASES[0]
 
 
 async def fk_fetch(path_or_url: str) -> str:
     global _fk_base
-    async with httpx.AsyncClient(
-        follow_redirects=True,
-        timeout=20.0,
-        headers={"User-Agent": FK_UA},
-    ) as client:
-        if path_or_url.startswith("http"):
-            candidates = [path_or_url]
-        else:
-            candidates = [urljoin(base, path_or_url.lstrip("/")) for base in FK_BASES]
-
-        last_error = None
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20.0, headers={"User-Agent": FK_UA}) as client:
+        candidates = (
+            [path_or_url]
+            if path_or_url.startswith("http")
+            else [urljoin(b, path_or_url.lstrip("/")) for b in FK_BASES]
+        )
+        last_err = None
         for url in candidates:
             try:
                 resp = await client.get(url)
                 if resp.status_code == 200 and len(resp.text) > 400:
-                    parsed = urlparse(str(resp.url))
-                    _fk_base = f"{parsed.scheme}://{parsed.netloc}/"
+                    p = urlparse(str(resp.url))
+                    _fk_base = f"{p.scheme}://{p.netloc}/"
                     return resp.text
-            except Exception as exc:
-                last_error = exc
-                continue
-    raise HTTPException(
-        status_code=502,
-        detail=f"4KHDHub unreachable: {last_error}",
-    )
+            except Exception as e:
+                last_err = e
+        raise HTTPException(502, f"4KHDHub unreachable: {last_err}")
 
 
 def fk_parse_search(html: str) -> List[dict]:
     soup = BeautifulSoup(html, "html.parser")
-    items: List[dict] = []
+    items = []
     for card in soup.select("a.movie-card"):
         href = card.get("href") or ""
         title_el = card.select_one(".movie-card-title")
@@ -528,9 +644,9 @@ def fk_parse_search(html: str) -> List[dict]:
         meta_text = meta_el.get_text(" ", strip=True) if meta_el else ""
         img = card.select_one("img")
         year = None
-        match = re.search(r"(19|20)\d{2}", meta_text or title)
-        if match:
-            year = match.group(0)
+        m = re.search(r"(19|20)\d{2}", meta_text or title)
+        if m:
+            year = m.group(0)
         path = urlparse(href).path if href.startswith("http") else href
         items.append(
             {
@@ -549,30 +665,20 @@ def fk_parse_releases(html: str, season: int = 0, episode: int = 0) -> List[dict
     soup = BeautifulSoup(html, "html.parser")
     item_sel = "#episodes .episode-download-item" if season > 0 else ".download-item"
     title_sel = ".episode-file-title" if season > 0 else ".file-title"
-    releases: List[dict] = []
-
+    releases = []
     for item in soup.select(item_sel):
         title_el = item.select_one(title_sel)
         filename = title_el.get_text(strip=True) if title_el else ""
-        if not filename:
+        if not filename or filename.lower().endswith((".zip", ".rar", ".7z")):
             continue
-        lower = filename.lower()
-        if lower.endswith((".zip", ".rar", ".7z")):
-            continue
-
         if season > 0:
             m = re.search(r"S0*(\d+)\s*E0*(\d+)", filename, re.I)
-            if not m:
+            if not m or int(m.group(1)) != season or int(m.group(2)) != episode:
                 continue
-            if int(m.group(1)) != season or int(m.group(2)) != episode:
-                continue
-
         mirrors = []
         for link in item.select("a[href]"):
             href = link.get("href") or ""
-            if not href.startswith("https://"):
-                continue
-            if "logout" in href.lower():
+            if not href.startswith("https://") or "logout" in href.lower():
                 continue
             mirrors.append(
                 {
@@ -583,13 +689,11 @@ def fk_parse_releases(html: str, season: int = 0, episode: int = 0) -> List[dict
             )
         if not mirrors:
             continue
-
         quality = None
         for q in ("2160", "1080", "720", "480", "360"):
             if q in filename:
                 quality = f"{q}p"
                 break
-
         size_el = item.select_one(".badge-size, .badge")
         releases.append(
             {
@@ -603,212 +707,227 @@ def fk_parse_releases(html: str, season: int = 0, episode: int = 0) -> List[dict
 
 
 # =============================================================================
-# UI — StreamHub (fresh, not Walter clone)
+# UI
 # =============================================================================
 
-UI_HTML = """<!DOCTYPE html>
+UI_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>StreamHub</title>
-  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    :root {
-      --bg: #0a0b0f;
-      --panel: #12141c;
-      --line: #1e2230;
-      --text: #e8eaf0;
-      --mute: #7a8194;
-      --g: #39ff14;
-      --c: #00e5ff;
-      --m: #c77dff;
-    }
-    body {
-      font-family: Syne, system-ui, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      min-height: 100vh;
-      background-image:
-        radial-gradient(ellipse 80% 50% at 20% -10%, rgba(57,255,20,.08), transparent),
-        radial-gradient(ellipse 60% 40% at 90% 10%, rgba(0,229,255,.07), transparent),
-        radial-gradient(ellipse 50% 30% at 50% 100%, rgba(199,125,255,.06), transparent);
-    }
-    .wrap { max-width: 1080px; margin: 0 auto; padding: 48px 20px 80px; }
-    .top {
-      display: flex; align-items: center; justify-content: space-between;
-      margin-bottom: 48px; flex-wrap: wrap; gap: 16px;
-    }
-    .logo { font-size: 1.75rem; font-weight: 800; letter-spacing: -0.04em; }
-    .logo span {
-      background: linear-gradient(135deg, var(--g), var(--c));
-      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    }
-    .pill {
-      font-family: "IBM Plex Mono", monospace; font-size: 0.7rem;
-      padding: 6px 12px; border: 1px solid var(--line); border-radius: 999px;
-      color: var(--mute); background: var(--panel);
-    }
-    .hero { margin-bottom: 40px; }
-    .hero h1 {
-      font-size: clamp(1.8rem, 5vw, 2.6rem); font-weight: 800;
-      line-height: 1.15; margin-bottom: 12px; letter-spacing: -0.03em;
-    }
-    .hero p {
-      color: var(--mute); font-size: 1.05rem; max-width: 520px;
-      line-height: 1.5; font-weight: 500;
-    }
-    .providers {
-      display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-      gap: 16px; margin-bottom: 36px;
-    }
-    .prov {
-      background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
-      padding: 22px; position: relative; overflow: hidden; transition: 0.25s;
-    }
-    .prov:hover { border-color: #2a3145; transform: translateY(-3px); }
-    .prov::before {
-      content: ""; position: absolute; top: 0; left: 0; right: 0; height: 2px;
-      background: var(--accent, var(--g));
-    }
-    .prov.mb { --accent: var(--g); }
-    .prov.fk { --accent: var(--c); }
-    .prov.ag { --accent: var(--m); }
-    .prov h3 {
-      font-size: 1.1rem; margin-bottom: 6px;
-      display: flex; align-items: center; gap: 8px;
-    }
-    .prov .tag {
-      font-family: "IBM Plex Mono", monospace; font-size: 0.65rem;
-      color: var(--accent);
-      border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
-      padding: 2px 8px; border-radius: 6px;
-    }
-    .prov p {
-      color: var(--mute); font-size: 0.88rem; line-height: 1.45; margin-bottom: 14px;
-    }
-    .ep {
-      font-family: "IBM Plex Mono", monospace; font-size: 0.72rem;
-      background: #0d0f14; border: 1px solid var(--line); padding: 10px 12px;
-      border-radius: 10px; color: var(--c); margin-bottom: 12px; word-break: break-all;
-    }
-    .btn {
-      display: inline-flex; align-items: center; justify-content: center;
-      padding: 11px 16px; border-radius: 10px; background: var(--text);
-      color: var(--bg); font-weight: 700; font-size: 0.85rem;
-      text-decoration: none; transition: 0.2s;
-    }
-    .btn:hover { opacity: 0.9; transform: scale(1.02); }
-    .btn.ghost {
-      background: transparent; color: var(--text); border: 1px solid var(--line);
-    }
-    .btn.ghost:hover { border-color: var(--mute); }
-    .grid2 {
-      display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 12px;
-    }
-    .card {
-      background: var(--panel); border: 1px solid var(--line);
-      border-radius: 14px; padding: 18px;
-    }
-    .card h4 { font-size: 0.95rem; margin-bottom: 8px; }
-    .foot {
-      margin-top: 48px; text-align: center; color: var(--mute);
-      font-size: 0.8rem; font-family: "IBM Plex Mono", monospace;
-    }
-  </style>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>StreamHub</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#07080c;--panel:#10121a;--line:#1c2030;--text:#eef0f6;--mute:#7b8296;
+--g:#39ff14;--c:#00e5ff;--m:#c77dff;--o:#ff8a3d}
+html{scroll-behavior:smooth}
+body{font-family:Syne,system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;
+background-image:radial-gradient(ellipse 90% 60% at 10% -20%,rgba(57,255,20,.1),transparent),
+radial-gradient(ellipse 70% 50% at 100% 0%,rgba(0,229,255,.08),transparent),
+radial-gradient(ellipse 50% 40% at 50% 120%,rgba(199,125,255,.07),transparent)}
+.orb{position:fixed;border-radius:50%;filter:blur(80px);opacity:.35;pointer-events:none;z-index:0;animation:float 12s ease-in-out infinite}
+.orb.a{width:280px;height:280px;background:var(--g);top:-40px;left:-60px}
+.orb.b{width:220px;height:220px;background:var(--c);top:20%;right:-40px;animation-delay:-4s}
+.orb.c{width:200px;height:200px;background:var(--m);bottom:10%;left:30%;animation-delay:-7s}
+@keyframes float{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(20px,-24px) scale(1.08)}}
+.wrap{position:relative;z-index:1;max-width:1100px;margin:0 auto;padding:40px 18px 100px}
+.top{display:flex;align-items:center;justify-content:space-between;margin-bottom:40px;flex-wrap:wrap;gap:12px;
+animation:fadeUp .7s ease both}
+.logo{font-size:1.85rem;font-weight:800;letter-spacing:-.04em}
+.logo span{background:linear-gradient(135deg,var(--g),var(--c));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.pill{font-family:"IBM Plex Mono",monospace;font-size:.68rem;padding:6px 12px;border:1px solid var(--line);
+border-radius:999px;color:var(--mute);background:rgba(16,18,26,.8);backdrop-filter:blur(8px)}
+.hero{margin-bottom:36px;animation:fadeUp .8s .1s ease both}
+.hero h1{font-size:clamp(2rem,5.5vw,2.9rem);font-weight:800;line-height:1.12;margin-bottom:12px;letter-spacing:-.03em}
+.hero p{color:var(--mute);font-size:1.05rem;max-width:540px;line-height:1.55;font-weight:500}
+@keyframes fadeUp{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:none}}
+.providers{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:14px;margin-bottom:28px}
+.prov{background:rgba(16,18,26,.85);border:1px solid var(--line);border-radius:18px;padding:22px;
+position:relative;overflow:hidden;transition:transform .3s,border-color .3s,box-shadow .3s;
+animation:fadeUp .75s ease both;backdrop-filter:blur(12px)}
+.prov:nth-child(1){animation-delay:.15s}.prov:nth-child(2){animation-delay:.22s}.prov:nth-child(3){animation-delay:.29s}
+.prov:nth-child(4){animation-delay:.36s}
+.prov:hover{transform:translateY(-6px);border-color:#2c3448;box-shadow:0 18px 40px rgba(0,0,0,.35)}
+.prov::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:var(--accent)}
+.prov.mb{--accent:var(--g)}.prov.fk{--accent:var(--c)}.prov.ag{--accent:var(--m)}.prov.tl{--accent:var(--o)}
+.prov h3{font-size:1.08rem;margin-bottom:6px;display:flex;align-items:center;gap:8px}
+.tag{font-family:"IBM Plex Mono",monospace;font-size:.62rem;color:var(--accent);
+border:1px solid color-mix(in srgb,var(--accent) 45%,transparent);padding:2px 8px;border-radius:6px}
+.prov p{color:var(--mute);font-size:.86rem;line-height:1.45;margin-bottom:14px}
+.ep{font-family:"IBM Plex Mono",monospace;font-size:.7rem;background:#0a0c12;border:1px solid var(--line);
+padding:10px 12px;border-radius:10px;color:var(--c);margin-bottom:12px;word-break:break-all}
+.btn{display:inline-flex;align-items:center;justify-content:center;padding:11px 16px;border-radius:11px;
+background:var(--text);color:var(--bg);font-weight:700;font-size:.84rem;text-decoration:none;
+transition:transform .2s,opacity .2s,box-shadow .2s}
+.btn:hover{opacity:.92;transform:scale(1.03);box-shadow:0 8px 24px rgba(57,255,20,.15)}
+.btn.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
+.btn.ghost:hover{border-color:var(--mute);box-shadow:none}
+.section{margin-top:42px;animation:fadeUp .8s .2s ease both}
+.section h2{font-size:1.25rem;margin-bottom:14px;display:flex;align-items:center;gap:10px}
+.section h2::after{content:"";flex:1;height:1px;background:var(--line)}
+.guide{display:grid;gap:10px}
+.g-row{background:rgba(16,18,26,.75);border:1px solid var(--line);border-radius:14px;padding:14px 16px;
+display:grid;grid-template-columns:110px 1fr;gap:12px;align-items:start;transition:border-color .2s}
+.g-row:hover{border-color:#2a3144}
+.g-method{font-family:"IBM Plex Mono",monospace;font-size:.68rem;font-weight:500;color:var(--bg);
+background:var(--g);padding:4px 8px;border-radius:6px;text-align:center;align-self:start}
+.g-method.get{background:var(--c)}.g-method.tool{background:var(--o)}
+.g-body code{font-family:"IBM Plex Mono",monospace;font-size:.78rem;color:var(--c);display:block;margin-bottom:4px}
+.g-body span{color:var(--mute);font-size:.82rem;line-height:1.4}
+.foot{margin-top:48px;text-align:center;color:var(--mute);font-size:.78rem;font-family:"IBM Plex Mono",monospace}
+@media(max-width:560px){.g-row{grid-template-columns:1fr}}
+</style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="top">
-      <div class="logo">Stream<span>Hub</span></div>
-      <div class="pill">v4.0 · multi-provider</div>
-    </div>
-    <div class="hero">
-      <h1>One API.<br />Multiple sources.</h1>
-      <p>MovieBox mobile streams + 4KHDHub releases. Clean endpoints with playback headers.</p>
-    </div>
-    <div class="providers">
-      <div class="prov mb">
-        <h3>MovieBox <span class="tag">HMAC</span></h3>
-        <p>Mobile API · DASH + MP4 · signCookie bypass · resource links</p>
-        <div class="ep">/mb/search?q= · /mb/stream/{id}</div>
-        <a class="btn" href="/mb/search?q=Avatar" target="_blank">Try search</a>
-      </div>
-      <div class="prov fk">
-        <h3>4KHDHub <span class="tag">SCRAPE</span></h3>
-        <p>4K / BluRay releases · multi-mirror · series episodes</p>
-        <div class="ep">/fk/search?q= · /fk/stream?id=</div>
-        <a class="btn" href="/fk/search?q=Dune" target="_blank">Try search</a>
-      </div>
-      <div class="prov ag">
-        <h3>Aggregate <span class="tag">ALL</span></h3>
-        <p>Search both providers in one call</p>
-        <div class="ep">/search?q=Avatar</div>
-        <a class="btn" href="/search?q=Avatar" target="_blank">Search all</a>
-      </div>
-    </div>
-    <div class="grid2">
-      <div class="card">
-        <h4>Docs</h4>
-        <div class="ep">/docs</div>
-        <a class="btn ghost" href="/docs">Swagger UI</a>
-      </div>
-      <div class="card">
-        <h4>Health</h4>
-        <div class="ep">/health</div>
-        <a class="btn ghost" href="/health">Check</a>
-      </div>
-      <div class="card">
-        <h4>Movie stream</h4>
-        <div class="ep">/mb/stream/{id}?se=0&amp;ep=0</div>
-      </div>
-      <div class="card">
-        <h4>Series stream</h4>
-        <div class="ep">/mb/stream/{id}?se=1&amp;ep=1</div>
-      </div>
-    </div>
-    <div class="foot">StreamHub · independent client · not affiliated</div>
+<div class="orb a"></div><div class="orb b"></div><div class="orb c"></div>
+<div class="wrap">
+  <div class="top">
+    <div class="logo">Stream<span>Hub</span></div>
+    <div class="pill">v4.1 · multi-provider</div>
   </div>
+  <div class="hero">
+    <h1>One API.<br/>Multiple sources.</h1>
+    <p>MovieBox mobile streams, 4KHDHub releases, and HubCloud direct links — with clear endpoints and playback headers.</p>
+  </div>
+
+  <div class="providers">
+    <div class="prov mb">
+      <h3>MovieBox <span class="tag">HMAC</span></h3>
+      <p>Search · detail · DASH/MP4 streams · captions</p>
+      <div class="ep">/mb/search · /mb/stream/{id}</div>
+      <a class="btn" href="/mb/search?q=Avatar" target="_blank">Try search</a>
+    </div>
+    <div class="prov fk">
+      <h3>4KHDHub <span class="tag">SCRAPE</span></h3>
+      <p>4K releases · mirrors · optional auto-resolve</p>
+      <div class="ep">/fk/search · /fk/stream?id=</div>
+      <a class="btn" href="/fk/search?q=Dune" target="_blank">Try search</a>
+    </div>
+    <div class="prov tl">
+      <h3>HubCloud <span class="tag">RESOLVE</span></h3>
+      <p>Turn hubcloud.ist/drive/… into direct CDN links</p>
+      <div class="ep">/tools/resolve?url=</div>
+      <a class="btn" href="/docs#/default/resolve_any_tools_resolve_get" target="_blank">Open docs</a>
+    </div>
+    <div class="prov ag">
+      <h3>Aggregate <span class="tag">ALL</span></h3>
+      <p>Search MovieBox + 4KHDHub together</p>
+      <div class="ep">/search?q=Avatar</div>
+      <a class="btn" href="/search?q=Avatar" target="_blank">Search all</a>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>How each API works</h2>
+    <div class="guide">
+      <div class="g-row">
+        <div class="g-method get">GET</div>
+        <div class="g-body">
+          <code>/mb/search?q=Avatar&amp;page=1</code>
+          <span>MovieBox search. Returns subject_id, poster, year, type.</span>
+        </div>
+      </div>
+      <div class="g-row">
+        <div class="g-method get">GET</div>
+        <div class="g-body">
+          <code>/mb/detail/{subject_id}</code>
+          <span>Full metadata + seasons for series.</span>
+        </div>
+      </div>
+      <div class="g-row">
+        <div class="g-method get">GET</div>
+        <div class="g-body">
+          <code>/mb/stream/{subject_id}?se=0&amp;ep=0</code>
+          <span>Playable sources (DASH/MP4/HLS) with Cookie/UA headers. Movie: se=0&amp;ep=0. Series: se=1&amp;ep=1.</span>
+        </div>
+      </div>
+      <div class="g-row">
+        <div class="g-method get">GET</div>
+        <div class="g-body">
+          <code>/mb/captions/{subject_id}?resource_id=</code>
+          <span>External subtitles for a stream id.</span>
+        </div>
+      </div>
+      <div class="g-row">
+        <div class="g-method get">GET</div>
+        <div class="g-body">
+          <code>/fk/search?q=Dune</code>
+          <span>4KHDHub search. Returns page path id for detail/stream.</span>
+        </div>
+      </div>
+      <div class="g-row">
+        <div class="g-method get">GET</div>
+        <div class="g-body">
+          <code>/fk/stream?id=/path/&amp;se=0&amp;ep=0&amp;resolve=true</code>
+          <span>Release list + mirrors. resolve=true expands HubCloud to direct CDN links.</span>
+        </div>
+      </div>
+      <div class="g-row">
+        <div class="g-method tool">GET</div>
+        <div class="g-body">
+          <code>/tools/resolve?url=https://hubcloud.ist/drive/xxxx</code>
+          <span>Standalone HubCloud/HubDrive → direct download URLs (PixelDrain, R2, FSL…).</span>
+        </div>
+      </div>
+      <div class="g-row">
+        <div class="g-method get">GET</div>
+        <div class="g-body">
+          <code>/search?q=Avatar</code>
+          <span>Combined MovieBox + 4KHDHub results in one response.</span>
+        </div>
+      </div>
+      <div class="g-row">
+        <div class="g-method get">GET</div>
+        <div class="g-body">
+          <code>/docs</code>
+          <span>Interactive Swagger — try every endpoint live.</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section" style="margin-top:28px">
+    <h2>Quick links</h2>
+    <div style="display:flex;flex-wrap:wrap;gap:10px">
+      <a class="btn ghost" href="/docs">Swagger</a>
+      <a class="btn ghost" href="/health">Health</a>
+      <a class="btn ghost" href="/mb/home">MB Home</a>
+      <a class="btn ghost" href="/openapi.json">OpenAPI JSON</a>
+    </div>
+  </div>
+
+  <div class="foot">StreamHub v4.1 · not affiliated with MovieBox or 4KHDHub</div>
+</div>
 </body>
 </html>
 """
 
 
 # =============================================================================
-# Routes
+# ROUTES
 # =============================================================================
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse, tags=["Meta"])
 async def root():
     return HTMLResponse(UI_HTML)
 
 
-@app.get("/health")
+@app.get("/health", tags=["Meta"])
 async def health():
-    return {
-        "ok": True,
-        "version": "4.0.0",
-        "providers": ["moviebox", "4khdhub"],
-    }
+    return {"ok": True, "version": "4.1.0", "providers": ["moviebox", "4khdhub", "hubcloud-resolve"]}
 
 
-# ----- MovieBox (/mb/...) -----
+# ----- MovieBox -----
 
 
-@app.get("/mb/search")
-async def mb_search(q: str = Query(..., min_length=1), page: int = 1):
+@app.get("/mb/search", tags=["MovieBox"])
+async def mb_search(q: str = Query(..., min_length=1, description="Search query"), page: int = 1):
+    """Search MovieBox catalog. Use returned `subject_id` with /mb/stream and /mb/detail."""
     data = await mb_request(
         "POST",
         "/wefeed-mobile-bff/subject-api/search/v2",
-        {
-            "keyword": q,
-            "page": page,
-            "perPage": 20,
-            "subjectType": 0,
-        },
+        {"keyword": q, "page": page, "perPage": 20, "subjectType": 0},
     )
     items: List[dict] = []
     raw: List[Any] = []
@@ -817,7 +936,6 @@ async def mb_search(q: str = Query(..., min_length=1), page: int = 1):
         raw = results[0].get("subjects") or []
     if not raw:
         raw = data.get("list") or data.get("items") or data.get("subjects") or []
-
     for s in raw:
         if isinstance(s, dict) and "subject" in s:
             s = s["subject"]
@@ -825,11 +943,7 @@ async def mb_search(q: str = Query(..., min_length=1), page: int = 1):
             continue
         sid = s.get("subjectId") or s.get("id")
         cover = s.get("cover") or {}
-        poster = None
-        if isinstance(cover, dict):
-            poster = cover.get("url")
-        else:
-            poster = s.get("coverUrl") or cover
+        poster = cover.get("url") if isinstance(cover, dict) else (s.get("coverUrl") or cover)
         items.append(
             {
                 "name": s.get("title") or s.get("name"),
@@ -838,57 +952,46 @@ async def mb_search(q: str = Query(..., min_length=1), page: int = 1):
                 "slug": s.get("detailPath"),
                 "year": (s.get("releaseDate") or "")[:4] or None,
                 "rating": s.get("imdbRatingValue"),
-                "type": "series"
-                if (s.get("subjectType") or s.get("stype")) == 2
-                else "movie",
+                "type": "series" if (s.get("subjectType") or s.get("stype")) == 2 else "movie",
                 "provider": "moviebox",
             }
         )
-    return {
-        "provider": "moviebox",
-        "query": q,
-        "page": page,
-        "total": data.get("total") or len(items),
-        "items": items,
-    }
+    return {"provider": "moviebox", "query": q, "page": page, "total": data.get("total") or len(items), "items": items}
 
 
-@app.get("/mb/detail/{subject_id}")
+@app.get("/mb/detail/{subject_id}", tags=["MovieBox"])
 async def mb_detail(subject_id: str):
-    data = await mb_request(
-        "GET", f"/wefeed-mobile-bff/subject-api/get?subjectId={subject_id}"
-    )
+    """Full metadata for a MovieBox title. Series include season info."""
+    data = await mb_request("GET", f"/wefeed-mobile-bff/subject-api/get?subjectId={subject_id}")
     subject = data.get("subject") or data
-    stype = subject.get("subjectType") or subject.get("stype") or 1
-    if stype == 2:
+    if (subject.get("subjectType") or subject.get("stype") or 1) == 2:
         try:
-            seasons = await mb_request(
-                "GET",
-                f"/wefeed-mobile-bff/subject-api/season-info?subjectId={subject_id}",
+            subject["seasons"] = await mb_request(
+                "GET", f"/wefeed-mobile-bff/subject-api/season-info?subjectId={subject_id}"
             )
-            subject["seasons"] = seasons
         except Exception:
             pass
     return {"provider": "moviebox", "data": subject}
 
 
-@app.get("/mb/stream/{subject_id}")
+@app.get("/mb/stream/{subject_id}", tags=["MovieBox"])
 async def mb_stream(subject_id: str, se: int = 0, ep: int = 0):
+    """
+    Playable stream URLs (DASH / MP4 / HLS).
+    - Movie: se=0 & ep=0
+    - Series: se=1&ep=1 …
+    Each source includes `headers` (Cookie, User-Agent) required by the CDN.
+    """
     if se == 0 and ep == 0:
         path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}"
     else:
-        path = (
-            f"/wefeed-mobile-bff/subject-api/play-info/v2"
-            f"?subjectId={subject_id}&se={se}&ep={ep}"
-        )
+        path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}&se={se}&ep={ep}"
     try:
         data = await mb_request("GET", path)
     except HTTPException:
         data = await mb_request("GET", path.replace("/play-info/v2", "/play-info"))
-
     if not isinstance(data, dict):
         data = {}
-
     sources = _parse_mb_play_info(data, _mb_ua)
     extra = await _mb_resource_links(subject_id, se, ep)
     seen = {s["url"] for s in sources}
@@ -896,7 +999,6 @@ async def mb_stream(subject_id: str, se: int = 0, ep: int = 0):
         if item["url"] not in seen:
             sources.append(item)
             seen.add(item["url"])
-
     return {
         "provider": "moviebox",
         "subject_id": subject_id,
@@ -905,27 +1007,20 @@ async def mb_stream(subject_id: str, se: int = 0, ep: int = 0):
         "count": len(sources),
         "has_resource": len(sources) > 0,
         "sources": sources,
-        "note": None
-        if sources
-        else "No playable sources (try another id / episode)",
+        "note": None if sources else "No playable sources",
     }
 
 
-@app.get("/mb/home")
+@app.get("/mb/home", tags=["MovieBox"])
 async def mb_home(page: int = 1):
-    data = await mb_request(
-        "GET", f"/wefeed-mobile-bff/tab-operating?page={page}&tabId=1&version="
-    )
+    """Homepage operating tabs from MovieBox."""
+    data = await mb_request("GET", f"/wefeed-mobile-bff/tab-operating?page={page}&tabId=1&version=")
     return {"provider": "moviebox", "data": data}
 
 
-@app.get("/mb/captions/{subject_id}")
-async def mb_captions(
-    subject_id: str,
-    resource_id: str = "",
-    se: int = 0,
-    ep: int = 0,
-):
+@app.get("/mb/captions/{subject_id}", tags=["MovieBox"])
+async def mb_captions(subject_id: str, resource_id: str = "", se: int = 0, ep: int = 0):
+    """Subtitles for a MovieBox stream. Pass resource_id from /mb/stream sources[].id."""
     if not resource_id:
         stream_data = await mb_stream(subject_id, se, ep)
         for src in stream_data.get("sources") or []:
@@ -936,15 +1031,9 @@ async def mb_captions(
         return {"count": 0, "captions": []}
     data = await mb_request(
         "GET",
-        f"/wefeed-mobile-bff/subject-api/get-ext-captions"
-        f"?subjectId={subject_id}&resourceId={resource_id}",
+        f"/wefeed-mobile-bff/subject-api/get-ext-captions?subjectId={subject_id}&resourceId={resource_id}",
     )
-    captions = (
-        data.get("extCaptions")
-        or data.get("captions")
-        or data.get("list")
-        or []
-    )
+    captions = data.get("extCaptions") or data.get("captions") or data.get("list") or []
     return {
         "provider": "moviebox",
         "subject_id": subject_id,
@@ -954,34 +1043,28 @@ async def mb_captions(
     }
 
 
-# ----- 4KHDHub (/fk/...) -----
+# ----- 4KHDHub -----
 
 
-@app.get("/fk/search")
+@app.get("/fk/search", tags=["4KHDHub"])
 async def fk_search(q: str = Query(..., min_length=1)):
+    """Search 4KHDHub. Use returned `id` (path) with /fk/detail and /fk/stream."""
     html = await fk_fetch(f"?s={q}")
-    items = fk_parse_search(html)
-    return {"provider": "4khdhub", "query": q, "items": items}
+    return {"provider": "4khdhub", "query": q, "items": fk_parse_search(html)}
 
 
-@app.get("/fk/detail")
-async def fk_detail(
-    id: str = Query(..., description="Path id from search, e.g. /some-movie/"),
-):
+@app.get("/fk/detail", tags=["4KHDHub"])
+async def fk_detail(id: str = Query(..., description="Path from search, e.g. /movie-name/")):
+    """Metadata for a 4KHDHub page."""
     html = await fk_fetch(id)
     soup = BeautifulSoup(html, "html.parser")
     h1 = soup.select_one("h1")
     title = h1.get_text(strip=True) if h1 else id
     og = soup.select_one('meta[property="og:image"]')
-    desc_el = soup.select_one(".content-section p.mt-4")
-    if not desc_el:
-        desc_el = soup.select_one('meta[name="description"]')
+    desc_el = soup.select_one(".content-section p.mt-4") or soup.select_one('meta[name="description"]')
     description = None
     if desc_el:
-        if desc_el.name == "p":
-            description = desc_el.get_text(strip=True)
-        else:
-            description = desc_el.get("content")
+        description = desc_el.get_text(strip=True) if desc_el.name == "p" else desc_el.get("content")
     return {
         "provider": "4khdhub",
         "id": id,
@@ -992,33 +1075,63 @@ async def fk_detail(
     }
 
 
-@app.get("/fk/stream")
+@app.get("/fk/stream", tags=["4KHDHub"])
 async def fk_stream(
-    id: str = Query(..., description="Path id from search"),
+    id: str = Query(..., description="Path from /fk/search"),
     se: int = 0,
     ep: int = 0,
+    resolve: bool = Query(False, description="If true, expand HubCloud mirrors to direct URLs"),
 ):
+    """
+    Release list with mirrors.
+    Set resolve=true to call HubCloud resolver on each hubcloud/hubdrive link
+    and attach `direct_links` under that mirror.
+    """
     html = await fk_fetch(id)
     releases = fk_parse_releases(html, se, ep)
+
+    if resolve:
+        for rel in releases:
+            for mirror in rel.get("mirrors") or []:
+                if not mirror.get("needs_resolve"):
+                    continue
+                try:
+                    mirror["direct_links"] = await resolve_any(mirror["url"])
+                except Exception as e:
+                    mirror["direct_links"] = []
+                    mirror["resolve_error"] = str(e)
+
     return {
         "provider": "4khdhub",
         "id": id,
         "se": se,
         "ep": ep,
+        "resolved": resolve,
         "count": len(releases),
         "releases": releases,
-        "note": (
-            "mirrors with needs_resolve=true need hubcloud/hubdrive "
-            "resolution in your player/client"
-        ),
+        "hint": "Use /tools/resolve?url= for a single HubCloud link, or resolve=true here.",
     }
+
+
+# ----- Tools -----
+
+
+@app.get("/tools/resolve", tags=["Tools"])
+async def tools_resolve(url: str = Query(..., description="hubcloud.*/drive/... or hubdrive.*/file/...")):
+    """
+    Resolve HubCloud / HubDrive page into direct CDN download URLs
+    (PixelDrain, Cloudflare R2, FSL, Google storage, etc.).
+    """
+    links = await resolve_any(url)
+    return {"input": url, "count": len(links), "direct_links": links}
 
 
 # ----- Aggregate -----
 
 
-@app.get("/search")
+@app.get("/search", tags=["Aggregate"])
 async def search_all(q: str = Query(..., min_length=1)):
+    """Search MovieBox + 4KHDHub in parallel-ish sequential calls."""
     moviebox_items: Any = []
     fourk_items: Any = []
     errors: Dict[str, str] = {}
@@ -1030,28 +1143,18 @@ async def search_all(q: str = Query(..., min_length=1)):
         fourk_items = (await fk_search(q))["items"]
     except Exception as exc:
         errors["4khdhub"] = str(exc)
-    return {
-        "query": q,
-        "moviebox": moviebox_items,
-        "fourkhdhub": fourk_items,
-        "errors": errors or None,
-    }
+    return {"query": q, "moviebox": moviebox_items, "fourkhdhub": fourk_items, "errors": errors or None}
 
 
-# ----- Legacy aliases (old clients) -----
+# ----- Legacy -----
 
 
-@app.get("/api/stream/{subject_id}")
-async def legacy_stream(
-    subject_id: str,
-    se: int = 0,
-    ep: int = 0,
-    detail_path: str = "",
-):
+@app.get("/api/stream/{subject_id}", tags=["Legacy"], include_in_schema=False)
+async def legacy_stream(subject_id: str, se: int = 0, ep: int = 0, detail_path: str = ""):
     return await mb_stream(subject_id, se, ep)
 
 
-@app.get("/detail/{subject_id}")
+@app.get("/detail/{subject_id}", tags=["Legacy"], include_in_schema=False)
 async def legacy_detail(subject_id: str):
     return await mb_detail(subject_id)
 
