@@ -434,6 +434,7 @@ def _unwrap_pages_dev(url: str) -> Optional[str]:
 
 
 def _is_playable_direct(url: str) -> bool:
+    """Only real file hosts — reject ads, VPN tips, telegram, random sites."""
     try:
         p = urlparse(url)
         if p.scheme != "https" or not p.hostname:
@@ -446,7 +447,31 @@ def _is_playable_direct(url: str) -> bool:
             return False
         if "hubcloud." in host and path.startswith("/drive/"):
             return False
-        return True
+        # junk / non-file hosts
+        block = (
+            "google.com", "google.", "t.me", "telegram", "tinyurl.", "bit.ly",
+            "one.one.one.one", "cloudflare.com", "hdhub4u", "facebook.", "youtube.",
+            "instagram.", "twitter.", "x.com", "reddit.", "idm", "how-to",
+        )
+        if any(b in host for b in block):
+            return False
+        label_noise = path in ("/", "") and not any(
+            x in host for x in ("pixeldrain.", "workers.dev", "r2.", "googleapis.com", "cloudflarestorage")
+        )
+        # Prefer hosts that look like CDNs / file storage
+        good = (
+            "pixeldrain.", "workers.dev", "r2.dev", "cloudflarestorage", "googleapis.com",
+            "hubcloud.", "gofile.", "workupload.", "streamtape.", "cdn.",
+        )
+        if any(g in host for g in good):
+            return True
+        # file extension in path
+        if any(path.endswith(ext) for ext in (".mp4", ".mkv", ".m3u8", ".mpd", ".avi", ".mov", ".webm")):
+            return True
+        # long path often means signed download
+        if len(path) > 40:
+            return True
+        return False
     except Exception:
         return False
 
@@ -1655,8 +1680,8 @@ async def api_play(
     except Exception as e:
         errors["moviebox"] = str(e)
 
-    
-    # MovieBox-only direct play (TUI-style). No third-party embeds.
+
+    # Title for 4KHDHub match
     title = q or ""
     if not title and sid:
         try:
@@ -1679,8 +1704,74 @@ async def api_play(
         else:
             s["play_url"] = s.get("url")
 
+    # --- 4KHDHub + HubCloud direct (MovieBox-TUI style, no embeds) ---
+    hub_links: List[dict] = []
+    clean = re.sub(r"\[[^\]]*\]", " ", title or "")
+    clean = re.sub(r"\([^)]*\)", " ", clean)
+    clean = re.sub(r"\s+S\d+.*$", "", clean, flags=re.I)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    if clean:
+        try:
+            html = await fk_fetch(f"?s={clean}")
+            hits = fk_parse_search(html)
+            def tscore(name: str) -> int:
+                n = (name or "").lower(); c = clean.lower()
+                if n == c or n.startswith(c): return 0
+                if c.split()[0] in n and (len(c.split())==1 or c in n): return 1
+                if c in n: return 2
+                return 9
+            hits = sorted(hits, key=lambda x: tscore(x.get("name") or ""))
+            if hits and tscore(hits[0].get("name") or "") <= 2:
+                path_id = hits[0].get("id")
+                if path_id:
+                    page = await fk_fetch(path_id)
+                    releases = fk_parse_releases(page, se if media == "tv" else 0, ep if media == "tv" else 0)
+                    def rscore(r):
+                        fn = (r.get("filename") or "").lower()
+                        q = (r.get("quality") or "").lower()
+                        sc = 50
+                        if "x264" in fn or "avc" in fn: sc -= 25
+                        if "1080" in q or "1080" in fn: sc -= 10
+                        if "720" in q or "720" in fn: sc -= 8
+                        if "2160" in q or "4k" in fn: sc += 12
+                        if "remux" in fn: sc += 8
+                        return sc
+                    for rel in sorted(releases, key=rscore):
+                        if len(hub_links) >= 8:
+                            break
+                        for mir in rel.get("mirrors") or []:
+                            if len(hub_links) >= 8:
+                                break
+                            murl = mir.get("url") or ""
+                            if "hubcloud." not in murl and "hubdrive." not in murl:
+                                continue
+                            try:
+                                links = await resolve_any(murl)
+                            except Exception:
+                                continue
+                            for L in links:
+                                u = L.get("url") or ""
+                                if not u or not _is_playable_direct(u):
+                                    continue
+                                hub_links.append({
+                                    "label": f"{rel.get('quality') or '?'} · {(L.get('label') or 'CDN')[:40]}",
+                                    "filename": (rel.get("filename") or "")[:120],
+                                    "quality": rel.get("quality"),
+                                    "size": rel.get("size"),
+                                    "url": u,
+                                    "play_url": u,
+                                    "type": "hub",
+                                    "format": "FILE",
+                                    "provider": "4khdhub",
+                                })
+                                if len(hub_links) >= 8:
+                                    break
+        except Exception as e:
+            errors["4khdhub"] = str(e)
+
     seen = set()
-    uniq = []
+    mb_list = []
+    hub_src = []
     for s in sources:
         u = s.get("url")
         if not u or u in seen:
@@ -1688,7 +1779,24 @@ async def api_play(
         seen.add(u)
         if "play_url" not in s:
             s["play_url"] = _proxy_url(s) if s.get("type") == "direct" else u
-        uniq.append(s)
+        mb_list.append(s)
+    for h in hub_links:
+        u = h.get("url")
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        hub_src.append({
+            "provider": "4khdhub",
+            "label": h.get("label") or "HubCloud",
+            "url": u,
+            "play_url": u,
+            "format": "FILE",
+            "type": "direct",
+            "headers": {},
+        })
+    # Prefer Hub files when MovieBox is HEVC-only (browser often audio-only)
+    only_hevc = mb_list and all(s.get("hevc") for s in mb_list)
+    uniq = (hub_src + mb_list) if only_hevc else (mb_list + hub_src)
 
     return {
         "subject_id": sid,
@@ -1698,9 +1806,10 @@ async def api_play(
         "title": title,
         "count": len(uniq),
         "sources": uniq,
+        "hub_links": hub_links,
         "errors": errors or None,
-        "strategy": "moviebox-direct-only (TUI-style proxy)",
-        "note": "Streams are MPEG-DASH via signed CDN (often HEVC). Proxy injects Cookie like MovieBox-TUI.",
+        "strategy": "moviebox-dash(+proxy) + 4khdhub/hubcloud direct — no embeds",
+        "note": "HEVC MovieBox may be audio-only on some phones. Pick a Hub link below for file playback.",
     }
 
 
@@ -1936,6 +2045,23 @@ function renderP(){
   }
 }
 window.__nx=()=>{if(PS.idx<PS.sources.length-1){PS.idx++;toast('Next source…');renderP()}else toast('All sources failed')};
+function playHub(i){
+  const h=(PS.hub||[])[i];
+  if(!h) return;
+  // inject as current source and play
+  const src={provider:'4khdhub',label:h.label,url:h.url,play_url:h.play_url||h.url,type:'direct',format:'FILE',headers:{}};
+  // replace or append
+  let found=-1;
+  PS.sources.forEach(function(s,idx){ if(s.url===src.url) found=idx; });
+  if(found>=0) PS.idx=found;
+  else { PS.sources.push(src); PS.idx=PS.sources.length-1;
+    const box=document.getElementById('srcs');
+    if(box) box.innerHTML=PS.sources.map((s,i)=>`<button type="button" class="src ${i===PS.idx?'on':''}" data-i="${i}" onclick="PS.idx=${i};renderP()">${esc(s.label)}</button>`).join('');
+  }
+  renderP();
+  toast('Playing hub file…');
+}
+
 
 async function watch(media,id,se,ep){
   setNav(''); PS={sources:[],idx:0,media,id,se:se||1,ep:ep||1};
@@ -1948,7 +2074,22 @@ async function watch(media,id,se,ep){
   try{
     const d=await api(`/api/play?subject_id=${encodeURIComponent(id)}&media=${media}&se=${PS.se}&ep=${PS.ep}`);
     PS.sources=d.sources||[];
+    PS.hub=d.hub_links||[];
     document.getElementById('srcs').innerHTML=PS.sources.map((s,i)=>`<button type="button" class="src ${i===0?'on':''}" data-i="${i}" onclick="PS.idx=${i};renderP()">${esc(s.label)}</button>`).join('')||'<span class="err">No streams</span>';
+    // HubCloud direct file list
+    let hubHtml='';
+    if(PS.hub.length){
+      hubHtml='<div style="margin-top:14px"><div style="font-weight:700;margin-bottom:8px">HubCloud / 4K files</div>'+
+        PS.hub.map(function(h,i){
+          return '<button type="button" class="src" style="display:block;width:100%;text-align:left;margin-bottom:6px" onclick="playHub('+i+')">'+
+            esc(h.label||'File')+(h.size?(' · '+esc(h.size)):'')+
+            (h.filename?('<div style="font-size:.7rem;color:var(--mute);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(h.filename)+'</div>'):'')+
+            '</button>';
+        }).join('')+'</div>';
+    }
+    const eps=document.getElementById('eps');
+    if(eps){ const box=document.createElement('div'); box.id='hubBox'; box.innerHTML=hubHtml; eps.parentNode.insertBefore(box, eps); }
+    if(d.note) toast(d.note, 4000);
     if(d.errors) toast(JSON.stringify(d.errors));
     renderP();
   }catch(e){document.getElementById('frame').innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
@@ -1988,3 +2129,6 @@ async def site_spa():
 @app.get("/", response_class=HTMLResponse, tags=["Meta"], include_in_schema=False)
 async def root_spa():
     return HTMLResponse(SPA_HTML)
+
+
+
