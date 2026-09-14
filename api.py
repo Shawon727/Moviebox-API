@@ -2,6 +2,7 @@
 # MovieBox (HMAC) + 4KHDHub + HubCloud direct resolve
 
 import os
+import asyncio
 import re
 import json
 import time
@@ -730,8 +731,9 @@ async def health():
 
 
 
+
 # =============================================================================
-# STREAM PROXY — stateless token (base64 payload, works on multi-worker hosts)
+# STREAM PROXY — stateless base64 token + DASH BaseURL mode for $Number$ templates
 # =============================================================================
 
 def _b64url_encode(obj: dict) -> str:
@@ -745,25 +747,27 @@ def _b64url_decode(s: str) -> dict:
 
 
 def _proxy_url(src: dict, base: str = "") -> str:
+    """For direct streams. DASH MPD uses /proxy/dash/{tok}/ so templates keep $Number$."""
     if src.get("type") != "direct" or not src.get("url"):
         return src.get("url") or ""
     h = src.get("headers") or {}
-    tok = _b64url_encode({
-        "u": src["url"],
-        "c": h.get("Cookie") or h.get("cookie") or "",
-        "r": h.get("Referer") or h.get("referer") or "https://sportslive.wine",
-        "a": h.get("User-Agent") or h.get("user-agent") or (_mb_ua or "Mozilla/5.0"),
-    })
-    return f"/proxy/{tok}"
+    cookie = h.get("Cookie") or h.get("cookie") or ""
+    referer = h.get("Referer") or h.get("referer") or "https://sportslive.wine"
+    ua = h.get("User-Agent") or h.get("user-agent") or (_mb_ua or "Mozilla/5.0")
+    url = src["url"]
+    # DASH: client loads MPD via /proxy/file/{tok}; MPD rewritten to use /proxy/dash/{dir_tok}/
+    tok = _b64url_encode({"u": url, "c": cookie, "r": referer, "a": ua})
+    return f"/proxy/file/{tok}"
 
 
-@app.get("/proxy/{token}", tags=["Playback"])
-async def proxy_stream_token(token: str):
+@app.get("/proxy/file/{token}", tags=["Playback"])
+async def proxy_file(token: str):
+    """Fetch a single file (MPD/m3u8/mp4). Rewrites manifests for segment proxying."""
     try:
         meta = _b64url_decode(token)
     except Exception:
-        raise HTTPException(400, "bad proxy token")
-    return await _proxy_fetch(
+        raise HTTPException(400, "bad token")
+    return await _proxy_fetch_and_rewrite(
         meta.get("u") or "",
         meta.get("c") or "",
         meta.get("r") or "https://sportslive.wine",
@@ -771,21 +775,66 @@ async def proxy_stream_token(token: str):
     )
 
 
-@app.get("/proxy", tags=["Playback"])
-async def proxy_stream_qs(
-    url: str = Query(""),
-    cookie: str = Query(""),
-    referer: str = Query(""),
-    ua: str = Query(""),
-):
-    if not url:
-        raise HTTPException(400, "url required")
-    return await _proxy_fetch(url, cookie, referer or "https://sportslive.wine", ua or _mb_ua or "Mozilla/5.0")
+@app.get("/proxy/dash/{token}/{path:path}", tags=["Playback"])
+async def proxy_dash_segment(token: str, path: str = ""):
+    """DASH segment under a directory BaseURL. path may include $ already substituted by player."""
+    try:
+        meta = _b64url_decode(token)
+    except Exception:
+        raise HTTPException(400, "bad dash token")
+    base = (meta.get("u") or "").rstrip("/") + "/"
+    url = base + path.lstrip("/")
+    return await _proxy_raw(
+        url,
+        meta.get("c") or "",
+        meta.get("r") or "https://sportslive.wine",
+        meta.get("a") or "Mozilla/5.0",
+    )
 
 
-async def _proxy_fetch(url: str, cookie: str, referer: str, ua: str):
+@app.get("/proxy/{token}", tags=["Playback"])
+async def proxy_legacy(token: str):
+    """Back-compat single-token proxy."""
+    try:
+        meta = _b64url_decode(token)
+    except Exception:
+        raise HTTPException(400, "bad token")
+    return await _proxy_fetch_and_rewrite(
+        meta.get("u") or "",
+        meta.get("c") or "",
+        meta.get("r") or "https://sportslive.wine",
+        meta.get("a") or "Mozilla/5.0",
+    )
+
+
+async def _proxy_raw(url: str, cookie: str, referer: str, ua: str):
     if not url.startswith(("https://", "http://")):
-        raise HTTPException(400, "Only http(s) upstream")
+        raise HTTPException(400, "bad upstream")
+    headers = {
+        "User-Agent": ua or "Mozilla/5.0",
+        "Accept": "*/*",
+        "Referer": referer or "https://sportslive.wine",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+        try:
+            r = await client.get(url, headers=headers)
+        except Exception as e:
+            raise HTTPException(502, f"proxy: {e}")
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, f"upstream {r.status_code}")
+        ctype = (r.headers.get("content-type") or "application/octet-stream").split(";")[0]
+        return Response(
+            content=r.content,
+            media_type=ctype,
+            headers={"cache-control": "no-store", "access-control-allow-origin": "*"},
+        )
+
+
+async def _proxy_fetch_and_rewrite(url: str, cookie: str, referer: str, ua: str):
+    if not url.startswith(("https://", "http://")):
+        raise HTTPException(400, "Only http(s)")
     headers = {
         "User-Agent": ua or "Mozilla/5.0",
         "Accept": "*/*",
@@ -808,62 +857,92 @@ async def _proxy_fetch(url: str, cookie: str, referer: str, ua: str):
         is_mpd = ".mpd" in url.lower() or "mpd" in ctype or body[:200].lstrip().startswith(b"<?xml")
         is_m3u = ".m3u8" in url.lower() or "mpegurl" in ctype or body[:7] == b"#EXTM3U"
 
-        def make_prox(u: str) -> str:
-            u = (u or "").strip().strip('"').strip("'")
-            if not u or u.startswith("data:"):
-                return u
-            if u.startswith("//"):
-                u = "https:" + u
-            elif u.startswith("/"):
-                pr = urlparse(final_url)
-                u = f"{pr.scheme}://{pr.netloc}{u}"
-            elif not u.startswith("http"):
-                u = final_url.rsplit("/", 1)[0] + "/" + u
-            tok = _b64url_encode({
-                "u": u,
-                "c": cookie or "",
-                "r": referer or "https://sportslive.wine",
-                "a": ua or "Mozilla/5.0",
-            })
-            return f"/proxy/{tok}"
-
-        if is_mpd or is_m3u:
+        if is_mpd:
             try:
                 text = body.decode("utf-8", errors="ignore")
                 import re as _re
-                if is_m3u:
-                    out_lines = []
-                    for line in text.splitlines():
-                        if line and not line.startswith("#"):
-                            out_lines.append(make_prox(line))
-                        elif "URI=" in line:
-                            out_lines.append(_re.sub(
-                                r'URI="([^"]+)"',
-                                lambda m: f'URI="{make_prox(m.group(1))}"',
-                                line,
-                            ))
-                        else:
-                            out_lines.append(line)
-                    return Response(
-                        content="\n".join(out_lines).encode("utf-8"),
-                        media_type="application/vnd.apple.mpegurl",
-                        headers={"cache-control": "no-store", "access-control-allow-origin": "*"},
+                # Directory for segments
+                dir_url = final_url.rsplit("/", 1)[0] + "/"
+                dir_tok = _b64url_encode({"u": dir_url, "c": cookie, "r": referer, "a": ua})
+                proxy_base = f"/proxy/dash/{dir_tok}/"
+
+                # Strip existing BaseURL, inject ours
+                text = _re.sub(r"<BaseURL[^>]*>[^<]*</BaseURL>", "", text, flags=_re.I)
+                # Insert BaseURL after <Period ...> or after opening MPD content
+                if _re.search(r"<Period[^>]*>", text, _re.I):
+                    text = _re.sub(
+                        r"(<Period[^>]*>)",
+                        r"\1\n\t\t<BaseURL>" + proxy_base + r"</BaseURL>",
+                        text,
+                        count=1,
+                        flags=_re.I,
                     )
+                else:
+                    text = text.replace(
+                        "<MPD",
+                        "<MPD",
+                        1,
+                    )
+                    text = _re.sub(
+                        r"(<MPD[^>]*>)",
+                        r"\1\n\t<BaseURL>" + proxy_base + r"</BaseURL>",
+                        text,
+                        count=1,
+                        flags=_re.I,
+                    )
+
+                # If media/initialization are absolute http URLs, make them relative filenames only
+                def to_rel(m):
+                    attr, val = m.group(1), m.group(2)
+                    if val.startswith("http://") or val.startswith("https://"):
+                        # keep only path after last folder that looks like template
+                        name = val.rsplit("/", 1)[-1]
+                        return f'{attr}="{name}"'
+                    if val.startswith("/proxy/"):
+                        # already wrong from old code — extract original if possible
+                        return f'{attr}="{val.rsplit("/", 1)[-1]}"'
+                    return m.group(0)
+
                 text = _re.sub(
-                    r'\b(media|initialization|sourceURL|url)=["\']([^"\']+)["\']',
-                    lambda m: f'{m.group(1)}="{make_prox(m.group(2))}"',
-                    text,
-                    flags=_re.I,
-                )
-                text = _re.sub(
-                    r'(<BaseURL[^>]*>)([^<]+)(</BaseURL>)',
-                    lambda m: m.group(1) + make_prox(m.group(2).strip()) + m.group(3),
+                    r'\b(media|initialization|sourceURL)=["\']([^"\']+)["\']',
+                    to_rel,
                     text,
                     flags=_re.I,
                 )
                 return Response(
                     content=text.encode("utf-8"),
                     media_type="application/dash+xml",
+                    headers={"cache-control": "no-store", "access-control-allow-origin": "*"},
+                )
+            except Exception:
+                pass
+
+        if is_m3u:
+            try:
+                text = body.decode("utf-8", errors="ignore")
+                import re as _re
+                dir_url = final_url.rsplit("/", 1)[0] + "/"
+                out = []
+                for line in text.splitlines():
+                    if line and not line.startswith("#"):
+                        seg = line.strip()
+                        if not seg.startswith("http"):
+                            seg = dir_url + seg
+                        tok = _b64url_encode({"u": seg, "c": cookie, "r": referer, "a": ua})
+                        out.append(f"/proxy/file/{tok}")
+                    elif "URI=" in line:
+                        def repl(m):
+                            u = m.group(1)
+                            if not u.startswith("http"):
+                                u = dir_url + u
+                            tok = _b64url_encode({"u": u, "c": cookie, "r": referer, "a": ua})
+                            return f'URI="/proxy/file/{tok}"'
+                        out.append(_re.sub(r'URI="([^"]+)"', repl, line))
+                    else:
+                        out.append(line)
+                return Response(
+                    content="\n".join(out).encode("utf-8"),
+                    media_type="application/vnd.apple.mpegurl",
                     headers={"cache-control": "no-store", "access-control-allow-origin": "*"},
                 )
             except Exception:
@@ -877,48 +956,90 @@ async def _proxy_fetch(url: str, cookie: str, referer: str, ua: str):
         )
 
 
-async def _tmdb_search_id(title: str, media: str = "movie"):
-    key = os.environ.get("TMDB_API_KEY", "3fd2be6f0c70a2a598f084ddfb75487f")
-    # strip [Hindi], (2024), etc for better match
+
+async def _clean_title(title: str) -> str:
     clean = re.sub(r"\[[^\]]*\]", " ", title or "")
     clean = re.sub(r"\([^)]*\)", " ", clean)
-    clean = re.sub(r"\s+", " ", clean).strip() or (title or "")
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean or (title or "")
+
+
+async def _tmdb_search_id(title: str, media: str = "movie"):
+    key = os.environ.get("TMDB_API_KEY", "1f54bd990f1cdfb230adb312546d765d")
+    clean = await _clean_title(title)
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(
                 "https://api.themoviedb.org/3/search/" + ("tv" if media == "tv" else "movie"),
                 params={"api_key": key, "query": clean},
             )
-            if r.status_code != 200:
-                return None
-            results = (r.json().get("results") or [])
-            return str(results[0]["id"]) if results else None
+            if r.status_code == 200:
+                results = (r.json().get("results") or [])
+                if results:
+                    return {"tmdb": str(results[0]["id"]), "imdb": None, "name": results[0].get("title") or results[0].get("name")}
     except Exception:
-        return None
+        pass
+    # Cinemeta fallback → IMDB id
+    try:
+        kind = "series" if media == "tv" else "movie"
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"https://v3-cinemeta.strem.io/catalog/{kind}/top/search={clean}.json")
+            if r.status_code == 200:
+                metas = r.json().get("metas") or []
+                if metas:
+                    imdb = metas[0].get("imdb_id") or metas[0].get("id")
+                    if imdb and str(imdb).startswith("tt"):
+                        return {"tmdb": None, "imdb": str(imdb), "name": metas[0].get("name")}
+    except Exception:
+        pass
+    return None
 
 
-def _embed_sources(tmdb_id: str, media: str, se: int = 1, ep: int = 1):
-    tid = tmdb_id
+def _embed_sources_meta(meta: dict, media: str, se: int = 1, ep: int = 1):
+    sources = []
+    tmdb = meta.get("tmdb")
+    imdb = meta.get("imdb")
     if media == "movie":
-        pairs = [
-            ("VidSrc", f"https://vidsrc.xyz/embed/movie/{tid}"),
-            ("VidSrc.to", f"https://vidsrc.to/embed/movie/{tid}"),
-            ("2Embed", f"https://www.2embed.cc/embed/{tid}"),
-            ("VidLink", f"https://vidlink.pro/movie/{tid}"),
-            ("SuperEmbed", f"https://multiembed.mov/?video_id={tid}&tmdb=1"),
-        ]
+        if tmdb:
+            pairs = [
+                ("VidSrc", f"https://vidsrc.xyz/embed/movie/{tmdb}"),
+                ("VidSrc.to", f"https://vidsrc.to/embed/movie/{tmdb}"),
+                ("2Embed", f"https://www.2embed.cc/embed/{tmdb}"),
+                ("VidLink", f"https://vidlink.pro/movie/{tmdb}"),
+                ("SuperEmbed", f"https://multiembed.mov/?video_id={tmdb}&tmdb=1"),
+            ]
+        elif imdb:
+            pairs = [
+                ("VidSrc IMDB", f"https://vidsrc.xyz/embed/movie?imdb={imdb}"),
+                ("VidSrc.to IMDB", f"https://vidsrc.to/embed/movie/{imdb}"),
+                ("SuperEmbed IMDB", f"https://multiembed.mov/?video_id={imdb}"),
+            ]
+        else:
+            pairs = []
     else:
-        pairs = [
-            ("VidSrc", f"https://vidsrc.xyz/embed/tv/{tid}/{se}/{ep}"),
-            ("VidSrc.to", f"https://vidsrc.to/embed/tv/{tid}/{se}/{ep}"),
-            ("2Embed", f"https://www.2embed.cc/embedtv/{tid}&s={se}&e={ep}"),
-            ("VidLink", f"https://vidlink.pro/tv/{tid}/{se}/{ep}"),
-            ("SuperEmbed", f"https://multiembed.mov/?video_id={tid}&tmdb=1&s={se}&e={ep}"),
-        ]
-    return [
-        {"provider": "embed", "label": n, "url": u, "format": "EMBED", "type": "embed", "headers": {}, "play_url": u}
-        for n, u in pairs
-    ]
+        if tmdb:
+            pairs = [
+                ("VidSrc", f"https://vidsrc.xyz/embed/tv/{tmdb}/{se}/{ep}"),
+                ("VidSrc.to", f"https://vidsrc.to/embed/tv/{tmdb}/{se}/{ep}"),
+                ("2Embed", f"https://www.2embed.cc/embedtv/{tmdb}&s={se}&e={ep}"),
+                ("VidLink", f"https://vidlink.pro/tv/{tmdb}/{se}/{ep}"),
+            ]
+        elif imdb:
+            pairs = [
+                ("VidSrc IMDB", f"https://vidsrc.xyz/embed/tv?imdb={imdb}&season={se}&episode={ep}"),
+                ("VidSrc.to IMDB", f"https://vidsrc.to/embed/tv/{imdb}/{se}/{ep}"),
+            ]
+        else:
+            pairs = []
+    for n, u in pairs:
+        sources.append({"provider": "embed", "label": n, "url": u, "format": "EMBED", "type": "embed", "headers": {}, "play_url": u})
+    return sources
+
+
+# keep old name as wrapper
+def _embed_sources(tmdb_id: str, media: str, se: int = 1, ep: int = 1):
+    return _embed_sources_meta({"tmdb": tmdb_id, "imdb": None}, media, se, ep)
+
 
 
 @app.get("/mb/search", tags=["MovieBox"])
@@ -1282,16 +1403,24 @@ async def api_home():
 async def api_movies(page: int = 1):
     items = []
     errors = None
-    for kw in ("action", "love", "2024", "the"):
+    for kw in ("action", "love", "2024", "movie", "the"):
         try:
             d = await mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2",
-                {"keyword": kw, "page": page, "perPage": 24, "subjectType": 1})
-            items = [x for x in _mb_items_from_search_data(d) if x.get("type") == "movie"] or _mb_items_from_search_data(d)
+                {"keyword": kw, "page": page, "perPage": 24, "subjectType": 0})
+            items = [x for x in _mb_items_from_search_data(d) if x.get("type") == "movie"]
+            if not items:
+                items = _mb_items_from_search_data(d)
             if items:
                 break
         except Exception as e:
             errors = str(e)
             continue
+    if not items:
+        try:
+            home = await api_home()
+            items = home.get("trending_movies") or home.get("popular_movies") or []
+        except Exception as e:
+            errors = str(e)
     return {"page": page, "items": items, "total_pages": 10, "error": errors}
 
 
@@ -1299,30 +1428,56 @@ async def api_movies(page: int = 1):
 async def api_series(page: int = 1):
     items = []
     errors = None
-    for kw in ("drama", "love", "2024", "the"):
+    for kw in ("drama", "love", "2024", "series", "the"):
         try:
             d = await mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2",
-                {"keyword": kw, "page": page, "perPage": 24, "subjectType": 2})
-            items = [x for x in _mb_items_from_search_data(d) if x.get("type") == "tv"] or _mb_items_from_search_data(d)
+                {"keyword": kw, "page": page, "perPage": 24, "subjectType": 0})
+            items = [x for x in _mb_items_from_search_data(d) if x.get("type") == "tv"]
+            if not items:
+                items = _mb_items_from_search_data(d)
             if items:
                 break
         except Exception as e:
             errors = str(e)
             continue
+    if not items:
+        try:
+            home = await api_home()
+            items = home.get("trending_tv") or home.get("popular_tv") or []
+        except Exception as e:
+            errors = str(e)
     return {"page": page, "items": items, "total_pages": 10, "error": errors}
 
 
 @app.get("/api/search", tags=["Catalog"])
 async def api_search_catalog(q: str = Query(..., min_length=1)):
+    """Same MovieBox path as /mb/search (stable). Optional 4KHDHub secondary."""
     mb_items = []
     fk_items = []
     errors = {}
     try:
-        d = await mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2",
-            {"keyword": q, "page": 1, "perPage": 24, "subjectType": 0})
+        d = await mb_request(
+            "POST",
+            "/wefeed-mobile-bff/subject-api/search/v2",
+            {"keyword": q, "page": 1, "perPage": 20, "subjectType": 0},
+        )
         mb_items = _mb_items_from_search_data(d)
     except Exception as e:
         errors["moviebox"] = str(e)
+        # one soft retry after short pause
+        try:
+            await asyncio.sleep(1.0)
+            global _mb_token
+            _mb_token = None
+            d = await mb_request(
+                "POST",
+                "/wefeed-mobile-bff/subject-api/search/v2",
+                {"keyword": q, "page": 1, "perPage": 20, "subjectType": 0},
+            )
+            mb_items = _mb_items_from_search_data(d)
+            errors.pop("moviebox", None)
+        except Exception as e2:
+            errors["moviebox"] = str(e2)
     try:
         html = await fk_fetch(f"?s={q}")
         for it in fk_parse_search(html):
@@ -1336,7 +1491,14 @@ async def api_search_catalog(q: str = Query(..., min_length=1)):
             })
     except Exception as e:
         errors["4khdhub"] = str(e)
-    return {"query": q, "items": mb_items, "moviebox": mb_items, "fourkhdhub": fk_items, "tmdb": [], "errors": errors or None}
+    return {
+        "query": q,
+        "items": mb_items,
+        "moviebox": mb_items,
+        "fourkhdhub": fk_items,
+        "tmdb": [],
+        "errors": errors or None,
+    }
 
 
 @app.get("/api/detail/{media}/{item_id}", tags=["Catalog"])
@@ -1503,11 +1665,11 @@ async def api_play(
         except Exception:
             pass
     if title:
-        tid = await _tmdb_search_id(title, media)
-        if tid:
-            sources.extend(_embed_sources(tid, media, se or 1, ep or 1))
+        meta = await _tmdb_search_id(title, media)
+        if meta:
+            sources.extend(_embed_sources_meta(meta, media, se or 1, ep or 1))
         else:
-            errors["embed"] = "no tmdb match for title: " + title[:60]
+            errors["embed"] = "no meta match for title: " + title[:60]
     else:
         errors["embed"] = "no title for embed lookup"
 
@@ -1653,11 +1815,21 @@ async function grid(k){
 async function search(q){
   setNav(''); root.innerHTML='<div class="empty">Searching…</div>';
   try{
-    const d=await api('/api/search?q='+encodeURIComponent(q));
-    const items=d.items||d.moviebox||d.tmdb||[];
-    let html=`<section class="sec" style="padding-top:18px"><h2>Results · ${esc(q)}</h2><div class="grid">${items.map(card).join('')||'<p class="empty">No results</p>'}</div>`;
-    if(d.fourkhdhub&&d.fourkhdhub.length) html+=`<h2 style="margin-top:18px">4KHDHub</h2><div class="grid">${d.fourkhdhub.map(x=>card({...x,type:x.type||'movie'})).join('')}</div>`;
-    html+='</section>'; root.innerHTML=html;
+    let items=[];
+    try{
+      const d=await api('/api/search?q='+encodeURIComponent(q));
+      items=d.items||d.moviebox||[];
+      if(!items.length){
+        const mb=await api('/mb/search?q='+encodeURIComponent(q));
+        items=(mb.items||[]).map(x=>({id:x.subject_id||x.id,name:x.name,poster:x.poster_url||x.poster,year:x.year,type:x.type==='series'?'tv':'movie',provider:'moviebox'}));
+      }
+      let html=`<section class="sec" style="padding-top:18px"><h2>Results · ${esc(q)}</h2><div class="grid">${items.map(card).join('')||'<p class="empty">No MovieBox results</p>'}</div></section>`;
+      root.innerHTML=html;
+    }catch(e1){
+      const mb=await api('/mb/search?q='+encodeURIComponent(q));
+      items=(mb.items||[]).map(x=>({id:x.subject_id||x.id,name:x.name,poster:x.poster_url||x.poster,year:x.year,type:x.type==='series'?'tv':'movie',provider:'moviebox'}));
+      root.innerHTML=`<section class="sec" style="padding-top:18px"><h2>Results · ${esc(q)}</h2><div class="grid">${items.map(card).join('')||'<p class="empty">No results</p>'}</div></section>`;
+    }
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
 async function title(media,id){
