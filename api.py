@@ -1,23 +1,25 @@
+import os
 import re
 import json
+import time
+import hashlib
+import hmac
+import base64
+import random
+import string
+from urllib.parse import urlparse, parse_qsl, urlencode
+from typing import Optional
+
 import httpx
-import asyncio
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 app = FastAPI(
-    title="MovieBox API Pro",
-    description="Full Pure REST API for moviebox.ph — Zero Scraping",
-    version="2.1.5"
+    title="MovieBox API Pro (Mobile)",
+    description="Updated with MovieBox-TUI mobile API + HMAC signing",
+    version="3.0.0"
 )
-
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "ok",
-        "message": "MovieBox API is healthy"
-    }
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,538 +28,440 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_URL = "https://moviebox.ph"
-API_BASE = "https://h5-api.aoneroom.com/wefeed-h5api-bff"
+# ── Host pool (from MovieBox-TUI) ──────────────────────────────────────────
+HOST_POOL = [
+    "https://api6.aoneroom.com",
+    "https://api5.aoneroom.com",
+    "https://api4.aoneroom.com",
+    "https://api4sg.aoneroom.com",
+    "https://api3.aoneroom.com",
+    "https://api6sg.aoneroom.com",
+    "https://api.inmoviebox.com",
+]
 
-_bearer_token: str | None = None
+SECRET_KEY = "76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O"  # base64 secret from TUI
+RETRY_STATUS = {403, 406, 407, 429, 500, 502, 503, 504}
 
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-    "Referer": "https://moviebox.ph/",
-    "Origin": "https://moviebox.ph",
-    "X-Client-Info": '{"timezone":"Asia/Dhaka"}',
-    "X-Request-Lang": "en",
-    "Accept": "application/json",
-    "Content-Type": "application/json",
-    "sec-ch-ua": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "cross-site",
-}
+# Global session
+_bearer_token: Optional[str] = None
+_active_host_idx = 0
+_user_agent = ""
+_client_info = ""
+_spoofed_ip = ""
 
-# Player-side headers for the stream domain (netfilm.world)
-PLAYER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "X-Client-Info": '{"timezone":"Asia/Dhaka"}',
-    "X-Source": "",
-    "sec-ch-ua": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-origin",
-}
 
-async def _get_bearer_token() -> str:
-    """Auto-acquire a guest JWT from the x-user response header."""
+def _b64_decode(val: str) -> bytes:
+    pad = (4 - len(val) % 4) % 4
+    return base64.b64decode(val + "=" * pad)
+
+
+def _md5_hex(data: bytes) -> str:
+    return hashlib.md5(data).hexdigest()
+
+
+def _generate_x_client_token(ts: int) -> str:
+    rev = str(ts)[::-1]
+    return f"{ts},{_md5_hex(rev.encode())}"
+
+
+def _sorted_query(url: str) -> str:
+    parsed = urlparse(url)
+    params = parse_qsl(parsed.query, keep_blank_values=True)
+    if not params:
+        return ""
+    # sort by key
+    params = sorted(params, key=lambda x: x[0])
+    return urlencode(params, doseq=True)
+
+
+def _build_canonical(method: str, accept: str, content_type: str, url: str, body: Optional[str], ts: int) -> str:
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    query = _sorted_query(url)
+    canonical_url = f"{path}?{query}" if query else path
+
+    body_hash = ""
+    body_len = ""
+    if body is not None:
+        b = body.encode()
+        truncated = b[:102400]
+        body_hash = _md5_hex(truncated)
+        body_len = str(len(b))
+
+    return "\n".join([
+        method.upper(),
+        accept or "",
+        content_type or "",
+        body_len,
+        str(ts),
+        body_hash,
+        canonical_url,
+    ])
+
+
+def _generate_signature(method: str, url: str, body: Optional[str], ts: int) -> str:
+    accept = "application/json"
+    content_type = "application/json"
+    canonical = _build_canonical(method, accept, content_type, url, body, ts)
+    key = _b64_decode(SECRET_KEY)
+    sig = hmac.new(key, canonical.encode(), hashlib.md5).digest()
+    sig_b64 = base64.b64encode(sig).decode()
+    return f"{ts}|2|{sig_b64}"
+
+
+def _random_hex(n: int) -> str:
+    return "".join(random.choices("0123456789abcdef", k=n))
+
+
+def _random_uuid() -> str:
+    return f"{_random_hex(8)}-{_random_hex(4)}-{_random_hex(4)}-{_random_hex(4)}-{_random_hex(12)}"
+
+
+def _generate_client_info_and_ua() -> tuple[str, str]:
+    android_versions = [
+        ("9", "PQ3A.190605.03081104"),
+        ("10", "QP1A.191005.007.A3"),
+        ("11", "RP1A.200720.011"),
+        ("12", "S1B.220414.015"),
+        ("13", "TQ2A.230405.003"),
+    ]
+    redmi = [
+        ("23078RKD5C", "Redmi"),
+        ("2201117TY", "Redmi"),
+        ("22101316G", "Redmi"),
+        ("M2012K11AG", "Redmi"),
+    ]
+    version_codes = [50020117, 50020118, 50020119, 50020120, 50020121]
+    networks = ["NETWORK_WIFI", "NETWORK_MOBILE"]
+    timezones = ["Asia/Dhaka", "Asia/Kolkata", "Asia/Shanghai", "America/New_York"]
+
+    android = random.choice(android_versions)
+    device = random.choice(redmi)
+    vcode = random.choice(version_codes)
+    network = random.choice(networks)
+    tz = random.choice(timezones)
+    gaid = _random_uuid()
+    device_id = _random_hex(32)
+
+    ua = (
+        f"com.community.oneroom/{vcode} "
+        f"(Linux; U; Android {android[0]}; en_US; {device[0]}; Build/{android[1]}; Cronet/135.0.7012.3)"
+    )
+    client_info = json.dumps({
+        "package_name": "com.community.oneroom",
+        "version_name": "4.0.01.0813.03",
+        "version_code": vcode,
+        "os": "android",
+        "os_version": android[0],
+        "install_ch": "ps",
+        "device_id": device_id,
+        "install_store": "ps",
+        "gaid": gaid,
+        "brand": device[1],
+        "model": device[0],
+        "system_language": "en",
+        "net": network,
+        "region": "US",
+        "timezone": tz,
+        "sp_code": "40401",
+        "X-Play-Mode": "2",
+    }, separators=(",", ":"))
+    return ua, client_info
+
+
+def _random_spoofed_ip() -> str:
+    prefixes = ["103.241", "49.36", "117.195", "106.198", "122.162", "157.32", "182.70"]
+    return f"{random.choice(prefixes)}.{random.randint(1,253)}.{random.randint(1,253)}"
+
+
+def _init_identity():
+    global _user_agent, _client_info, _spoofed_ip
+    if not _user_agent:
+        _user_agent, _client_info = _generate_client_info_and_ua()
+        _spoofed_ip = _random_spoofed_ip()
+
+
+def _build_headers(method: str, url: str, body: Optional[str] = None, token: Optional[str] = None) -> dict:
+    _init_identity()
+    ts = int(time.time() * 1000)
+    headers = {
+        "User-Agent": _user_agent,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Connection": "keep-alive",
+        "x-client-token": _generate_x_client_token(ts),
+        "x-tr-signature": _generate_signature(method, url, body, ts),
+        "x-client-info": _client_info,
+        "x-client-status": "0",
+        "x-forwarded-for": _spoofed_ip,
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+async def _visitor_login(client: httpx.AsyncClient) -> str:
+    global _bearer_token, _active_host_idx
+    path = "/wefeed-mobile-bff/user-api/visitor-login"
+    body = "{}"
+
+    for i in range(len(HOST_POOL)):
+        idx = (_active_host_idx + i) % len(HOST_POOL)
+        base = HOST_POOL[idx]
+        url = base + path
+        headers = _build_headers("POST", url, body, None)
+        try:
+            resp = await client.post(url, headers=headers, content=body, timeout=12)
+            if resp.status_code in RETRY_STATUS:
+                continue
+            data = resp.json()
+            # data may be wrapped or direct
+            token = None
+            if isinstance(data, dict):
+                token = data.get("token") or (data.get("data") or {}).get("token")
+            if token:
+                _bearer_token = token
+                _active_host_idx = idx
+                # absorb x-user if present
+                x_user = resp.headers.get("x-user")
+                if x_user:
+                    try:
+                        xu = json.loads(x_user)
+                        if xu.get("token"):
+                            _bearer_token = xu["token"]
+                    except Exception:
+                        pass
+                return _bearer_token
+        except Exception:
+            continue
+    raise HTTPException(502, "Failed to obtain visitor token (all hosts exhausted)")
+
+
+async def _get_token(client: httpx.AsyncClient) -> str:
     global _bearer_token
     if _bearer_token:
         return _bearer_token
-    async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
-        resp = await client.get(f"{API_BASE}/home?host=moviebox.ph", headers=DEFAULT_HEADERS)
-        x_user = resp.headers.get("x-user")
-        if x_user:
-            _bearer_token = json.loads(x_user).get("token")
-        if not _bearer_token:
-            # fallback: read from set-cookie
-            cookie = resp.headers.get("set-cookie", "")
-            import re as _re
-            m = _re.search(r"token=([^;]+)", cookie)
-            if m:
-                _bearer_token = m.group(1)
-    return _bearer_token or ""
+    return await _visitor_login(client)
 
-async def _make_request(url: str, method: str = "GET", payload: dict = None, custom_headers: dict = None) -> dict:
-    global _bearer_token
-    token = await _get_bearer_token()
-    headers = {
-        **DEFAULT_HEADERS,
-        "Authorization": f"Bearer {token}" if token else "",
-        **(custom_headers or {})
-    }
-    async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
-        try:
-            if method == "POST":
-                resp = await client.post(url, headers=headers, json=payload)
+
+async def _make_request(method: str, path: str, body: Optional[dict] = None) -> dict:
+    global _bearer_token, _active_host_idx
+    body_str = json.dumps(body, separators=(",", ":")) if body is not None else None
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+        token = await _get_token(client)
+
+        for attempt in range(2):  # retry once on 401/403
+            start = _active_host_idx
+            for i in range(len(HOST_POOL)):
+                idx = (start + i) % len(HOST_POOL)
+                base = HOST_POOL[idx]
+                url = base + path
+                headers = _build_headers(method, url, body_str, token)
+
+                try:
+                    if method.upper() == "POST":
+                        resp = await client.post(url, headers=headers, content=body_str or "{}")
+                    else:
+                        resp = await client.get(url, headers=headers)
+
+                    # refresh token from x-user
+                    x_user = resp.headers.get("x-user")
+                    if x_user:
+                        try:
+                            xu = json.loads(x_user)
+                            if xu.get("token"):
+                                _bearer_token = xu["token"]
+                                token = _bearer_token
+                        except Exception:
+                            pass
+
+                    if resp.status_code in (401, 403) and attempt == 0:
+                        _bearer_token = None
+                        token = await _visitor_login(client)
+                        break  # retry whole loop with new token
+
+                    if resp.status_code in RETRY_STATUS:
+                        continue
+
+                    if resp.status_code != 200:
+                        continue
+
+                    data = resp.json()
+                    _active_host_idx = idx
+                    # return inner data if present
+                    if isinstance(data, dict) and "data" in data:
+                        return data["data"]
+                    return data
+                except Exception:
+                    continue
             else:
-                resp = await client.get(url, headers=headers)
+                continue
+            break
 
-            # Refresh token if server sends a new one
-            x_user = resp.headers.get("x-user")
-            if x_user:
-                new_token = json.loads(x_user).get("token")
-                if new_token:
-                    _bearer_token = new_token
+    raise HTTPException(502, f"Request failed for {path} (all hosts exhausted)")
 
-            if resp.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"Upstream API error: {resp.status_code}")
 
-            return resp.json()
-        except Exception as e:
-            if isinstance(e, HTTPException): raise e
-            raise HTTPException(status_code=502, detail=f"Request failed: {str(e)}")
+# ── Endpoints ──────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": "3.0.0", "engine": "mobile-api + hmac"}
+
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>MovieBox Pure API | Pro Dashboard</title>
-        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
-        <style>
-            :root {
-                --primary: #ff3d71;
-                --secondary: #3366ff;
-                --accent: #00f2ff;
-                --bg: #07080c;
-                --card-bg: rgba(255, 255, 255, 0.03);
-                --glass: rgba(255, 255, 255, 0.06);
-                --text: #ffffff;
-            }
+    return HTMLResponse("""
+    <h1>MovieBox API v3 (Mobile)</h1>
+    <p>Updated from MovieBox-TUI logic</p>
+    <ul>
+      <li><a href="/home">/home</a></li>
+      <li><a href="/search?q=avatar">/search?q=avatar</a></li>
+      <li>/detail/{subject_id}</li>
+      <li>/api/stream/{subject_id}?se=1&ep=1</li>
+    </ul>
+    """)
 
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            
-            body {
-                font-family: 'Outfit', sans-serif;
-                background: var(--bg);
-                color: var(--text);
-                overflow-x: hidden;
-                min-height: 100vh;
-                background-image: 
-                    radial-gradient(circle at 10% 10%, rgba(255, 61, 113, 0.12) 0%, transparent 40%),
-                    radial-gradient(circle at 90% 90%, rgba(51, 102, 255, 0.12) 0%, transparent 40%);
-            }
-
-            .container {
-                max-width: 1200px;
-                margin: 0 auto;
-                padding: 60px 24px;
-                position: relative;
-            }
-
-            header {
-                text-align: center;
-                margin-bottom: 80px;
-                animation: fadeInDown 1s ease-out;
-            }
-
-            @keyframes fadeInDown {
-                from { opacity: 0; transform: translateY(-30px); }
-                to { opacity: 1; transform: translateY(0); }
-            }
-
-            h1 {
-                font-size: clamp(2.5rem, 8vw, 4rem);
-                font-weight: 800;
-                background: linear-gradient(135deg, #fff 0%, #aaa 100%);
-                -webkit-background-clip: text;
-                -webkit-text-fill-color: transparent;
-                margin-bottom: 15px;
-                letter-spacing: -2px;
-            }
-
-            .badge {
-                background: linear-gradient(90deg, var(--primary), var(--secondary));
-                padding: 8px 18px;
-                border-radius: 40px;
-                font-size: 0.85rem;
-                font-weight: 700;
-                display: inline-block;
-                margin-bottom: 25px;
-                text-transform: uppercase;
-                letter-spacing: 1px;
-                box-shadow: 0 10px 30px rgba(255, 61, 113, 0.3);
-            }
-
-            .grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
-                gap: 30px;
-                margin-top: 20px;
-            }
-
-            .card {
-                background: var(--card-bg);
-                border: 1px solid var(--glass);
-                border-radius: 28px;
-                padding: 35px;
-                transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-                backdrop-filter: blur(12px);
-                position: relative;
-                overflow: hidden;
-                display: flex;
-                flex-direction: column;
-            }
-
-            @media (hover: hover) {
-                .card:hover {
-                    transform: translateY(-12px) scale(1.02);
-                    border-color: rgba(255,255,255,0.2);
-                    box-shadow: 0 30px 60px rgba(0,0,0,0.5);
-                }
-            }
-
-            .card-title {
-                font-size: 1.5rem;
-                font-weight: 700;
-                margin-bottom: 18px;
-                display: flex;
-                align-items: center;
-                gap: 12px;
-            }
-
-            .card-title i {
-                width: 32px; height: 32px;
-                background: rgba(255,255,255,0.05);
-                border-radius: 8px;
-                display: flex; align-items: center; justify-content: center;
-                font-size: 1rem; color: var(--accent);
-                font-style: normal;
-            }
-
-            .card-desc {
-                color: #9ea3ac;
-                font-size: 1rem;
-                line-height: 1.6;
-                margin-bottom: 25px;
-                flex-grow: 1;
-            }
-
-            .endpoint {
-                font-family: 'JetBrains Mono', monospace;
-                background: rgba(0,0,0,0.4);
-                padding: 14px;
-                border-radius: 14px;
-                font-size: 0.85rem;
-                color: var(--accent);
-                border: 1px solid rgba(0,242,255,0.15);
-                margin-bottom: 25px;
-                word-break: break-all;
-                position: relative;
-            }
-
-            .endpoint::after {
-                content: 'GET';
-                position: absolute;
-                right: 14px; top: 14px;
-                font-size: 0.65rem; font-weight: 800;
-                color: rgba(255,255,255,0.3);
-            }
-
-            .btn {
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                padding: 16px;
-                background: #ffffff;
-                color: #000000;
-                text-decoration: none;
-                border-radius: 16px;
-                font-weight: 700;
-                font-size: 0.95rem;
-                transition: all 0.3s;
-            }
-
-            .btn:hover {
-                background: var(--primary);
-                color: #fff;
-                transform: translateY(-2px);
-                box-shadow: 0 10px 25px rgba(255, 61, 113, 0.4);
-            }
-
-            footer {
-                text-align: center;
-                padding: 80px 0 40px;
-                animation: fadeIn 2s ease;
-            }
-
-            @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-
-            .dev-tag {
-                font-weight: 800;
-                color: #666;
-                letter-spacing: 3px;
-                text-transform: uppercase;
-                font-size: 0.75rem;
-                border: 1px solid #222;
-                padding: 12px 30px;
-                border-radius: 50px;
-                display: inline-block;
-                background: rgba(255,255,255,0.01);
-                transition: all 0.3s;
-            }
-
-            .dev-tag:hover {
-                color: var(--text);
-                border-color: var(--primary);
-                letter-spacing: 5px;
-            }
-
-            @media (max-width: 480px) {
-                .container { padding: 40px 16px; }
-                .card { padding: 25px; }
-                h1 { margin-bottom: 10px; }
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <header>
-                <div class="badge">Enterprise API Solution</div>
-                <h1>MovieBox Pro</h1>
-                <p style="color: #667; font-size: 1.25rem; font-weight: 300;">State-of-the-Art Pure API Architecture</p>
-            </header>
-
-            <div class="grid">
-                <div class="card">
-                    <div class="card-title"><i>🏠</i> Discover Home</div>
-                    <p class="card-desc">The ultimate window into MovieBox. Headlines, recommended content, and trending blocks updated in real-time.</p>
-                    <div class="endpoint">/home</div>
-                    <a href="/home" target="_blank" class="btn">Launch API</a>
-                </div>
-
-                <div class="card">
-                    <div class="card-title"><i>🔍</i> Smart Search</div>
-                    <p class="card-desc">High-precision search engine results. Returns titles, posters, and slugs for lightning-fast matching.</p>
-                    <div class="endpoint">/search?q=Attack on Titan</div>
-                    <a href="/search?q=Attack on Titan" target="_blank" class="btn">Test Search</a>
-                </div>
-
-                <div class="card">
-                    <div class="card-title"><i>🆔</i> Metadata A-Z</div>
-                    <p class="card-desc">Deep-dive into any subject. Episodes, seasons, languages, and full high-resolution metadata trees.</p>
-                    <div class="endpoint">/detail/{slug}</div>
-                    <a href="/detail/attack-on-titan-hindi-kGWQOIx0d4" target="_blank" class="btn">Fetch Specs</a>
-                </div>
-
-                <div class="card">
-                    <div class="card-title"><i>🎬</i> Stream Engine</div>
-                    <p class="card-desc">Dynamic domain discovery and direct MP4 extraction. Supports multiple resolutions and qualities.</p>
-                    <div class="endpoint">/api/stream/{subject_id}</div>
-                    <a href="/api/stream/56988683026712168?detail_path=attack-on-titan-hindi-kGWQOIx0d4" target="_blank" class="btn">Get Player Link</a>
-                </div>
-
-                <div class="card">
-                    <div class="card-title"><i>📦</i> Catalog Filters</div>
-                    <p class="card-desc">Paginated collections for all genres. Movies, TV shows, and Animations filtered by professional criteria. Pagination Supported.</p>
-                    <div class="endpoint">/tv-series?page=2</div>
-                    <a href="/tv-series?page=2" target="_blank" class="btn">Test Page 2</a>
-                </div>
-
-                <div class="card">
-                    <div class="card-title"><i>💬</i> Subtitle Suite</div>
-                    <p class="card-desc">Access to the complete SRT/VTT global database for all streaming subjects.</p>
-                    <div class="endpoint">/api/stream/{id}/captions</div>
-                    <a href="/api/stream/6207982430134357800/captions?detail_path=breaking-bad-ej6Bp0MCAo7" target="_blank" class="btn">Retrive Subs</a>
-                </div>
-            </div>
-
-            <footer>
-                <div class="dev-tag">Developer: Walter</div>
-            </footer>
-        </div>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
 
 @app.get("/home")
-async def get_home():
-    url = f"{API_BASE}/home?host=moviebox.ph"
-    data = await _make_request(url)
-    sections = []
-    for op in data.get("data", {}).get("operatingList", []) or []:
-        op_type = op.get("type")
-        title = op.get("title", "Featured")
-        if op_type == "BANNER":
-            items = [{
-                "name": item.get("title") or (item.get("subject") or {}).get("title"),
-                "poster_url": item.get("image", {}).get("url") or (item.get("subject") or {}).get("cover", {}).get("url"),
-                "slug": item.get("detailPath") or (item.get("subject") or {}).get("detailPath"),
-                "subject_id": (item.get("subject") or {}).get("subjectId"),
-                "badge": (item.get("subject") or {}).get("corner")
-            } for item in op.get("banner", {}).get("items", []) if item.get("title") and "Communities" not in item.get("title")]
-            sections.append({"section": "Banner", "count": len(items), "items": items})
-        elif op_type in ["SUBJECTS_MOVIE", "SUBJECTS_TV", "SUBJECTS_ANIMATION"]:
-            items = [{
-                "name": sub.get("title"),
-                "poster_url": sub.get("cover", {}).get("url"),
-                "slug": sub.get("detailPath"),
-                "subject_id": sub.get("subjectId"),
-                "badge": sub.get("corner"),
-                "rating": sub.get("imdbRatingValue")
-            } for sub in op.get("subjects", [])]
-            sections.append({"section": title, "count": len(items), "items": items})
-    return {"status": "success", "sections": sections}
+async def get_home(page: int = 1):
+    # tabId=1 usually home
+    data = await _make_request("GET", f"/wefeed-mobile-bff/tab-operating?page={page}&tabId=1&version=")
+    return {"status": "success", "data": data}
 
-async def _get_category_data(tab_id: int, page: int = 1, per_page: int = 24, sort: str = "RECOMMEND") -> dict:
-    url = f"{API_BASE}/subject/filter"
-    payload = {"tabId": tab_id, "filter": {"sort": sort, "genre": "ALL", "country": "ALL", "year": "ALL", "language": "ALL"}, "page": page, "perPage": per_page}
-    data = await _make_request(url, method="POST", payload=payload)
-    inner = data.get("data", {})
-    raw_items = inner.get("items", inner.get("subjects", []))
-    items = [{
-        "name": sub.get("title"),
-        "poster_url": sub.get("cover", {}).get("url"),
-        "slug": sub.get("detailPath"),
-        "subject_id": sub.get("subjectId"),
-        "badge": sub.get("corner"),
-        "rating": sub.get("imdbRatingValue"),
-        "year": sub.get("releaseDate", "")[:4] if sub.get("releaseDate") else None
-    } for sub in raw_items]
-    pager = inner.get("pager", {})
-    total = pager.get("totalCount") or inner.get("total") or len(items)
-    return {"page": page, "per_page": per_page, "total": total, "items": items}
-
-@app.get("/movies")
-async def get_movies(page: int = 1, sort: str = "RECOMMEND"):
-    return await _get_category_data(tab_id=2, page=page, sort=sort)
-
-@app.get("/tv-series")
-async def get_tv_series(page: int = 1, sort: str = "RECOMMEND"):
-    return await _get_category_data(tab_id=5, page=page, sort=sort)
-
-@app.get("/animation")
-async def get_animation(page: int = 1, sort: str = "RECOMMEND"):
-    return await _get_category_data(tab_id=8, page=page, sort=sort)
-
-@app.get("/search/suggest")
-async def get_search_suggestions(q: str = Query(..., min_length=1)):
-    url = f"{API_BASE}/subject/search-suggest"
-    data = await _make_request(url, method="POST", payload={"keyword": q, "perPage": 10})
-    inner = data.get("data", {})
-    raw = inner.get("items", inner.get("list", []))
-    suggestions = []
-    for item in raw:
-        sub = item.get("subject") or {}
-        suggestions.append({
-            "title": sub.get("title") or item.get("word") or item.get("title"),
-            "slug": sub.get("detailPath") or item.get("detailPath"),
-            "subject_id": sub.get("subjectId") or item.get("subjectId")
-        })
-    return {"suggestions": suggestions}
 
 @app.get("/search")
 async def search(q: str = Query(..., min_length=1), page: int = 1):
-    url = f"{API_BASE}/subject/search"
-    data = await _make_request(url, method="POST", payload={"keyword": q, "page": page, "perPage": 20})
-    inner = data.get("data", {})
-    raw = inner.get("items", inner.get("list", []))
-    items = [{
-        "name": sub.get("title"),
-        "poster_url": sub.get("cover", {}).get("url"),
-        "slug": sub.get("detailPath"),
-        "subject_id": sub.get("subjectId")
-    } for sub in raw]
-    pager = inner.get("pager", {})
-    total = pager.get("totalCount") or inner.get("total") or len(items)
-    return {"query": q, "page": page, "total": total, "items": items}
+    payload = {
+        "keyword": q,
+        "page": page,
+        "perPage": 20,
+        "subjectType": 0
+    }
+    data = await _make_request("POST", "/wefeed-mobile-bff/subject-api/search/v2", payload)
+    items = []
+    raw = data.get("items") or data.get("list") or data.get("subjects") or []
+    for sub in raw:
+        if isinstance(sub, dict) and "subject" in sub:
+            sub = sub["subject"]
+        items.append({
+            "name": sub.get("title") or sub.get("name"),
+            "poster_url": (sub.get("cover") or {}).get("url") if isinstance(sub.get("cover"), dict) else sub.get("cover"),
+            "slug": sub.get("detailPath"),
+            "subject_id": str(sub.get("subjectId") or sub.get("id") or ""),
+            "year": (sub.get("releaseDate") or "")[:4] or None,
+            "rating": sub.get("imdbRatingValue"),
+        })
+    return {"query": q, "page": page, "total": data.get("total") or len(items), "items": items}
 
-@app.get("/detail/{slug}")
-async def get_movie_detail(slug: str):
-    url = f"{API_BASE}/detail?detailPath={slug}"
-    return await _make_request(url)
+
+@app.get("/detail/{subject_id}")
+async def get_detail(subject_id: str):
+    data = await _make_request("GET", f"/wefeed-mobile-bff/subject-api/get?subjectId={subject_id}")
+    # attach seasons if series
+    stype = data.get("subjectType") or data.get("stype") or 1
+    if stype == 2:
+        try:
+            seasons = await _make_request("GET", f"/wefeed-mobile-bff/subject-api/season-info?subjectId={subject_id}")
+            data["seasons"] = seasons
+        except Exception:
+            pass
+    return data
+
 
 @app.get("/api/stream/{subject_id}")
-async def get_stream_sources(subject_id: str, detail_path: str, se: int = 1, ep: int = 1):
-    # Step 1: get the player domain
-    dom_data = await _make_request(f"{API_BASE}/media-player/get-domain")
-    domain = dom_data.get("data", "https://netfilm.world").rstrip("/")
+async def get_stream(
+    subject_id: str,
+    se: int = 0,
+    ep: int = 0,
+    detail_path: Optional[str] = None,  # kept for compatibility, not required
+):
+    """
+    Returns playable streams using mobile play-info/v2
+    se=0 & ep=0 → movie
+    """
+    if se == 0 and ep == 0:
+        path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}"
+    else:
+        path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}&se={se}&ep={ep}"
 
-    # Step 2: build the Referer the way the real browser player does
-    player_referer = (
-        f"{domain}/spa/videoPlayPage/movies/{detail_path}"
-        f"?id={subject_id}&type=/movie/detail&detailSe={se}&detailEp={ep}&lang=en"
-    )
-    play_url = f"{domain}/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
+    data = await _make_request("GET", path)
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
-        resp = await client.get(play_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
-        data = resp.json().get("data", {})
-
-    has_resource = data.get("hasResource", False)
-    streams = [
-        {
-            "resolution": f"{s.get('resolutions')}p",
-            "format": s.get("format"),
-            "url": s.get("url"),
+    streams = []
+    # streams list
+    for s in data.get("streams") or data.get("streamList") or []:
+        url = s.get("url")
+        if not url:
+            continue
+        streams.append({
+            "resolution": f"{s.get('resolutions') or s.get('resolution') or s.get('quality') or '?'}p",
+            "format": s.get("format") or ("DASH" if ".mpd" in url else "MP4" if ".mp4" in url else "HLS"),
+            "url": url,
             "size": s.get("size"),
             "duration": s.get("duration"),
-            "codec": s.get("codecName")
-        }
-        for s in data.get("streams", [])
-    ]
+            "codec": s.get("codecName"),
+            "id": s.get("id"),
+        })
+
+    # also collect dash / hls if present
+    dash = data.get("dash") or []
+    hls = data.get("hls") or []
+
+    has_resource = bool(streams or dash or hls) or data.get("hasResource", False)
+
     return {
         "subject_id": subject_id,
         "se": se,
         "ep": ep,
         "has_resource": has_resource,
         "sources": streams,
-        "hls": data.get("hls", []),
-        "dash": data.get("dash", []),
+        "hls": hls,
+        "dash": dash,
         "free_episodes": data.get("freeNum"),
         "limited": data.get("limited", False),
-        "note": None if has_resource else "No stream found for this episode."
+        "note": None if has_resource else "No stream found (may require paid / region locked)",
+        "raw_keys": list(data.keys()) if isinstance(data, dict) else [],
     }
 
+
 @app.get("/api/stream/{subject_id}/captions")
-async def get_captions(subject_id: str, detail_path: str, se: int = 1, ep: int = 1):
-    dom_data = await _make_request(f"{API_BASE}/media-player/get-domain")
-    domain = dom_data.get("data", "https://netfilm.world").rstrip("/")
+async def get_captions(subject_id: str, resource_id: str = "", se: int = 0, ep: int = 0):
+    if not resource_id:
+        # try to get first stream id
+        play = await get_stream(subject_id, se, ep)
+        sources = play.get("sources") or []
+        if sources:
+            resource_id = str(sources[0].get("id") or "")
+    if not resource_id:
+        return {"subject_id": subject_id, "count": 0, "captions": []}
 
-    player_referer = (
-        f"{domain}/spa/videoPlayPage/movies/{detail_path}"
-        f"?id={subject_id}&type=/movie/detail&detailSe={se}&detailEp={ep}&lang=en"
+    data = await _make_request(
+        "GET",
+        f"/wefeed-mobile-bff/subject-api/get-ext-captions?subjectId={subject_id}&resourceId={resource_id}"
     )
-    play_url = f"{domain}/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
+    captions = data.get("captions") or data.get("list") or []
+    return {
+        "subject_id": subject_id,
+        "resource_id": resource_id,
+        "count": len(captions),
+        "captions": captions,
+    }
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
-        play_resp = await client.get(play_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
-        play_data = play_resp.json().get("data", {})
 
-    streams = play_data.get("streams", [])
-    dash = play_data.get("dash", [])
+@app.get("/movies")
+async def movies(page: int = 1):
+    # tabId=2 movies (approximate)
+    data = await _make_request("GET", f"/wefeed-mobile-bff/tab-operating?page={page}&tabId=2&version=")
+    return data
 
-    stream_id = None
-    stream_format = None
-    if streams:
-        stream_id = streams[0].get("id")
-        stream_format = streams[0].get("format", "MP4")
-    elif dash:
-        stream_id = dash[0].get("id")
-        stream_format = dash[0].get("format", "DASH")
 
-    if not stream_id:
-        return {"subject_id": subject_id, "se": se, "ep": ep, "count": 0, "captions": []}
+@app.get("/tv-series")
+async def tv_series(page: int = 1):
+    data = await _make_request("GET", f"/wefeed-mobile-bff/tab-operating?page={page}&tabId=5&version=")
+    return data
 
-    cap_url = (
-        f"{API_BASE}/subject/caption"
-        f"?format={stream_format}&id={stream_id}&subjectId={subject_id}&detailPath={detail_path}"
-    )
-    data = await _make_request(cap_url)
-    inner = data.get("data", {})
-    captions = inner.get("captions", []) if isinstance(inner, dict) else inner
-    return {"subject_id": subject_id, "se": se, "ep": ep, "count": len(captions), "captions": captions}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("newapi:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("api:app", host="0.0.0.0", port=port, reload=True)
