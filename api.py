@@ -16,7 +16,7 @@ import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 app = FastAPI(
     title="StreamHub API",
@@ -728,73 +728,160 @@ async def health():
 
 # ----- MovieBo
 
-# =============================================================================
-# STREAM PROXY (browser cannot send Cookie on <video src>)
-# =============================================================================
-from fastapi.responses import StreamingResponse
-from starlette.background import BackgroundTask
 
-@app.get("/proxy", tags=["Playback"])
-async def proxy_stream(
-    url: str = Query(..., description="Upstream media URL"),
-    cookie: str = Query("", description="Cookie header"),
-    referer: str = Query(""),
-    ua: str = Query(""),
-):
-    """Pipe upstream stream to client with required CDN headers."""
-    if not url.startswith("https://"):
-        raise HTTPException(400, "Only https upstream allowed")
-    headers = {
-        "User-Agent": ua or _mb_ua or "Mozilla/5.0",
-        "Accept": "*/*",
+# =============================================================================
+# STREAM PROXY — token bag avoids huge Cookie in query string
+# =============================================================================
+_PROXY_BAG: dict = {}
+_PROXY_BAG_TS: dict = {}
+
+
+def _proxy_bag_put(url: str, cookie: str, referer: str, ua: str) -> str:
+    import secrets
+    tok = secrets.token_urlsafe(12)
+    _PROXY_BAG[tok] = {
+        "url": url,
+        "cookie": cookie or "",
+        "referer": referer or "https://sportslive.wine",
+        "ua": ua or _mb_ua or "Mozilla/5.0",
     }
-    if cookie:
-        headers["Cookie"] = cookie
-    if referer:
-        headers["Referer"] = referer
-    client = httpx.AsyncClient(follow_redirects=True, timeout=None)
-    try:
-        req = client.build_request("GET", url, headers=headers)
-        upstream = await client.send(req, stream=True)
-    except Exception as e:
-        await client.aclose()
-        raise HTTPException(502, f"proxy connect failed: {e}")
-
-    if upstream.status_code >= 400:
-        body = await upstream.aread()
-        await upstream.aclose()
-        await client.aclose()
-        raise HTTPException(upstream.status_code, body[:200].decode("utf-8", "ignore"))
-
-    out_headers = {}
-    for k in ("content-type", "content-length", "accept-ranges", "content-range"):
-        if k in upstream.headers:
-            out_headers[k] = upstream.headers[k]
-    out_headers["cache-control"] = "no-store"
-
-    async def gen():
-        try:
-            async for chunk in upstream.aiter_bytes(65536):
-                yield chunk
-        finally:
-            await upstream.aclose()
-            await client.aclose()
-
-    return StreamingResponse(gen(), status_code=upstream.status_code, headers=out_headers, media_type=upstream.headers.get("content-type"))
+    _PROXY_BAG_TS[tok] = time.time()
+    # prune old (>30 min)
+    cutoff = time.time() - 1800
+    for k, ts in list(_PROXY_BAG_TS.items()):
+        if ts < cutoff:
+            _PROXY_BAG.pop(k, None)
+            _PROXY_BAG_TS.pop(k, None)
+    return tok
 
 
 def _proxy_url(src: dict, base: str = "") -> str:
-    """Build same-origin proxy URL for a direct source with headers."""
     if src.get("type") != "direct" or not src.get("url"):
         return src.get("url") or ""
     h = src.get("headers") or {}
-    q = urlencode({
-        "url": src["url"],
-        "cookie": h.get("Cookie") or h.get("cookie") or "",
-        "referer": h.get("Referer") or h.get("referer") or "",
-        "ua": h.get("User-Agent") or h.get("user-agent") or "",
-    })
-    return f"/proxy?{q}"
+    tok = _proxy_bag_put(
+        src["url"],
+        h.get("Cookie") or h.get("cookie") or "",
+        h.get("Referer") or h.get("referer") or "https://sportslive.wine",
+        h.get("User-Agent") or h.get("user-agent") or "",
+    )
+    return f"/proxy/{tok}"
+
+
+@app.get("/proxy/{token}", tags=["Playback"])
+async def proxy_stream_token(token: str):
+    meta = _PROXY_BAG.get(token)
+    if not meta:
+        raise HTTPException(404, "proxy token expired — reopen play")
+    return await _proxy_fetch(meta["url"], meta["cookie"], meta["referer"], meta["ua"], token)
+
+
+@app.get("/proxy", tags=["Playback"])
+async def proxy_stream_qs(
+    url: str = Query(""),
+    cookie: str = Query(""),
+    referer: str = Query(""),
+    ua: str = Query(""),
+    token: str = Query(""),
+):
+    if token and token in _PROXY_BAG:
+        meta = _PROXY_BAG[token]
+        return await _proxy_fetch(meta["url"], meta["cookie"], meta["referer"], meta["ua"], token)
+    if not url:
+        raise HTTPException(400, "url or token required")
+    return await _proxy_fetch(url, cookie, referer or "https://sportslive.wine", ua or _mb_ua, None)
+
+
+async def _proxy_fetch(url: str, cookie: str, referer: str, ua: str, parent_token: Optional[str]):
+    if not url.startswith(("https://", "http://")):
+        raise HTTPException(400, "Only http(s) upstream")
+    headers = {
+        "User-Agent": ua or "Mozilla/5.0",
+        "Accept": "*/*",
+        "Referer": referer or "https://sportslive.wine",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+        try:
+            upstream = await client.get(url, headers=headers)
+        except Exception as e:
+            raise HTTPException(502, f"proxy failed: {e}")
+        if upstream.status_code >= 400:
+            raise HTTPException(upstream.status_code, f"upstream {upstream.status_code}")
+
+        ctype = (upstream.headers.get("content-type") or "").lower()
+        body = upstream.content
+        final_url = str(upstream.url)
+        is_mpd = ".mpd" in url.lower() or "mpd" in ctype or body[:200].lstrip().startswith(b"<?xml")
+        is_m3u = ".m3u8" in url.lower() or "mpegurl" in ctype or body[:7] == b"#EXTM3U"
+
+        def make_prox(u: str) -> str:
+            u = u.strip().strip('"').strip("'")
+            if not u or u.startswith("data:"):
+                return u
+            if u.startswith("//"):
+                u = "https:" + u
+            elif u.startswith("/"):
+                p = urlparse(final_url)
+                u = f"{p.scheme}://{p.netloc}{u}"
+            elif not u.startswith("http"):
+                u = final_url.rsplit("/", 1)[0] + "/" + u
+            tok = _proxy_bag_put(u, cookie, referer, ua)
+            return f"/proxy/{tok}"
+
+        if is_mpd or is_m3u:
+            try:
+                text = body.decode("utf-8", errors="ignore")
+                import re as _re
+                if is_m3u:
+                    out_lines = []
+                    for line in text.splitlines():
+                        if line and not line.startswith("#"):
+                            out_lines.append(make_prox(line))
+                        elif "URI=" in line:
+                            out_lines.append(_re.sub(
+                                r'URI="([^"]+)"',
+                                lambda m: f'URI="{make_prox(m.group(1))}"',
+                                line,
+                            ))
+                        else:
+                            out_lines.append(line)
+                    return Response(
+                        content="\n".join(out_lines).encode("utf-8"),
+                        media_type="application/vnd.apple.mpegurl",
+                        headers={"cache-control": "no-store", "access-control-allow-origin": "*"},
+                    )
+                text = _re.sub(
+                    r'\b(media|initialization|sourceURL|url)=["\']([^"\']+)["\']',
+                    lambda m: f'{m.group(1)}="{make_prox(m.group(2))}"',
+                    text,
+                    flags=_re.I,
+                )
+                text = _re.sub(
+                    r'(<BaseURL[^>]*>)([^<]+)(</BaseURL>)',
+                    lambda m: m.group(1) + make_prox(m.group(2).strip()) + m.group(3),
+                    text,
+                    flags=_re.I,
+                )
+                return Response(
+                    content=text.encode("utf-8"),
+                    media_type="application/dash+xml",
+                    headers={"cache-control": "no-store", "access-control-allow-origin": "*"},
+                )
+            except Exception:
+                pass
+
+        media_type = ctype.split(";")[0] if ctype else "application/octet-stream"
+        return Response(
+            content=body,
+            media_type=media_type,
+            headers={
+                "cache-control": "no-store",
+                "access-control-allow-origin": "*",
+            },
+        )
 
 
 async def _tmdb_search_id(title: str, media: str = "movie"):
@@ -1197,33 +1284,35 @@ async def api_home():
 @app.get("/api/movies", tags=["Catalog"])
 async def api_movies(page: int = 1):
     items = []
-    try:
-        d = await mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2",
-            {"keyword": "movie", "page": page, "perPage": 24, "subjectType": 1})
-        items = [x for x in _mb_items_from_search_data(d) if x["type"] == "movie"]
-    except Exception:
-        pass
-    if not items:
-        d = await mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2",
-            {"keyword": "a", "page": page, "perPage": 24, "subjectType": 1})
-        items = _mb_items_from_search_data(d)
-    return {"page": page, "items": items, "total_pages": 10}
+    errors = None
+    for kw in ("action", "love", "2024", "the"):
+        try:
+            d = await mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2",
+                {"keyword": kw, "page": page, "perPage": 24, "subjectType": 1})
+            items = [x for x in _mb_items_from_search_data(d) if x.get("type") == "movie"] or _mb_items_from_search_data(d)
+            if items:
+                break
+        except Exception as e:
+            errors = str(e)
+            continue
+    return {"page": page, "items": items, "total_pages": 10, "error": errors}
 
 
 @app.get("/api/series", tags=["Catalog"])
 async def api_series(page: int = 1):
     items = []
-    try:
-        d = await mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2",
-            {"keyword": "series", "page": page, "perPage": 24, "subjectType": 2})
-        items = [x for x in _mb_items_from_search_data(d) if x["type"] == "tv"]
-    except Exception:
-        pass
-    if not items:
-        d = await mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2",
-            {"keyword": "the", "page": page, "perPage": 24, "subjectType": 2})
-        items = _mb_items_from_search_data(d)
-    return {"page": page, "items": items, "total_pages": 10}
+    errors = None
+    for kw in ("drama", "love", "2024", "the"):
+        try:
+            d = await mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2",
+                {"keyword": kw, "page": page, "perPage": 24, "subjectType": 2})
+            items = [x for x in _mb_items_from_search_data(d) if x.get("type") == "tv"] or _mb_items_from_search_data(d)
+            if items:
+                break
+        except Exception as e:
+            errors = str(e)
+            continue
+    return {"page": page, "items": items, "total_pages": 10, "error": errors}
 
 
 @app.get("/api/search", tags=["Catalog"])
@@ -1458,6 +1547,7 @@ SPA_HTML = r"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>StreamHub</title>
+<script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800&display=swap" rel="stylesheet"/>
 <style>
 :root{--bg:#05060a;--card:#141722;--line:#1e2333;--text:#f0f2f8;--mute:#8b93a7;--a:#6c5ce7;--a2:#00d2d3}
@@ -1524,10 +1614,7 @@ document.getElementById('mb').onclick=e=>{e.stopPropagation();document.getElemen
 document.onclick=()=>document.getElementById('menu').classList.remove('open');
 document.getElementById('q').onkeydown=e=>{if(e.key==='Enter'&&e.target.value.trim())location.hash='#/search/'+encodeURIComponent(e.target.value.trim())};
 const esc=s=>String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function api(p){
-  const r=await fetch(p);
-  const text=await r.text();
-  let data; try{data=JSON.parse(text)}catch{throw new Error(text.slice(0,200)||r.status)}
+async function api(p){const r=await fetch(p);const tx=await r.text();let j=null;try{j=JSON.parse(tx)}catch(e){throw new Error(r.ok?'Invalid JSON from API':('HTTP '+r.status+' — API error'))}if(!r.ok)throw new Error((j&&(j.detail||j.error))||('HTTP '+r.status));return j}catch{throw new Error(text.slice(0,200)||r.status)}
   if(!r.ok) throw new Error((data&&data.detail)||text.slice(0,200)||('HTTP '+r.status));
   return data;
 }
@@ -1589,11 +1676,27 @@ function renderP(){
   const play=s.play_url||s.url;
   document.getElementById('st').textContent=(PS.idx+1)+'/'+PS.sources.length+' · '+s.label+(s.type==='direct'?' · proxy':'');
   document.querySelectorAll('.src[data-i]').forEach((b,i)=>b.classList.toggle('on',i===PS.idx));
-  if(s.type==='embed') f.innerHTML=`<iframe src="${esc(play)}" allowfullscreen allow="autoplay;encrypted-media;picture-in-picture"></iframe>`;
-  else {
-    const v=document.createElement('video'); v.controls=true; v.autoplay=true; v.playsInline=true; v.style.cssText='width:100%;height:100%;background:#000';
-    v.src=play; v.onerror=()=>{window.__nx&&window.__nx()};
-    f.innerHTML=''; f.appendChild(v);
+  if(s.type==='embed'){
+    f.innerHTML=`<iframe src="${esc(play)}" allowfullscreen allow="autoplay;encrypted-media;picture-in-picture" style="width:100%;height:100%;border:0"></iframe>`;
+    return;
+  }
+  const isDash=/\.mpd(\?|$)/i.test(play)||/\.mpd(\?|$)/i.test(s.url||'')||(s.format||'').toUpperCase()==='DASH';
+  const isHls=/\.m3u8(\?|$)/i.test(play)||(s.format||'').toUpperCase()==='HLS';
+  f.innerHTML='';
+  const v=document.createElement('video');
+  v.controls=true; v.autoplay=true; v.playsInline=true;
+  v.style.cssText='width:100%;height:100%;background:#000';
+  v.onerror=()=>{window.__nx&&window.__nx()};
+  f.appendChild(v);
+  if(isDash&&window.dashjs){
+    try{
+      const player=dashjs.MediaPlayer().create();
+      player.updateSettings({streaming:{abortDelay:{enabled:true}}});
+      player.initialize(v, play, true);
+      player.on(dashjs.MediaPlayer.events.ERROR,()=>{window.__nx&&window.__nx()});
+    }catch(e){window.__nx&&window.__nx()}
+  }else{
+    v.src=play;
   }
 }
 window.__nx=()=>{if(PS.idx<PS.sources.length-1){PS.idx++;toast('Next source…');renderP()}else toast('All sources failed')};
