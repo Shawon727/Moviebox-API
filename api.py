@@ -1,4 +1,4 @@
-# StreamHub API v4.1.0
+# StreamHub API v5.0.0
 # MovieBox (HMAC) + 4KHDHub + HubCloud direct resolve
 
 import os
@@ -26,7 +26,7 @@ app = FastAPI(
         "**4KHDHub** (`/fk/*`) — search, releases, HubCloud resolve\n"
         "**Tools** (`/tools/*`) — HubCloud/HubDrive direct-link resolver"
     ),
-    version="4.1.0",
+    version="5.0.0",
     docs_url="/docs",
 )
 app.add_middleware(
@@ -783,7 +783,7 @@ background:var(--g);padding:4px 8px;border-radius:6px;text-align:center;align-se
 <div class="wrap">
   <div class="top">
     <div class="logo">Stream<span>Hub</span></div>
-    <div class="pill">v4.1 · multi-provider</div>
+    <div class="pill">v5.0 · multi-provider</div>
   </div>
   <div class="hero">
     <h1>One API.<br/>Multiple sources.</h1>
@@ -896,7 +896,7 @@ background:var(--g);padding:4px 8px;border-radius:6px;text-align:center;align-se
     </div>
   </div>
 
-  <div class="foot">StreamHub v4.1 · not affiliated with MovieBox or 4KHDHub</div>
+  <div class="foot">StreamHub v5.0 · not affiliated with MovieBox or 4KHDHub</div>
 </div>
 </body>
 </html>
@@ -915,7 +915,7 @@ async def root():
 
 @app.get("/health", tags=["Meta"])
 async def health():
-    return {"ok": True, "version": "4.1.0", "providers": ["moviebox", "4khdhub", "hubcloud-resolve"]}
+    return {"ok": True, "version": "5.0.0", "providers": ["moviebox", "4khdhub", "hubcloud", "tmdb", "embeds"]}
 
 
 # ----- MovieBox -----
@@ -1157,6 +1157,325 @@ async def legacy_stream(subject_id: str, se: int = 0, ep: int = 0, detail_path: 
 @app.get("/detail/{subject_id}", tags=["Legacy"], include_in_schema=False)
 async def legacy_detail(subject_id: str):
     return await mb_detail(subject_id)
+
+
+
+# =============================================================================
+# TMDB CATALOG + EMBED FAILOVER + SPA (v5)
+# =============================================================================
+import asyncio as _asyncio
+
+TMDB_KEY = os.environ.get("TMDB_API_KEY", "3fd2be6f0c70a2a598f084ddfb75487f")
+TMDB_BASE = "https://api.themoviedb.org/3"
+
+async def tmdb_get(path: str, **params):
+    params["api_key"] = TMDB_KEY
+    async with httpx.AsyncClient(timeout=12.0) as c:
+        r = await c.get(f"{TMDB_BASE}{path}", params=params)
+        if r.status_code != 200:
+            raise HTTPException(502, f"TMDB {r.status_code}")
+        return r.json()
+
+def tmdb_poster(path, size="w500"):
+    return f"https://image.tmdb.org/t/p/{size}{path}" if path else None
+
+def map_tmdb(x, media):
+    return {
+        "id": str(x.get("id")),
+        "name": x.get("title") or x.get("name"),
+        "poster": tmdb_poster(x.get("poster_path")),
+        "backdrop": tmdb_poster(x.get("backdrop_path"), "w1280"),
+        "year": (x.get("release_date") or x.get("first_air_date") or "")[:4] or None,
+        "rating": x.get("vote_average"),
+        "overview": x.get("overview"),
+        "type": media,
+        "provider": "tmdb",
+    }
+
+def embed_sources(tmdb_id, media, se=1, ep=1):
+    tid = tmdb_id
+    if media == "movie":
+        pairs = [
+            ("VidSrc", f"https://vidsrc.xyz/embed/movie/{tid}"),
+            ("VidSrc.to", f"https://vidsrc.to/embed/movie/{tid}"),
+            ("2Embed", f"https://www.2embed.cc/embed/{tid}"),
+            ("VidLink", f"https://vidlink.pro/movie/{tid}"),
+            ("SuperEmbed", f"https://multiembed.mov/?video_id={tid}&tmdb=1"),
+        ]
+    else:
+        pairs = [
+            ("VidSrc", f"https://vidsrc.xyz/embed/tv/{tid}/{se}/{ep}"),
+            ("VidSrc.to", f"https://vidsrc.to/embed/tv/{tid}/{se}/{ep}"),
+            ("2Embed", f"https://www.2embed.cc/embedtv/{tid}&s={se}&e={ep}"),
+            ("VidLink", f"https://vidlink.pro/tv/{tid}/{se}/{ep}"),
+            ("SuperEmbed", f"https://multiembed.mov/?video_id={tid}&tmdb=1&s={se}&e={ep}"),
+        ]
+    return [{"provider": "embed", "label": n, "url": u, "format": "EMBED", "type": "embed", "headers": {}} for n, u in pairs]
+
+@app.get("/api/home", tags=["Catalog"])
+async def api_home():
+    movies, tv, pop_m, pop_t = await _asyncio.gather(
+        tmdb_get("/trending/movie/week"),
+        tmdb_get("/trending/tv/week"),
+        tmdb_get("/movie/popular"),
+        tmdb_get("/tv/popular"),
+    )
+    return {
+        "trending_movies": [map_tmdb(x, "movie") for x in (movies.get("results") or [])[:18]],
+        "trending_tv": [map_tmdb(x, "tv") for x in (tv.get("results") or [])[:18]],
+        "popular_movies": [map_tmdb(x, "movie") for x in (pop_m.get("results") or [])[:18]],
+        "popular_tv": [map_tmdb(x, "tv") for x in (pop_t.get("results") or [])[:18]],
+    }
+
+@app.get("/api/movies", tags=["Catalog"])
+async def api_movies(page: int = 1):
+    data = await tmdb_get("/movie/popular", page=page)
+    return {"page": page, "items": [map_tmdb(x, "movie") for x in data.get("results") or []], "total_pages": data.get("total_pages")}
+
+@app.get("/api/series", tags=["Catalog"])
+async def api_series(page: int = 1):
+    data = await tmdb_get("/tv/popular", page=page)
+    return {"page": page, "items": [map_tmdb(x, "tv") for x in data.get("results") or []], "total_pages": data.get("total_pages")}
+
+@app.get("/api/search", tags=["Catalog"])
+async def api_search_catalog(q: str = Query(..., min_length=1)):
+    data = await tmdb_get("/search/multi", query=q)
+    items = []
+    for x in data.get("results") or []:
+        mt = x.get("media_type")
+        if mt in ("movie", "tv"):
+            items.append(map_tmdb(x, mt))
+    mb = []
+    try:
+        mb = (await mb_search(q))["items"] if False else []
+    except Exception:
+        pass
+    # use existing mb_search route logic via mb_request
+    try:
+        from fastapi.encoders import jsonable_encoder
+        # call internal search
+        data_mb = await mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2", {"keyword": q, "page": 1, "perPage": 12, "subjectType": 0})
+        raw = []
+        results = data_mb.get("results") or []
+        if results and isinstance(results[0], dict):
+            raw = results[0].get("subjects") or []
+        for s in raw:
+            if isinstance(s, dict) and "subject" in s:
+                s = s["subject"]
+            if not isinstance(s, dict):
+                continue
+            sid = s.get("subjectId") or s.get("id")
+            cover = s.get("cover") or {}
+            poster = cover.get("url") if isinstance(cover, dict) else s.get("coverUrl")
+            mb.append({"name": s.get("title") or s.get("name"), "id": str(sid) if sid is not None else None, "poster": poster, "type": "tv" if (s.get("subjectType") or s.get("stype")) == 2 else "movie", "provider": "moviebox"})
+    except Exception:
+        pass
+    return {"query": q, "tmdb": items, "moviebox": mb}
+
+@app.get("/api/detail/{media}/{tmdb_id}", tags=["Catalog"])
+async def api_detail(media: str, tmdb_id: str):
+    if media not in ("movie", "tv"):
+        raise HTTPException(400, "media must be movie|tv")
+    data = await tmdb_get(f"/{media}/{tmdb_id}")
+    seasons = []
+    if media == "tv":
+        for s in data.get("seasons") or []:
+            if (s.get("season_number") or 0) > 0:
+                seasons.append({"season": s.get("season_number"), "name": s.get("name"), "episode_count": s.get("episode_count"), "poster": tmdb_poster(s.get("poster_path"))})
+    return {
+        "id": str(data.get("id")),
+        "name": data.get("title") or data.get("name"),
+        "overview": data.get("overview"),
+        "poster": tmdb_poster(data.get("poster_path")),
+        "backdrop": tmdb_poster(data.get("backdrop_path"), "w1280"),
+        "year": (data.get("release_date") or data.get("first_air_date") or "")[:4],
+        "rating": data.get("vote_average"),
+        "genres": [g.get("name") for g in data.get("genres") or []],
+        "type": media,
+        "seasons": seasons,
+    }
+
+@app.get("/api/tv/{tmdb_id}/season/{season}", tags=["Catalog"])
+async def api_season(tmdb_id: str, season: int):
+    data = await tmdb_get(f"/tv/{tmdb_id}/season/{season}")
+    return {"season": season, "episodes": [{"episode": e.get("episode_number"), "name": e.get("name"), "overview": e.get("overview"), "still": tmdb_poster(e.get("still_path"), "w300")} for e in data.get("episodes") or []]}
+
+@app.get("/api/play", tags=["Playback"])
+async def api_play(tmdb_id: str = Query(...), media: str = Query("movie"), se: int = 0, ep: int = 0):
+    """Ordered failover list: MovieBox direct (by title search) then public embeds."""
+    sources = []
+    errors = {}
+    title = ""
+    try:
+        d = await tmdb_get(f"/{media}/{tmdb_id}")
+        title = d.get("title") or d.get("name") or ""
+    except Exception as e:
+        errors["tmdb"] = str(e)
+    if title:
+        try:
+            data_mb = await mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2", {"keyword": title, "page": 1, "perPage": 5, "subjectType": 0})
+            raw = []
+            results = data_mb.get("results") or []
+            if results and isinstance(results[0], dict):
+                raw = results[0].get("subjects") or []
+            sid = None
+            for s in raw:
+                if isinstance(s, dict) and "subject" in s:
+                    s = s["subject"]
+                if isinstance(s, dict) and (s.get("subjectId") or s.get("id")):
+                    sid = str(s.get("subjectId") or s.get("id"))
+                    break
+            if sid:
+                # reuse mb_stream logic
+                se_use = se if media == "tv" else 0
+                ep_use = ep if media == "tv" else 0
+                if se_use == 0 and ep_use == 0:
+                    path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={sid}"
+                else:
+                    path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={sid}&se={se_use}&ep={ep_use}"
+                try:
+                    pdata = await mb_request("GET", path)
+                except Exception:
+                    pdata = await mb_request("GET", path.replace("/play-info/v2", "/play-info"))
+                for s in _parse_mb_play_info(pdata if isinstance(pdata, dict) else {}, _mb_ua):
+                    sources.append({
+                        "provider": "moviebox",
+                        "label": f"MovieBox {s.get('resolution') or s.get('format')}",
+                        "url": s["url"],
+                        "format": s.get("format"),
+                        "type": "direct",
+                        "headers": s.get("headers") or {},
+                    })
+        except Exception as e:
+            errors["moviebox"] = str(e)
+    sources.extend(embed_sources(tmdb_id, media, se or 1, ep or 1))
+    seen = set()
+    uniq = []
+    for s in sources:
+        u = s.get("url")
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        uniq.append(s)
+    return {"tmdb_id": tmdb_id, "media": media, "se": se, "ep": ep, "title": title, "count": len(uniq), "sources": uniq, "errors": errors or None, "strategy": "moviebox → embeds failover"}
+
+
+
+SPA_HTML = """<!DOCTYPE html>
+<html lang=en><head>
+<meta charset=UTF-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>StreamHub</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800&display=swap" rel=stylesheet>
+<style>
+:root{--bg:#05060a;--card:#141722;--line:#1e2333;--text:#f0f2f8;--mute:#8b93a7;--a:#6c5ce7;--a2:#00d2d3}
+*{box-sizing:border-box;margin:0;padding:0}body{font-family:Outfit,system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+a{color:inherit;text-decoration:none}button{font:inherit;cursor:pointer;border:0;background:0;color:inherit}
+.nav{position:sticky;top:0;z-index:40;display:flex;gap:12px;align-items:center;padding:12px 18px;background:rgba(5,6,10,.88);backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
+.logo{font-weight:800;font-size:1.3rem}.logo span{background:linear-gradient(135deg,var(--a),var(--a2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.nav a.n{padding:8px 12px;border-radius:10px;color:var(--mute)}.nav a.n:hover,.nav a.n.on{background:var(--card);color:var(--text)}
+.nav .r{margin-left:auto;display:flex;gap:8px;align-items:center}
+.nav input{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 12px;color:var(--text);width:160px}
+.ib{width:38px;height:38px;border-radius:10px;background:var(--card);border:1px solid var(--line);display:grid;place-items:center}
+.menu{position:absolute;right:18px;top:56px;width:260px;background:#0e1018;border:1px solid var(--line);border-radius:14px;padding:8px;display:none;z-index:50;box-shadow:0 16px 40px #0008}
+.menu.open{display:block}.menu a{display:block;padding:10px 12px;border-radius:8px;font-size:.88rem}.menu a:hover{background:var(--card)}
+.menu h4{font-size:.65rem;color:var(--mute);text-transform:uppercase;padding:8px 12px 2px;letter-spacing:.06em}
+main{padding-bottom:40px}.hero{position:relative;height:min(58vh,480px);overflow:hidden}
+.hero img{width:100%;height:100%;object-fit:cover;filter:brightness(.5)}
+.hero .g{position:absolute;inset:0;background:linear-gradient(0deg,var(--bg),transparent 55%)}
+.hero .b{position:absolute;left:0;right:0;bottom:0;padding:24px;max-width:640px}
+.hero h1{font-size:clamp(1.6rem,4vw,2.6rem);font-weight:800;margin-bottom:8px}
+.hero p{color:var(--mute);display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;margin-bottom:14px}
+.btn{display:inline-flex;padding:11px 18px;border-radius:12px;font-weight:600;background:linear-gradient(135deg,var(--a),#8b7cf7);color:#fff}
+.btn2{background:rgba(255,255,255,.08);border:1px solid var(--line);margin-left:8px}
+.sec{padding:0 16px 24px}.sec h2{font-size:1.15rem;margin:8px 0 12px}
+.row{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(110px,140px);gap:10px;overflow-x:auto;padding-bottom:6px}
+.card{cursor:pointer}.card .p{aspect-ratio:2/3;border-radius:12px;overflow:hidden;background:var(--card);border:1px solid var(--line)}
+.card img{width:100%;height:100%;object-fit:cover}.card .t{font-size:.82rem;font-weight:600;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card .s{font-size:.72rem;color:var(--mute)}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:12px}
+.player{max-width:1000px;margin:0 auto;padding:16px}.frame{aspect-ratio:16/9;background:#000;border-radius:14px;overflow:hidden;border:1px solid var(--line)}
+.frame iframe,.frame video{width:100%;height:100%;border:0}.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 0}
+.src{padding:7px 11px;border-radius:9px;background:var(--card);border:1px solid var(--line);font-size:.78rem}
+.src.on{border-color:var(--a);background:#6c5ce733}.ep{min-width:40px;padding:7px 9px;border-radius:9px;background:var(--card);border:1px solid var(--line)}
+.ep.on{background:var(--a);border-color:var(--a)}.empty{text-align:center;padding:48px;color:var(--mute)}
+.detail{display:flex;gap:20px;flex-wrap:wrap;padding:28px 16px;max-width:1000px;margin:0 auto}
+.detail .pos{width:160px;border-radius:12px;overflow:hidden;border:1px solid var(--line)}.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#0e1018;border:1px solid var(--line);padding:10px 16px;border-radius:10px;display:none;z-index:99}
+.toast.show{display:block}
+</style></head><body>
+<nav class="nav">
+<a class="logo" href="#/">Stream<span>Hub</span></a>
+<a class="n" href="#/" data-n=home>Home</a>
+<a class="n" href="#/movies" data-n=movies>Movies</a>
+<a class="n" href="#/series" data-n=series>Series</a>
+<div class="r">
+<input id=q placeholder="Search…">
+<button class="ib" id=mb>⋮</button>
+</div>
+<div class="menu" id=menu>
+<h4>API sections</h4>
+<a href=/docs target=_blank>Swagger /docs</a>
+<a href=/mb/search?q=Avatar target=_blank>MovieBox /mb</a>
+<a href=/fk/search?q=Dune target=_blank>4KHDHub /fk</a>
+<a href=/tools/resolve?url=https://hubcloud.ist/drive/x target=_blank>HubCloud /tools</a>
+<a href=/api/home target=_blank>Catalog /api</a>
+<a href=/api/play?tmdb_id=550&media=movie target=_blank>Play failover /api/play</a>
+<h4>System</h4>
+<a href=/health target=_blank>Health</a>
+</div>
+</nav>
+<main id=root><div class=empty>Loading…</div></main>
+<div class=toast id=toast></div>
+<script>
+const root=document.getElementById('root');
+const toast=(m)=>{const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500)};
+document.getElementById('mb').onclick=e=>{e.stopPropagation();document.getElementById('menu').classList.toggle('open')};
+document.onclick=()=>document.getElementById('menu').classList.remove('open');
+document.getElementById('q').onkeydown=e=>{if(e.key==='Enter'&&e.target.value.trim())location.hash='#/search/'+encodeURIComponent(e.target.value.trim())};
+const esc=s=>String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function api(p){const r=await fetch(p);if(!r.ok)throw new Error(await r.text());return r.json()}
+function card(i){const t=i.type||'movie';return `<div class=card onclick="location.hash='#/title/${t}/${i.id}'"><div class=p>${i.poster?`<img loading=lazy src="${i.poster}">`:''}</div><div class=t>${esc(i.name)}</div><div class=s>${i.year||''} · ${t}</div></div>`}
+function row(title,items){if(!items||!items.length)return '';return `<section class=sec><h2>${esc(title)}</h2><div class=row>${items.map(card).join('')}</div></section>`}
+function setNav(n){document.querySelectorAll('[data-n]').forEach(a=>a.classList.toggle('on',a.dataset.n===n))}
+async function home(){setNav('home');root.innerHTML='<div class=empty>Loading…</div>';const d=await api('/api/home');const h=(d.trending_movies&&d.trending_movies[0])||d.trending_tv[0];
+let html='';if(h)html+=`<div class=hero><img src="${h.backdrop||h.poster||''}"><div class=g></div><div class=b><h1>${esc(h.name)}</h1><p>${esc(h.overview||'')}</p><a class=btn href="#/watch/${h.type}/${h.id}">▶ Watch</a><a class="btn btn2" href="#/title/${h.type}/${h.id}">Details</a></div></div>`;
+html+=row('Trending Movies',d.trending_movies)+row('Trending Series',d.trending_tv)+row('Popular Movies',d.popular_movies)+row('Popular Series',d.popular_tv);root.innerHTML=html}
+async function grid(k){setNav(k);root.innerHTML='<div class=empty>Loading…</div>';const d=await api(k==='movies'?'/api/movies':'/api/series');root.innerHTML=`<section class=sec style="padding-top:20px"><h2>${k==='movies'?'Movies':'Series'}</h2><div class=grid>${(d.items||[]).map(card).join('')}</div></section>`}
+async function search(q){setNav('');root.innerHTML='<div class=empty>Searching…</div>';const d=await api('/api/search?q='+encodeURIComponent(q));
+root.innerHTML=`<section class=sec style="padding-top:20px"><h2>Results · ${esc(q)}</h2><div class=grid>${(d.tmdb||[]).map(card).join('')}</div></section>`}
+async function title(media,id){setNav('');root.innerHTML='<div class=empty>Loading…</div>';const d=await api(`/api/detail/${media}/${id}`);
+root.innerHTML=`<div class=detail><div class=pos>${d.poster?`<img src="${d.poster}" style="width:100%">`:''}</div><div style="flex:1;min-width:220px"><h1 style="font-size:1.8rem;font-weight:800;margin-bottom:8px">${esc(d.name)}</h1>
+<p style="color:var(--mute);margin-bottom:8px">${esc(d.year||'')} · ★ ${d.rating||'-'}</p><p style="color:var(--mute);line-height:1.5;margin-bottom:14px">${esc(d.overview||'')}</p>
+<a class=btn href="#/watch/${media}/${id}${media==='tv'?'?se=1&ep=1':''}">▶ Play</a></div></div>
+${media==='tv'&&d.seasons?`<section class=sec><h2>Seasons</h2><div class=row>${d.seasons.map(s=>`<div class=card onclick="location.hash='#/watch/tv/${id}?se=${s.season}&ep=1'"><div class=p>${s.poster?`<img src="${s.poster}">`:''}</div><div class=t>${esc(s.name||('S'+s.season))}</div></div>`).join('')}</div></section>`:''}`}
+let PS={sources:[],idx:0};
+function renderP(){const s=PS.sources[PS.idx];const f=document.getElementById('frame');if(!s){f.innerHTML='<div class=empty>No sources</div>';return}
+document.getElementById('st').textContent=`${PS.idx+1}/${PS.sources.length} · ${s.label}`;
+document.querySelectorAll('.src').forEach((b,i)=>b.classList.toggle('on',i===PS.idx));
+if(s.type==='embed')f.innerHTML=`<iframe src="${s.url}" allowfullscreen allow="autoplay;encrypted-media"></iframe>`;
+else f.innerHTML=`<video controls autoplay playsinline src="${s.url}" onerror="window.__nx&&window.__nx()"></video>`}
+window.__nx=()=>{if(PS.idx<PS.sources.length-1){PS.idx++;toast('Next source…');renderP()}else toast('All sources failed')};
+async function watch(media,id,se,ep){setNav('');PS={sources:[],idx:0,media,id,se:se||1,ep:ep||1};
+root.innerHTML=`<div class=player><div class=frame id=frame><div class=empty>Resolving…</div></div>
+<div class=bar><span id=st style="color:var(--mute);font-size:.8rem">…</span>
+<button class=src onclick="window.__nx()">Next source ↻</button>
+<a class=src href="#/title/${media}/${id}">Details</a></div><div id=srcs></div><div id=eps></div></div>`;
+try{const d=await api(`/api/play?tmdb_id=${id}&media=${media}&se=${PS.se}&ep=${PS.ep}`);PS.sources=d.sources||[];
+document.getElementById('srcs').innerHTML=PS.sources.map((s,i)=>`<button class="src ${i===0?'on':''}" onclick="PS.idx=${i};renderP()">${esc(s.label)}</button>`).join(' ');
+renderP()}catch(e){document.getElementById('frame').innerHTML=`<div class=empty>${esc(e.message)}</div>`}
+if(media==='tv'){try{const det=await api(`/api/detail/tv/${id}`);const sn=PS.se;const sd=await api(`/api/tv/${id}/season/${sn}`);
+document.getElementById('eps').innerHTML=`<div style="margin-top:10px"><select id=seSel style="background:var(--card);color:var(--text);border:1px solid var(--line);padding:8px;border-radius:8px">${(det.seasons||[]).map(s=>`<option value=${s.season} ${s.season==sn?'selected':''}>${esc(s.name||('S'+s.season))}</option>`).join('')}</select></div>
+<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">${(sd.episodes||[]).map(e=>`<button class="ep ${e.episode==PS.ep?'on':''}" onclick="location.hash='#/watch/tv/${id}?se=${sn}&ep=${e.episode}'">${e.episode}</button>`).join('')}</div>`;
+document.getElementById('seSel').onchange=ev=>{location.hash=`#/watch/tv/${id}?se=${+ev.target.value}&ep=1`}}catch{}}}
+async function router(){const h=location.hash.slice(1)||'/';const [path,qs]=h.split('?');const params=Object.fromEntries(new URLSearchParams(qs||''));const p=path.split('/').filter(Boolean);
+try{if(!p.length)return home();if(p[0]==='movies')return grid('movies');if(p[0]==='series')return grid('series');
+if(p[0]==='search'&&p[1])return search(decodeURIComponent(p[1]));if(p[0]==='title')return title(p[1],p[2]);
+if(p[0]==='watch')return watch(p[1],p[2],+(params.se||1),+(params.ep||1));root.innerHTML='<div class=empty>Not found</div>'}catch(e){root.innerHTML=`<div class=empty>${esc(e.message)}</div>`}}
+window.addEventListener('hashchange',router);router();
+</script></body></html>"""
+
+
+@app.get("/site", response_class=HTMLResponse, tags=["Meta"])
+async def site_spa():
+    return HTMLResponse(SPA_HTML)
 
 
 if __name__ == "__main__":
