@@ -516,7 +516,7 @@ async def fk_fetch(path_or_url: str) -> str:
 
 
 def fk_parse_search(html: str) -> List[dict]:
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
     items: List[dict] = []
     for card in soup.select("a.movie-card"):
         href = card.get("href") or ""
@@ -546,7 +546,7 @@ def fk_parse_search(html: str) -> List[dict]:
 
 
 def fk_parse_releases(html: str, season: int = 0, episode: int = 0) -> List[dict]:
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
     item_sel = "#episodes .episode-download-item" if season > 0 else ".download-item"
     title_sel = ".episode-file-title" if season > 0 else ".file-title"
     releases: List[dict] = []
@@ -969,7 +969,7 @@ async def fk_detail(
     id: str = Query(..., description="Path id from search, e.g. /some-movie/"),
 ):
     html = await fk_fetch(id)
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
     h1 = soup.select_one("h1")
     title = h1.get_text(strip=True) if h1 else id
     og = soup.select_one('meta[property="og:image"]')
