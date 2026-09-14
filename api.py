@@ -15,7 +15,7 @@ from typing import Optional, Any, List, Dict, Tuple
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
@@ -727,13 +727,9 @@ async def health():
     return {"ok": True, "version": "5.0.0", "providers": ["moviebox", "4khdhub", "hubcloud", "tmdb", "embeds"]}
 
 
-# ----- MovieBo
-
-
-
-
+# ----- Mov
 # =============================================================================
-# STREAM PROXY — stateless base64 token + DASH BaseURL mode for $Number$ templates
+# STREAM PROXY — MovieBox-TUI style (Cookie/UA on every segment + Range + MPD rewrite)
 # =============================================================================
 
 def _b64url_encode(obj: dict) -> str:
@@ -747,213 +743,224 @@ def _b64url_decode(s: str) -> dict:
 
 
 def _proxy_url(src: dict, base: str = "") -> str:
-    """For direct streams. DASH MPD uses /proxy/dash/{tok}/ so templates keep $Number$."""
+    """play_url for browser: /proxy/file/{token} where token holds url+cookie+ua+referer."""
     if src.get("type") != "direct" or not src.get("url"):
         return src.get("url") or ""
     h = src.get("headers") or {}
-    cookie = h.get("Cookie") or h.get("cookie") or ""
-    referer = h.get("Referer") or h.get("referer") or "https://sportslive.wine"
-    ua = h.get("User-Agent") or h.get("user-agent") or (_mb_ua or "Mozilla/5.0")
-    url = src["url"]
-    # DASH: client loads MPD via /proxy/file/{tok}; MPD rewritten to use /proxy/dash/{dir_tok}/
-    tok = _b64url_encode({"u": url, "c": cookie, "r": referer, "a": ua})
+    tok = _b64url_encode({
+        "u": src["url"],
+        "c": h.get("Cookie") or h.get("cookie") or "",
+        "r": h.get("Referer") or h.get("referer") or "https://sportslive.wine",
+        "a": h.get("User-Agent") or h.get("user-agent") or (_mb_ua or "Mozilla/5.0"),
+    })
     return f"/proxy/file/{tok}"
 
 
+def _auth_headers(cookie: str, referer: str, ua: str) -> dict:
+    h = {
+        "User-Agent": ua or "Mozilla/5.0",
+        "Accept": "*/*",
+        "Referer": referer or "https://sportslive.wine",
+        "Origin": "https://sportslive.wine",
+    }
+    if cookie:
+        h["Cookie"] = cookie
+    return h
+
+
 @app.get("/proxy/file/{token}", tags=["Playback"])
-async def proxy_file(token: str):
-    """Fetch a single file (MPD/m3u8/mp4). Rewrites manifests for segment proxying."""
+async def proxy_file(token: str, request: Request):
     try:
         meta = _b64url_decode(token)
     except Exception:
         raise HTTPException(400, "bad token")
-    return await _proxy_fetch_and_rewrite(
-        meta.get("u") or "",
-        meta.get("c") or "",
-        meta.get("r") or "https://sportslive.wine",
-        meta.get("a") or "Mozilla/5.0",
-    )
-
-
-@app.get("/proxy/dash/{token}/{path:path}", tags=["Playback"])
-async def proxy_dash_segment(token: str, path: str = ""):
-    """DASH segment under a directory BaseURL. path may include $ already substituted by player."""
-    try:
-        meta = _b64url_decode(token)
-    except Exception:
-        raise HTTPException(400, "bad dash token")
-    base = (meta.get("u") or "").rstrip("/") + "/"
-    url = base + path.lstrip("/")
-    return await _proxy_raw(
+    url = meta.get("u") or ""
+    return await _proxy_upstream(
         url,
         meta.get("c") or "",
         meta.get("r") or "https://sportslive.wine",
         meta.get("a") or "Mozilla/5.0",
+        range_header=request.headers.get("range") if request else None,
+        rewrite_manifest=True,
+        token_cookie=meta.get("c") or "",
+        token_ref=meta.get("r") or "https://sportslive.wine",
+        token_ua=meta.get("a") or "Mozilla/5.0",
     )
 
 
-@app.get("/proxy/{token}", tags=["Playback"])
-async def proxy_legacy(token: str):
-    """Back-compat single-token proxy."""
+@app.api_route("/proxy/cdn/{token}/{path:path}", methods=["GET", "HEAD"], tags=["Playback"])
+async def proxy_cdn(token: str, path: str, request: Request):
+    """Segment/path under CDN — TUI equivalent of /https/host/path with auth."""
     try:
         meta = _b64url_decode(token)
     except Exception:
         raise HTTPException(400, "bad token")
-    return await _proxy_fetch_and_rewrite(
+    base = (meta.get("u") or "").rstrip("/")
+    # meta.u is directory URL ending with /
+    if not base.endswith("/"):
+        base = base + "/"
+    url = base + path.lstrip("/")
+    return await _proxy_upstream(
+        url,
+        meta.get("c") or "",
+        meta.get("r") or "https://sportslive.wine",
+        meta.get("a") or "Mozilla/5.0",
+        range_header=request.headers.get("range"),
+        rewrite_manifest=False,
+    )
+
+
+@app.get("/proxy/{token}", tags=["Playback"])
+async def proxy_legacy(token: str, request: Request):
+    try:
+        meta = _b64url_decode(token)
+    except Exception:
+        raise HTTPException(400, "bad token")
+    return await _proxy_upstream(
         meta.get("u") or "",
         meta.get("c") or "",
         meta.get("r") or "https://sportslive.wine",
         meta.get("a") or "Mozilla/5.0",
+        range_header=request.headers.get("range"),
+        rewrite_manifest=True,
+        token_cookie=meta.get("c") or "",
+        token_ref=meta.get("r") or "https://sportslive.wine",
+        token_ua=meta.get("a") or "Mozilla/5.0",
     )
 
 
-async def _proxy_raw(url: str, cookie: str, referer: str, ua: str):
+async def _proxy_upstream(
+    url: str,
+    cookie: str,
+    referer: str,
+    ua: str,
+    range_header: Optional[str] = None,
+    rewrite_manifest: bool = False,
+    token_cookie: str = "",
+    token_ref: str = "",
+    token_ua: str = "",
+):
     if not url.startswith(("https://", "http://")):
-        raise HTTPException(400, "bad upstream")
-    headers = {
-        "User-Agent": ua or "Mozilla/5.0",
-        "Accept": "*/*",
-        "Referer": referer or "https://sportslive.wine",
-    }
-    if cookie:
-        headers["Cookie"] = cookie
-    async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-        try:
-            r = await client.get(url, headers=headers)
-        except Exception as e:
-            raise HTTPException(502, f"proxy: {e}")
-        if r.status_code >= 400:
-            raise HTTPException(r.status_code, f"upstream {r.status_code}")
-        ctype = (r.headers.get("content-type") or "application/octet-stream").split(";")[0]
-        return Response(
-            content=r.content,
-            media_type=ctype,
-            headers={"cache-control": "no-store", "access-control-allow-origin": "*"},
-        )
-
-
-async def _proxy_fetch_and_rewrite(url: str, cookie: str, referer: str, ua: str):
-    if not url.startswith(("https://", "http://")):
-        raise HTTPException(400, "Only http(s)")
-    headers = {
-        "User-Agent": ua or "Mozilla/5.0",
-        "Accept": "*/*",
-        "Referer": referer or "https://sportslive.wine",
-    }
-    if cookie:
-        headers["Cookie"] = cookie
+        raise HTTPException(400, "bad upstream url")
+    headers = _auth_headers(cookie, referer, ua)
+    if range_header:
+        headers["Range"] = range_header
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
         try:
             upstream = await client.get(url, headers=headers)
         except Exception as e:
-            raise HTTPException(502, f"proxy failed: {e}")
+            raise HTTPException(502, f"proxy: {e}")
+
         if upstream.status_code >= 400:
             raise HTTPException(upstream.status_code, f"upstream {upstream.status_code}")
 
         ctype = (upstream.headers.get("content-type") or "").lower()
         body = upstream.content
         final_url = str(upstream.url)
-        is_mpd = ".mpd" in url.lower() or "mpd" in ctype or body[:200].lstrip().startswith(b"<?xml")
-        is_m3u = ".m3u8" in url.lower() or "mpegurl" in ctype or body[:7] == b"#EXTM3U"
+        is_mpd = (
+            rewrite_manifest
+            and (
+                final_url.lower().endswith(".mpd")
+                or "mpd" in ctype
+                or body[:200].lstrip().startswith(b"<?xml")
+            )
+        )
+        is_m3u = rewrite_manifest and (
+            final_url.lower().endswith(".m3u8") or "mpegurl" in ctype or body[:7] == b"#EXTM3U"
+        )
 
         if is_mpd:
-            try:
-                text = body.decode("utf-8", errors="ignore")
-                import re as _re
-                # Directory for segments
-                dir_url = final_url.rsplit("/", 1)[0] + "/"
-                dir_tok = _b64url_encode({"u": dir_url, "c": cookie, "r": referer, "a": ua})
-                proxy_base = f"/proxy/dash/{dir_tok}/"
+            text = body.decode("utf-8", errors="ignore")
+            # Directory for relative segments
+            dir_url = final_url.rsplit("/", 1)[0] + "/"
+            host = urlparse(final_url).hostname or ""
+            dir_tok = _b64url_encode({
+                "u": dir_url,
+                "c": token_cookie or cookie,
+                "r": token_ref or referer,
+                "a": token_ua or ua,
+            })
+            proxy_base = f"/proxy/cdn/{dir_tok}/"
 
-                # Strip existing BaseURL, inject ours
-                text = _re.sub(r"<BaseURL[^>]*>[^<]*</BaseURL>", "", text, flags=_re.I)
-                # Insert BaseURL after <Period ...> or after opening MPD content
+            # TUI-style: rewrite absolute CDN host URLs → our proxy base + path
+            https_prefix = f"https://{host}/"
+            http_prefix = f"http://{host}/"
+            text = text.replace(https_prefix, proxy_base).replace(http_prefix, proxy_base)
+
+            # Inject BaseURL for relative SegmentTemplate ($Number$ stays intact)
+            import re as _re
+            if not _re.search(r"<BaseURL>", text, _re.I):
                 if _re.search(r"<Period[^>]*>", text, _re.I):
                     text = _re.sub(
                         r"(<Period[^>]*>)",
-                        r"\1\n\t\t<BaseURL>" + proxy_base + r"</BaseURL>",
+                        rf"\1\n    <BaseURL>{proxy_base}</BaseURL>",
                         text,
                         count=1,
                         flags=_re.I,
                     )
                 else:
-                    text = text.replace(
-                        "<MPD",
-                        "<MPD",
-                        1,
-                    )
                     text = _re.sub(
                         r"(<MPD[^>]*>)",
-                        r"\1\n\t<BaseURL>" + proxy_base + r"</BaseURL>",
+                        rf"\1\n  <BaseURL>{proxy_base}</BaseURL>",
                         text,
                         count=1,
                         flags=_re.I,
                     )
 
-                # If media/initialization are absolute http URLs, make them relative filenames only
-                def to_rel(m):
-                    attr, val = m.group(1), m.group(2)
-                    if val.startswith("http://") or val.startswith("https://"):
-                        # keep only path after last folder that looks like template
-                        name = val.rsplit("/", 1)[-1]
-                        return f'{attr}="{name}"'
-                    if val.startswith("/proxy/"):
-                        # already wrong from old code — extract original if possible
-                        return f'{attr}="{val.rsplit("/", 1)[-1]}"'
-                    return m.group(0)
-
-                text = _re.sub(
-                    r'\b(media|initialization|sourceURL)=["\']([^"\']+)["\']',
-                    to_rel,
-                    text,
-                    flags=_re.I,
-                )
-                return Response(
-                    content=text.encode("utf-8"),
-                    media_type="application/dash+xml",
-                    headers={"cache-control": "no-store", "access-control-allow-origin": "*"},
-                )
-            except Exception:
-                pass
+            return Response(
+                content=text.encode("utf-8"),
+                status_code=200,
+                media_type="application/dash+xml",
+                headers={
+                    "cache-control": "no-store",
+                    "access-control-allow-origin": "*",
+                    "access-control-expose-headers": "Content-Length, Content-Range, Accept-Ranges",
+                },
+            )
 
         if is_m3u:
-            try:
-                text = body.decode("utf-8", errors="ignore")
-                import re as _re
-                dir_url = final_url.rsplit("/", 1)[0] + "/"
-                out = []
-                for line in text.splitlines():
-                    if line and not line.startswith("#"):
-                        seg = line.strip()
-                        if not seg.startswith("http"):
-                            seg = dir_url + seg
-                        tok = _b64url_encode({"u": seg, "c": cookie, "r": referer, "a": ua})
-                        out.append(f"/proxy/file/{tok}")
-                    elif "URI=" in line:
-                        def repl(m):
-                            u = m.group(1)
-                            if not u.startswith("http"):
-                                u = dir_url + u
-                            tok = _b64url_encode({"u": u, "c": cookie, "r": referer, "a": ua})
-                            return f'URI="/proxy/file/{tok}"'
-                        out.append(_re.sub(r'URI="([^"]+)"', repl, line))
-                    else:
-                        out.append(line)
-                return Response(
-                    content="\n".join(out).encode("utf-8"),
-                    media_type="application/vnd.apple.mpegurl",
-                    headers={"cache-control": "no-store", "access-control-allow-origin": "*"},
-                )
-            except Exception:
-                pass
+            text = body.decode("utf-8", errors="ignore")
+            dir_url = final_url.rsplit("/", 1)[0] + "/"
+            out = []
+            for line in text.splitlines():
+                if line and not line.startswith("#"):
+                    seg = line.strip()
+                    if not seg.startswith("http"):
+                        seg = dir_url + seg
+                    tok = _b64url_encode({
+                        "u": seg,
+                        "c": token_cookie or cookie,
+                        "r": token_ref or referer,
+                        "a": token_ua or ua,
+                    })
+                    out.append(f"/proxy/file/{tok}")
+                else:
+                    out.append(line)
+            return Response(
+                content="\n".join(out).encode("utf-8"),
+                media_type="application/vnd.apple.mpegurl",
+                headers={"cache-control": "no-store", "access-control-allow-origin": "*"},
+            )
 
-        media_type = ctype.split(";")[0] if ctype else "application/octet-stream"
+        # Binary segment / mp4 — stream with Range support
+        out_headers = {
+            "cache-control": "no-store",
+            "access-control-allow-origin": "*",
+            "access-control-expose-headers": "Content-Length, Content-Range, Accept-Ranges",
+        }
+        for k in ("content-type", "content-length", "content-range", "accept-ranges"):
+            if k in upstream.headers:
+                out_headers[k] = upstream.headers[k]
+        media_type = (ctype.split(";")[0] if ctype else None) or "application/octet-stream"
         return Response(
             content=body,
+            status_code=upstream.status_code,
             media_type=media_type,
-            headers={"cache-control": "no-store", "access-control-allow-origin": "*"},
+            headers=out_headers,
         )
+
+
 
 
 
@@ -1625,6 +1632,7 @@ async def api_play(
                 "label": f"MovieBox {s.get('resolution') or s.get('format') or ''}".strip(),
                 "url": s["url"],
                 "format": s.get("format"),
+                "codec": s.get("codec"),
                 "type": "direct",
                 "headers": s.get("headers") or {},
             })
@@ -1648,14 +1656,7 @@ async def api_play(
         errors["moviebox"] = str(e)
 
     
-    # Attach proxy URLs for direct sources (Cookie/UA required by CDN)
-    for s in sources:
-        if s.get("type") == "direct":
-            s["play_url"] = _proxy_url(s)
-        else:
-            s["play_url"] = s.get("url")
-
-    # Always try embed backups (more reliable on cloud hosts)
+    # MovieBox-only direct play (TUI-style). No third-party embeds.
     title = q or ""
     if not title and sid:
         try:
@@ -1664,14 +1665,19 @@ async def api_play(
             title = sub.get("title") or sub.get("name") or ""
         except Exception:
             pass
-    if title:
-        meta = await _tmdb_search_id(title, media)
-        if meta:
-            sources.extend(_embed_sources_meta(meta, media, se or 1, ep or 1))
+
+    for s in sources:
+        codec = (s.get("codec") or "").lower()
+        url_l = (s.get("url") or "").lower()
+        if "hevc" in codec or "h265" in codec or "h265" in url_l or "hev1" in codec:
+            s["codec"] = "hevc"
+            s["hevc"] = True
+            if "HEVC" not in (s.get("label") or ""):
+                s["label"] = (s.get("label") or "MovieBox") + " · HEVC"
+        if s.get("type") == "direct":
+            s["play_url"] = _proxy_url(s)
         else:
-            errors["embed"] = "no meta match for title: " + title[:60]
-    else:
-        errors["embed"] = "no title for embed lookup"
+            s["play_url"] = s.get("url")
 
     seen = set()
     uniq = []
@@ -1693,7 +1699,8 @@ async def api_play(
         "count": len(uniq),
         "sources": uniq,
         "errors": errors or None,
-        "strategy": "moviebox-direct(+proxy) → embed failover",
+        "strategy": "moviebox-direct-only (TUI-style proxy)",
+        "note": "Streams are MPEG-DASH via signed CDN (often HEVC). Proxy injects Cookie like MovieBox-TUI.",
     }
 
 
@@ -1845,41 +1852,97 @@ async function title(media,id){
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
 let PS={sources:[],idx:0};
+
+let dashPlayer=null;
+function destroyPlayer(){
+  try{ if(dashPlayer){ dashPlayer.reset(); dashPlayer=null; } }catch(e){}
+}
 function renderP(){
   const s=PS.sources[PS.idx]; const f=document.getElementById('frame');
   if(!s){f.innerHTML='<div class="empty">No sources</div>';return}
+  destroyPlayer();
   const play=s.play_url||s.url;
-  document.getElementById('st').textContent=(PS.idx+1)+'/'+PS.sources.length+' · '+s.label+(s.type==='direct'?' · proxy':'');
+  const st=document.getElementById('st');
+  if(st) st.textContent=(PS.idx+1)+'/'+PS.sources.length+' · '+s.label;
+  const ext=document.getElementById('extPlay');
+  if(ext){ ext.href=play; ext.style.display=s.type==='direct'?'inline-flex':'none'; }
   document.querySelectorAll('.src[data-i]').forEach((b,i)=>b.classList.toggle('on',i===PS.idx));
+  const qsel=document.getElementById('qsel');
+  if(qsel){ qsel.innerHTML=''; qsel.style.display='none'; }
+
   if(s.type==='embed'){
-    f.innerHTML=`<iframe src="${esc(play)}" allowfullscreen allow="autoplay;encrypted-media;picture-in-picture" style="width:100%;height:100%;border:0"></iframe>`;
+    f.innerHTML=`<iframe src="${esc(play)}" allowfullscreen allow="autoplay;encrypted-media;picture-in-picture" style="width:100%;height:100%;border:0;background:#000"></iframe>`;
     return;
   }
-  const isDash=/\.mpd(\?|$)/i.test(play)||/\.mpd(\?|$)/i.test(s.url||'')||(s.format||'').toUpperCase()==='DASH';
-  const isHls=/\.m3u8(\?|$)/i.test(play)||(s.format||'').toUpperCase()==='HLS';
+
+  const isDash=/\.mpd(\?|$)/i.test(s.url||'')||/\.mpd(\?|$)/i.test(play)||(s.format||'').toUpperCase()==='DASH'||!!s.hevc;
   f.innerHTML='';
   const v=document.createElement('video');
   v.controls=true; v.autoplay=true; v.playsInline=true;
+  v.setAttribute('playsinline','');
   v.style.cssText='width:100%;height:100%;background:#000';
-  v.onerror=()=>{window.__nx&&window.__nx()};
   f.appendChild(v);
-  if(isDash&&window.dashjs){
+
+  if(isDash && window.dashjs){
     try{
-      const player=dashjs.MediaPlayer().create();
-      player.updateSettings({streaming:{abortDelay:{enabled:true}}});
-      player.initialize(v, play, true);
-      player.on(dashjs.MediaPlayer.events.ERROR,()=>{window.__nx&&window.__nx()});
-    }catch(e){window.__nx&&window.__nx()}
+      dashPlayer=dashjs.MediaPlayer().create();
+      dashPlayer.updateSettings({
+        streaming:{
+          abr:{autoSwitchBitrate:{video:true}},
+          buffer:{fastSwitchEnabled:true}
+        }
+      });
+      dashPlayer.initialize(v, play, true);
+      dashPlayer.on(dashjs.MediaPlayer.events.ERROR, function(){
+        toast('Stream error — next source');
+        setTimeout(function(){ window.__nx && window.__nx(); }, 800);
+      });
+      dashPlayer.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, function(){
+        try{
+          const bitrates=dashPlayer.getBitrateInfoListFor('video')||[];
+          if(qsel && bitrates.length){
+            qsel.style.display='inline-block';
+            qsel.innerHTML='<option value="auto">Auto quality</option>'+
+              bitrates.map(function(b,i){
+                return '<option value="'+i+'">'+(b.height||'?')+'p · '+Math.round((b.bitrate||0)/1000)+'kbps</option>';
+              }).join('');
+            qsel.onchange=function(){
+              const val=qsel.value;
+              if(val==='auto'){
+                dashPlayer.updateSettings({streaming:{abr:{autoSwitchBitrate:{video:true}}}});
+              }else{
+                dashPlayer.updateSettings({streaming:{abr:{autoSwitchBitrate:{video:false}}}});
+                dashPlayer.setQualityFor('video', parseInt(val,10));
+              }
+            };
+          }
+        }catch(e){}
+      });
+      setTimeout(function(){
+        try{
+          if(v.videoWidth===0 && v.currentTime>0.3){
+            toast('HEVC: audio only on this device — try desktop/Safari or external player');
+            const n=document.getElementById('hevcTip');
+            if(n) n.style.display='block';
+          }
+        }catch(e){}
+      }, 4000);
+    }catch(e){
+      window.__nx && window.__nx();
+    }
   }else{
     v.src=play;
+    v.onerror=function(){ window.__nx && window.__nx(); };
   }
 }
 window.__nx=()=>{if(PS.idx<PS.sources.length-1){PS.idx++;toast('Next source…');renderP()}else toast('All sources failed')};
+
 async function watch(media,id,se,ep){
   setNav(''); PS={sources:[],idx:0,media,id,se:se||1,ep:ep||1};
   root.innerHTML=`<div class="player"><div class="frame" id="frame"><div class="empty">Resolving streams…</div></div>
     <div class="bar"><span id="st" style="color:var(--mute);font-size:.8rem">…</span>
-    <button class="src" type="button" onclick="window.__nx()">Next source ↻</button>
+    <select id="qsel" class="se-select" style="display:none;margin:0 6px"></select><div id="hevcTip" style="display:none;width:100%;color:#ffa502;font-size:.8rem;margin-top:6px">This MovieBox stream is HEVC (H.265). Many phones play audio only. Use desktop Chrome/Safari, or open the stream in VLC.</div>
+    <button class="src" type="button" onclick="window.__nx()">Next source ↻</button><a class="src" id="extPlay" href="#" target="_blank" rel="noopener">Open stream URL</a>
     <a class="src" href="#/title/${media}/${id}">Details</a></div>
     <div id="srcs" style="display:flex;flex-wrap:wrap;gap:6px"></div><div id="eps"></div></div>`;
   try{
