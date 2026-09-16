@@ -2442,51 +2442,120 @@ async def music_lyrics(
     title: str = Query(..., min_length=1),
     artist: str = Query("", description="Artist name optional"),
 ):
-    """LRCLIB lyrics — plain + synced (LRC). Used by SimpMusic / vivi-music."""
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(
-                "https://lrclib.net/api/search",
-                params={"q": f"{artist} {title}".strip()},
-            )
-            if r.status_code != 200:
-                return {"found": False, "lyrics": None, "synced": None, "lines": [], "source": "lrclib"}
-            items = r.json() if isinstance(r.json(), list) else []
-            best = None
-            tlow = title.lower()
-            for it in items:
-                if not isinstance(it, dict):
+    """Lyrics lookup with accurate title/artist matching and robust LRC parsing."""
+    title = re.sub(r"\\s+", " ", (title or "").strip())
+    artist = re.sub(r"\\s+", " ", (artist or "").strip())
+
+    def norm(s: str) -> str:
+        s = unquote(str(s or "")).lower()
+        s = re.sub(r"\\([^)]*\\)|\\[[^]]*\\]", " ", s)
+        s = re.sub(r"[^\\w\\s]", " ", s, flags=re.UNICODE)
+        return re.sub(r"\\s+", " ", s).strip()
+
+    def parse_lrc(lrc: str):
+        lines = []
+        if not lrc:
+            return lines
+        # Supports [mm:ss], [mm:ss.xx], [mm:ss.xxx] and multiple timestamps on one line.
+        for raw in str(lrc).splitlines():
+            matches = list(re.finditer(r"\\[(\\d+):(\\d+(?:[.:]\\d+)?)\\]", raw))
+            if not matches:
+                continue
+            lyric = re.sub(r"^(?:\\s*\\[\\d+:\\d+(?:[.:]\\d+)?\\])+\\s*", "", raw).strip()
+            if not lyric:
+                continue
+            for m in matches:
+                sec_text = m.group(2).replace(":", ".")
+                try:
+                    timestamp = int(m.group(1)) * 60 + float(sec_text)
+                except ValueError:
                     continue
-                if it.get("plainLyrics") or it.get("syncedLyrics"):
-                    tn = (it.get("trackName") or "").lower()
-                    if tlow in tn or tn in tlow or not best:
-                        best = it
-                        if tlow == tn:
-                            break
-            if not best and items and isinstance(items[0], dict):
-                best = items[0]
-            if not best:
-                return {"found": False, "lyrics": None, "synced": None, "lines": [], "source": "lrclib"}
+                lines.append({"t": timestamp, "text": lyric})
+        lines.sort(key=lambda x: x["t"])
+        return lines
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=15.0,
+            follow_redirects=True,
+            headers={"User-Agent": "StreamHub/5.0"}
+        ) as client:
+            queries = []
+            if artist and title:
+                queries.append(f"{artist} {title}")
+            queries.append(title)
+
+            items = []
+            seen = set()
+            for q in queries:
+                try:
+                    r = await client.get("https://lrclib.net/api/search", params={"q": q})
+                    if r.status_code != 200:
+                        continue
+                    data = r.json()
+                    if not isinstance(data, list):
+                        continue
+                    for it in data:
+                        if not isinstance(it, dict):
+                            continue
+                        key = (
+                            str(it.get("id") or ""),
+                            norm(it.get("trackName")),
+                            norm(it.get("artistName")),
+                        )
+                        if key not in seen:
+                            seen.add(key)
+                            items.append(it)
+                except Exception:
+                    continue
+
+            if not items:
+                return {
+                    "found": False, "lyrics": None, "synced": None,
+                    "lines": [], "source": "lrclib"
+                }
+
+            nt, na = norm(title), norm(artist)
+
+            def score(it):
+                tn = norm(it.get("trackName"))
+                an = norm(it.get("artistName"))
+                score = 0
+                if tn == nt:
+                    score += 100
+                elif nt and (nt in tn or tn in nt):
+                    score += 55
+                if na and an == na:
+                    score += 80
+                elif na and (na in an or an in na):
+                    score += 35
+                if it.get("syncedLyrics"):
+                    score += 10
+                if it.get("plainLyrics"):
+                    score += 5
+                return score
+
+            best = max(items, key=score)
             synced = best.get("syncedLyrics") or ""
-            lines = []
-            # Parse LRC: [mm:ss.xx] text
-            for m in re.finditer(r"\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)", synced):
-                mins, secs, text = int(m.group(1)), float(m.group(2)), m.group(3).strip()
-                if text:
-                    lines.append({"t": mins * 60 + secs, "text": text})
+            plain = best.get("plainLyrics") or ""
+            lines = parse_lrc(synced)
+
             return {
-                "found": bool(best.get("plainLyrics") or synced),
-                "title": best.get("trackName"),
-                "artist": best.get("artistName"),
+                "found": bool(plain or synced),
+                "title": best.get("trackName") or title,
+                "artist": best.get("artistName") or artist,
                 "album": best.get("albumName"),
-                "lyrics": best.get("plainLyrics"),
-                "synced": synced,
+                "lyrics": plain or None,
+                "synced": synced or None,
                 "lines": lines,
                 "duration": best.get("duration"),
                 "source": "lrclib",
             }
     except Exception as e:
-        return {"found": False, "lyrics": None, "synced": None, "lines": [], "error": str(e), "source": "lrclib"}
+        return {
+            "found": False, "lyrics": None, "synced": None,
+            "lines": [], "error": str(e), "source": "lrclib"
+        }
 
 
 
