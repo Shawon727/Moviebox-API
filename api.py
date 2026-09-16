@@ -1610,13 +1610,6 @@ async def legacy_detail(subject_id: str):
 
 
 
-if __name__ == "__main__":
-    import uvicorn
-
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("api:app", host="0.0.0.0", port=port, reload=True)
-
-
 # =============================================================================
 # CATALOG + PLAY (MovieBox + 4KHDHub only — no TMDB)
 # =============================================================================
@@ -2355,7 +2348,6 @@ img{display:block;max-width:100%}
 @media (max-width:860px){
   .now-player{width:120px;height:48px}
   .m-grid{grid-template-columns:repeat(auto-fill,minmax(130px,1fr))}
-  .side{display:none}
 }
 
 .api-table{display:flex;flex-direction:column;gap:8px}
@@ -2410,7 +2402,7 @@ function card(it){
 }
 function row(title,items){if(!items||!items.length)return'';return `<section class="sec"><h2>${esc(title)}</h2><div class="row">${items.map(card).join('')}</div></section>`}
 
-async async function musicHome(){
+async function musicHome(){
   setNav('music');root.innerHTML='<div class="empty">Loading music…</div>';
   try{
     const d=await api('/music/home');
@@ -2433,7 +2425,7 @@ function musicCard(s){
     <div class="mi"><div class="mt">${esc(s.title)}</div><div class="ma">${esc(s.artist||'YouTube Music')}</div></div>
   </div>`;
 }
-async async function musicSearch(q){
+async function musicSearch(q){
   q=(q||'').trim(); if(!q) return;
   setNav('music');root.innerHTML='<div class="empty">Searching…</div>';
   try{
@@ -2745,5 +2737,7 @@ async def site_spa():
 async def root_spa():
     return HTMLResponse(SPA_HTML)
 
-
-
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("api:app", host="0.0.0.0", port=port)
