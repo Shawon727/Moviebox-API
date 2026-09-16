@@ -740,27 +740,102 @@ async def resolve_hubdrive(file_url: str) -> List[dict]:
 
 
 
+
+def _rot13(s: str) -> str:
+    out = []
+    for ch in s:
+        if "a" <= ch <= "z":
+            out.append(chr((ord(ch) - 97 + 13) % 26 + 97))
+        elif "A" <= ch <= "Z":
+            out.append(chr((ord(ch) - 65 + 13) % 26 + 65))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _b64_str(s: str) -> str:
+    pad = (-len(s)) % 4
+    return base64.b64decode(s + ("=" * pad)).decode("utf-8", errors="strict")
+
+
+def _decode_greenmotors_payload(payload: str) -> Optional[str]:
+    """greenmotors localStorage `o`: atob → atob → rot13 → atob → JSON → o → atob → hubcloud URL."""
+    try:
+        s = payload.strip()
+        s = _b64_str(s)
+        s = _b64_str(s)
+        s = _rot13(s)
+        s = _b64_str(s)
+        data = json.loads(s)
+        inner = data.get("o") or data.get("url") or ""
+        if not inner:
+            return None
+        url = _b64_str(inner) if not inner.startswith("http") else inner
+        if url.startswith("https://") and ("hubcloud." in url or "hubdrive." in url):
+            return url
+    except Exception:
+        return None
+    return None
+
+
 async def _resolve_masked_hub(url: str) -> List[dict]:
-    """Follow intermediate download pages to HubCloud /drive/ then resolve."""
-    headers = {"User-Agent": FK_UA, "Referer": url}
-    async with httpx.AsyncClient(follow_redirects=True, timeout=20.0, headers=headers) as client:
+    """Follow greenmotors / similar gates → HubCloud /drive/ → direct mirrors."""
+    headers = {
+        "User-Agent": FK_UA,
+        "Referer": "https://4khdhub.one/",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    out: List[dict] = []
+    async with httpx.AsyncClient(follow_redirects=True, timeout=25.0, headers=headers) as client:
         r = await client.get(url)
         text = r.text or ""
         final = str(r.url)
-        candidates = []
-        pattern = r"https?://[^\s\"'<>]+"
-        for u in re.findall(pattern, text + " " + final):
+        candidates: List[str] = []
+
+        # 1) Decode greenmotors s('o','...') payload
+        for m in re.finditer(r"s\(\s*['\"]o['\"]\s*,\s*['\"]([^'\"]+)['\"]", text):
+            decoded = _decode_greenmotors_payload(m.group(1))
+            if decoded:
+                candidates.append(decoded)
+
+        # 2) Any hubcloud/hubdrive already in HTML
+        for u in re.findall(r"https?://[^\s\"'<>]+", text + " " + final):
+            u = u.rstrip(").,;'\"")
             if "hubcloud." in u and "/drive/" in u:
-                candidates.append(u.split("&")[0].rstrip(").,;"))
-            if "hubdrive." in u:
-                candidates.append(u.split("&")[0].rstrip(").,;"))
-        out = []
-        for c in candidates[:3]:
+                candidates.append(u.split("&")[0])
+            if "hubdrive." in u and "/file/" in u:
+                candidates.append(u.split("&")[0])
+
+        # 3) If still on greenmotors, fetch mediator with cookie and scan
+        if "greenmotors." in final or "greenmotors." in url:
+            try:
+                client.cookies.set("xla", "s4t")
+                r2 = await client.get(
+                    "https://greenmotors.cc/homelander/",
+                    headers={**headers, "Referer": final},
+                )
+                t2 = r2.text or ""
+                for m in re.finditer(r"https://hubcloud\.[a-z.]+/drive/[a-zA-Z0-9]+", t2):
+                    candidates.append(m.group(0))
+                for m in re.finditer(r"s\(\s*['\"]o['\"]\s*,\s*['\"]([^'\"]+)['\"]", t2):
+                    decoded = _decode_greenmotors_payload(m.group(1))
+                    if decoded:
+                        candidates.append(decoded)
+            except Exception:
+                pass
+
+        seen = set()
+        for c in candidates:
+            if c in seen:
+                continue
+            seen.add(c)
             try:
                 out.extend(await resolve_any(c))
             except Exception:
                 continue
-        return out
+            if len(out) >= 8:
+                break
+    return out
 
 
 async def resolve_any(url: str) -> List[dict]:
@@ -1596,49 +1671,53 @@ def _mb_items_from_ops(data) -> list:
 
 @app.get("/api/home", tags=["Catalog"])
 async def api_home():
-    """TMDB homepage rows (Flick/streambert style catalog)."""
-    trending_m = trending_t = popular_m = popular_t = top_m = []
-    try:
-        d = await _tmdb_get("/trending/movie/week")
-        trending_m = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "movie"))]
-    except Exception:
-        pass
-    try:
-        d = await _tmdb_get("/trending/tv/week")
-        trending_t = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "tv"))]
-    except Exception:
-        pass
-    try:
-        d = await _tmdb_get("/movie/popular")
-        popular_m = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "movie"))]
-    except Exception:
-        pass
-    try:
-        d = await _tmdb_get("/tv/popular")
-        popular_t = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "tv"))]
-    except Exception:
-        pass
-    try:
-        d = await _tmdb_get("/movie/top_rated")
-        top_m = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "movie"))]
-    except Exception:
-        pass
+    """TMDB homepage — more rows for richer home."""
+    async def grab(path, media, pages=1):
+        items = []
+        for pg in range(1, pages + 1):
+            d = await _tmdb_get(path, {"page": pg})
+            for x in d.get("results") or []:
+                c = _tmdb_card(x, media)
+                if c:
+                    items.append(c)
+        return items
+
+    trending_m = await grab("/trending/movie/week", "movie", 2)
+    trending_t = await grab("/trending/tv/week", "tv", 2)
+    popular_m = await grab("/movie/popular", "movie", 2)
+    popular_t = await grab("/tv/popular", "tv", 2)
+    top_m = await grab("/movie/top_rated", "movie", 1)
+    top_t = await grab("/tv/top_rated", "tv", 1)
+    now_m = await grab("/movie/now_playing", "movie", 1)
+    airing = await grab("/tv/on_the_air", "tv", 1)
+    upcoming = await grab("/movie/upcoming", "movie", 1)
     return {
-        "trending_movies": trending_m[:18],
-        "trending_series": trending_t[:18],
-        "popular_movies": popular_m[:18],
-        "popular_series": popular_t[:18],
+        "trending_movies": trending_m[:24],
+        "trending_series": trending_t[:24],
+        "popular_movies": popular_m[:24],
+        "popular_series": popular_t[:24],
         "top_movies": top_m[:18],
+        "top_series": top_t[:18],
+        "now_playing": now_m[:18],
+        "on_the_air": airing[:18],
+        "upcoming": upcoming[:18],
         "provider": "tmdb",
     }
 
 
 
+
 @app.get("/api/movies", tags=["Catalog"])
 async def api_movies(page: int = 1):
-    d = await _tmdb_get("/movie/popular", {"page": page})
+    d = await _tmdb_get("/movie/popular", {"page": max(1, page)})
     items = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "movie"))]
-    return {"items": items, "page": page, "provider": "tmdb"}
+    return {
+        "items": items,
+        "page": page,
+        "total_pages": d.get("total_pages") or 1,
+        "total_results": d.get("total_results") or len(items),
+        "provider": "tmdb",
+    }
 
 
 
@@ -1646,10 +1725,16 @@ async def api_movies(page: int = 1):
 async def api_series(page: int = 1):
     d = await _tmdb_get("/tv/popular", {"page": page})
     items = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "tv"))]
-    return {"items": items, "page": page, "provider": "tmdb"}
-
-
-
+async def api_series(page: int = 1):
+    d = await _tmdb_get("/tv/popular", {"page": max(1, page)})
+    items = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "tv"))]
+    return {
+        "items": items,
+        "page": page,
+        "total_pages": d.get("total_pages") or 1,
+        "total_results": d.get("total_results") or len(items),
+        "provider": "tmdb",
+    }
 @app.get("/api/search", tags=["Catalog"])
 async def api_search_catalog(q: str = Query(..., min_length=1)):
     """TMDB multi-search for web + optional 4KHDHub hits."""
@@ -1998,6 +2083,25 @@ img{display:block;max-width:100%}
   .card{flex-basis:110px}
   .hero img{height:200px}
 }
+
+.badge{display:inline-block;background:var(--a);color:#041018;font-size:.7rem;font-weight:700;padding:3px 8px;border-radius:6px;margin-bottom:8px;letter-spacing:.04em}
+.sec-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+.sec-head h2{margin:0}
+.pager{display:flex;align-items:center;gap:10px}
+.pager .src:disabled{opacity:.35;cursor:not-allowed}
+.page-n{font-size:.85rem;color:var(--mute)}
+.card{position:relative}
+.card::after{content:'';position:absolute;inset:0;border-radius:var(--rad);box-shadow:inset 0 0 0 1px rgba(255,255,255,.04);pointer-events:none}
+.hero{box-shadow:0 12px 40px rgba(0,0,0,.35)}
+.btn{transition:transform .12s,box-shadow .12s}
+.btn:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(0,164,220,.35)}
+.src:hover,.ep:hover{border-color:var(--a)}
+.player-wrap{box-shadow:0 16px 48px rgba(0,0,0,.45)}
+@media (max-width:860px){
+  .content{padding:12px 12px 40px}
+  .pager{width:100%;justify-content:space-between}
+  .brand{font-size:1.05rem}
+}
 </style></head>
 <body>
 <div class="app">
@@ -2043,17 +2147,35 @@ async function home(){
     if(hero){
       const media=hero.type==='tv'?'tv':'movie';
       const bg=hero.backdrop||hero.poster||'';
-      h=`<div class="hero">${bg?`<img src="${esc(bg)}" alt=""/>`:''}<div class="hbody"><h1>${esc(hero.name)}</h1><p>${esc(hero.overview||'')}</p><div style="margin-top:12px"><button class="btn" onclick="location.hash='#/watch/${media}/${hero.tmdb_id||hero.id}'">▶ Play</button>
+      h=`<div class="hero">${bg?`<img src="${esc(bg)}" alt=""/>`:''}<div class="hbody"><div class="badge">Featured</div><h1>${esc(hero.name)}</h1><p>${esc(hero.overview||'')}</p><div style="margin-top:12px"><button class="btn" onclick="location.hash='#/watch/${media}/${hero.tmdb_id||hero.id}'">▶ Play</button>
       <button class="btn ghost" style="margin-left:8px" onclick="location.hash='#/title/${media}/${hero.tmdb_id||hero.id}'">Details</button></div></div></div>`;
     }
-    root.innerHTML=h+row('Trending Movies',d.trending_movies)+row('Trending Series',d.trending_series)+row('Popular Movies',d.popular_movies)+row('Popular Series',d.popular_series)+row('Top Rated',d.top_movies);
+    root.innerHTML=h
+      +row('Trending Movies',d.trending_movies)
+      +row('Trending Series',d.trending_series)
+      +row('Popular Movies',d.popular_movies)
+      +row('Popular Series',d.popular_series)
+      +row('Now Playing',d.now_playing)
+      +row('On The Air',d.on_the_air)
+      +row('Top Movies',d.top_movies)
+      +row('Top Series',d.top_series)
+      +row('Upcoming',d.upcoming);
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
-async function grid(k){
+async function grid(k,page){
+  page=page||1;
   setNav(k);root.innerHTML='<div class="empty">Loading…</div>';
   try{
-    const d=await api(k==='movies'?'/api/movies':'/api/series');
-    root.innerHTML=`<section class="sec" style="padding-top:6px"><h2>${k==='movies'?'Movies':'Series'}</h2><div class="grid">${(d.items||[]).map(card).join('')||'<p class="empty">Empty</p>'}</div></section>`;
+    const d=await api((k==='movies'?'/api/movies':'/api/series')+'?page='+page);
+    const total=d.total_pages||1;
+    const pager=`<div class="pager">
+      <button class="src" type="button" ${page<=1?'disabled':''} onclick="grid('${k}',${page-1})">← Prev</button>
+      <span class="page-n">Page ${page} / ${total}</span>
+      <button class="src" type="button" ${page>=total?'disabled':''} onclick="grid('${k}',${page+1})">Next →</button>
+    </div>`;
+    root.innerHTML=`<section class="sec" style="padding-top:6px"><div class="sec-head"><h2>${k==='movies'?'Movies':'Series'}</h2>${pager}</div>
+      <div class="grid">${(d.items||[]).map(card).join('')||'<p class="empty">Empty</p>'}</div>
+      ${pager}</section>`;
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
 async function search(q){
@@ -2093,7 +2215,11 @@ function renderP(){
   const qsel=document.getElementById('qsel');
   if(qsel){qsel.innerHTML='';qsel.style.display='none'}
   if(s.type==='embed'){
-    f.innerHTML=`<iframe src="${esc(play)}" allowfullscreen allow="autoplay;encrypted-media;picture-in-picture" style="width:100%;height:100%;border:0;background:#000"></iframe>`;
+    // sandbox reduces some popups; allow-scripts/same-origin needed for players
+    f.innerHTML=`<iframe src="${esc(play)}" allowfullscreen allow="autoplay;encrypted-media;picture-in-picture;fullscreen"
+      referrerpolicy="no-referrer" loading="eager"
+      sandbox="allow-scripts allow-same-origin allow-presentation allow-forms allow-popups-to-escape-sandbox"
+      style="width:100%;height:100%;border:0;background:#000"></iframe>`;
     return;
   }
   const isDash=/\\.mpd(\\?|$)/i.test(s.url||'')||/\\.mpd(\\?|$)/i.test(play)||(s.format||'').toUpperCase()==='DASH';
