@@ -1467,9 +1467,12 @@ def _mb_items_from_search_data(data: dict) -> list:
         cover = s.get("cover") or {}
         poster = cover.get("url") if isinstance(cover, dict) else (s.get("coverUrl") or cover)
         stype = s.get("subjectType") or s.get("stype") or 1
+        name = s.get("title") or s.get("name") or ""
+        # Strip trailing season labels so series dedupe cleanly (S1/S2 duplicates share id)
+        clean = re.sub(r"\s*S\d+\s*$", "", name, flags=re.I).strip() or name
         items.append({
             "id": str(sid) if sid is not None else None,
-            "name": s.get("title") or s.get("name"),
+            "name": clean,
             "poster": poster,
             "year": (s.get("releaseDate") or "")[:4] or None,
             "rating": s.get("imdbRatingValue") or s.get("score"),
@@ -1477,7 +1480,15 @@ def _mb_items_from_search_data(data: dict) -> list:
             "provider": "moviebox",
             "slug": s.get("detailPath"),
         })
-    return [x for x in items if x.get("id")]
+    # Dedupe by id — keep first occurrence
+    seen = set()
+    out = []
+    for x in items:
+        if not x.get("id") or x["id"] in seen:
+            continue
+        seen.add(x["id"])
+        out.append(x)
+    return out
 
 
 def _mb_items_from_ops(data) -> list:
@@ -1705,36 +1716,67 @@ async def api_detail(media: str, item_id: str):
 
 @app.get("/api/tv/{item_id}/season/{season}", tags=["Catalog"])
 async def api_season(item_id: str, season: int):
-    """Build episode buttons 1..N from season-info or play probes."""
+    """Episode list ascending (1..N). Uses allEp when MovieBox provides it."""
     episodes = []
     max_ep = 24
     try:
         sdata = await mb_request("GET", f"/wefeed-mobile-bff/subject-api/season-info?subjectId={item_id}")
-        raw = sdata if isinstance(sdata, list) else (sdata.get("list") or sdata.get("seasons") or [])
-        if isinstance(raw, dict):
-            raw = raw.get("list") or []
-        for s in raw or []:
+        raw = sdata
+        if isinstance(sdata, dict):
+            raw = sdata.get("seasons") or sdata.get("list") or []
+            if isinstance(raw, dict):
+                raw = raw.get("seasons") or raw.get("list") or []
+        if not isinstance(raw, list):
+            raw = []
+        for s in raw:
             if not isinstance(s, dict):
                 continue
             num = s.get("se") or s.get("season") or s.get("seasonNumber") or s.get("number")
-            if num is not None and int(num) == season:
-                max_ep = int(s.get("episodeCount") or s.get("epCount") or s.get("maxEp") or 24)
-                eps = s.get("episodes") or []
-                if eps:
-                    for e in eps:
-                        if isinstance(e, dict):
-                            episodes.append({
-                                "episode": e.get("ep") or e.get("episode") or e.get("number"),
-                                "name": e.get("title") or e.get("name") or f"Episode {e.get('ep')}",
-                                "overview": e.get("description") or "",
-                                "still": None,
-                            })
-                break
+            try:
+                num = int(num)
+            except Exception:
+                continue
+            if num != int(season):
+                continue
+            max_ep = int(s.get("episodeCount") or s.get("epCount") or s.get("maxEp") or 24)
+            eps = s.get("episodes") or s.get("episodeList") or []
+            if isinstance(eps, list) and eps:
+                for e in eps:
+                    if not isinstance(e, dict):
+                        continue
+                    epn = e.get("ep") or e.get("episode") or e.get("number") or e.get("epNum")
+                    if epn is None:
+                        continue
+                    episodes.append({
+                        "episode": int(epn),
+                        "name": e.get("title") or e.get("name") or f"Episode {epn}",
+                        "overview": e.get("description") or e.get("overview") or "",
+                        "still": e.get("cover") or e.get("still") or None,
+                    })
+            all_ep = str(s.get("allEp") or s.get("all_ep") or "").strip()
+            if not episodes and all_ep:
+                for part in all_ep.split(","):
+                    part = part.strip()
+                    if part.isdigit():
+                        n = int(part)
+                        episodes.append({
+                            "episode": n,
+                            "name": f"Episode {n}",
+                            "overview": "",
+                            "still": None,
+                        })
+            break
     except Exception:
         pass
     if not episodes:
-        episodes = [{"episode": i, "name": f"Episode {i}", "overview": "", "still": None} for i in range(1, max_ep + 1)]
-    return {"season": season, "episodes": episodes}
+        episodes = [
+            {"episode": i, "name": f"Episode {i}", "overview": "", "still": None}
+            for i in range(1, max_ep + 1)
+        ]
+    episodes = [e for e in episodes if e.get("episode") is not None]
+    episodes.sort(key=lambda e: int(e["episode"]))
+    return {"season": int(season), "episodes": episodes, "count": len(episodes)}
+
 
 
 @app.get("/api/play", tags=["Playback"])
@@ -1934,7 +1976,17 @@ async def api_play(
             "type": "direct",
             "headers": {},
         })
-    # Hub/Pixeldrain first (progressive files), then MovieBox DASH/HEVC
+    # Prefer browser-friendly files: MP4/Pixeldrain before MKV, then MovieBox HEVC
+    def _hub_rank(s):
+        u = (s.get("url") or "").lower()
+        lab = (s.get("label") or "").lower()
+        fmt = (s.get("format") or "").lower()
+        if "pixeldrain" in u or "pixeldrain" in lab: return 0
+        if ".mp4" in u or fmt == "mp4": return 1
+        if "workers.dev" in u and ".mkv" not in u: return 2
+        if ".mkv" in u or fmt == "mkv": return 4
+        return 3
+    hub_src.sort(key=_hub_rank)
     uniq = hub_src + mb_list
 
     return {
@@ -2096,7 +2148,7 @@ async function title(media,id){
       <p style="color:var(--mute);margin-bottom:8px">${esc(d.year||'')} · ${d.rating||''}</p>
       <p style="color:var(--mute);line-height:1.5;margin-bottom:14px">${esc(d.overview||'')}</p>
       <a class="btn" href="#/watch/${d.type||media}/${id}${ (d.type||media)==='tv'?'?se=1&ep=1':'' }">▶ Play</a></div></div>
-      ${(d.type||media)==='tv'&&d.seasons&&d.seasons.length?`<section class="sec"><h2>Seasons</h2><div class="row">${d.seasons.map(s=>`<div class="card" onclick="location.hash='#/watch/tv/${id}?se=${s.season}&ep=1'"><div class="p"></div><div class="t">${esc(s.name||('S'+s.season))}</div></div>`).join('')}</div></section>`:''}`;
+      ${(d.type||media)==='tv'&&d.seasons&&d.seasons.length?`<section class="sec"><h2>Seasons</h2><div class="row">${d.seasons.slice().sort((a,b)=>(a.season||0)-(b.season||0)).map(s=>`<div class="card" onclick="location.hash='#/watch/tv/${id}?se=${s.season}&ep=1'"><div class="p" style="display:flex;align-items:center;justify-content:center;font-size:1.4rem;color:var(--a)">S${s.season}</div><div class="t">${esc(s.name||('Season '+s.season))} · ${s.episode_count||'?'} ep</div></div>`).join('')}</div></section>`:''}`;
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
 let PS={sources:[],idx:0};
@@ -2248,7 +2300,8 @@ async function watch(media,id,se,ep){
   if(media==='tv'){
     try{
       const sd=await api(`/api/tv/${id}/season/${PS.se}`);
-      document.getElementById('eps').innerHTML=`<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">${(sd.episodes||[]).map(e=>`<button type="button" class="ep ${e.episode==PS.ep?'on':''}" onclick="location.hash='#/watch/tv/${id}?se=${PS.se}&ep=${e.episode}'">${e.episode}</button>`).join('')}</div>`;
+      const epsList=(sd.episodes||[]).slice().sort((a,b)=>(a.episode||0)-(b.episode||0));
+      document.getElementById('eps').innerHTML=`<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px;flex-direction:row">${epsList.map(e=>`<button type="button" class="ep ${e.episode==PS.ep?'on':''}" onclick="location.hash='#/watch/tv/${id}?se=${PS.se}&ep=${e.episode}'">E${e.episode}</button>`).join('')}</div>`;
     }catch{}
   }
 }
@@ -2281,6 +2334,3 @@ async def site_spa():
 @app.get("/", response_class=HTMLResponse, tags=["Meta"], include_in_schema=False)
 async def root_spa():
     return HTMLResponse(SPA_HTML)
-
-
-
