@@ -1000,7 +1000,7 @@ def fk_parse_releases(html: str, season: int = 0, episode: int = 0) -> List[dict
 
 @app.get("/health", tags=["Meta"])
 async def health():
-    return {"ok": True, "version": "5.0.0", "providers": ["tmdb", "videasy", "vidsrc", "vidking", "4khdhub", "hubcloud", "moviebox-api"]}
+    return {"ok": True, "version": "5.1.0", "providers": ["tmdb", "videasy", "vidsrc", "vidking", "4khdhub", "hubcloud", "moviebox-api"]}
 
 
 # ----- Mov
@@ -2056,6 +2056,162 @@ async def api_play(
     }
 
 
+# ═══════════════════════════════════════════════════════════
+# MUSIC — YouTube Music (SimpMusic-style Innertube client)
+# ═══════════════════════════════════════════════════════════
+
+YT_MUSIC_KEY = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30"
+YT_MUSIC_CTX = {
+    "client": {
+        "clientName": "WEB_REMIX",
+        "clientVersion": "1.20240403.01.00",
+        "hl": "en",
+        "gl": "US",
+    }
+}
+YT_MUSIC_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Content-Type": "application/json",
+    "Origin": "https://music.youtube.com",
+    "Referer": "https://music.youtube.com/",
+}
+
+
+async def _ytm_post(path: str, body: dict) -> dict:
+    url = f"https://music.youtube.com/youtubei/v1/{path}?key={YT_MUSIC_KEY}&prettyPrint=false"
+    payload = {"context": YT_MUSIC_CTX, **body}
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        r = await client.post(url, json=payload, headers=YT_MUSIC_HEADERS)
+        if r.status_code >= 400:
+            return {}
+        try:
+            return r.json()
+        except Exception:
+            return {}
+
+
+def _ytm_walk(obj, key: str, out: list):
+    if isinstance(obj, dict):
+        if key in obj:
+            out.append(obj[key])
+        for v in obj.values():
+            _ytm_walk(v, key, out)
+    elif isinstance(obj, list):
+        for i in obj:
+            _ytm_walk(i, key, out)
+
+
+def _ytm_parse_item(it: dict) -> Optional[dict]:
+    s = json.dumps(it)
+    vid_m = re.search(r'"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"', s)
+    if not vid_m:
+        return None
+    vid = vid_m.group(1)
+    texts = re.findall(r'"text"\s*:\s*"([^"\\]{1,120})"', s)
+    # filter noise
+    noise = {"Video", "Song", "Album", "Playlist", "Start mix", "Play next", "Shuffle", "Subscribe", "Share", "Episode"}
+    clean = [x for x in texts if x not in noise and not x.startswith("\\u") and len(x) > 1]
+    title = clean[0] if clean else vid
+    artist = ""
+    for c in clean[1:]:
+        if c not in title and not re.match(r"^\d", c) and "views" not in c.lower() and "play" not in c.lower():
+            artist = c
+            break
+    thumbs = re.findall(r'https://i\.ytimg\.com/[^"\\]+', s)
+    thumb = thumbs[0].replace("\\u0026", "&") if thumbs else f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+    return {
+        "id": vid,
+        "video_id": vid,
+        "title": title,
+        "artist": artist,
+        "thumb": thumb,
+        "type": "song",
+        "provider": "ytmusic",
+    }
+
+
+@app.get("/music/search", tags=["Music"])
+async def music_search(q: str = Query(..., min_length=1)):
+    """YouTube Music search (SimpMusic / Innertube)."""
+    data = await _ytm_post("search", {"query": q.strip()[:100]})
+    items = []
+    _ytm_walk(data, "musicResponsiveListItemRenderer", items)
+    _ytm_walk(data, "musicTwoRowItemRenderer", items)
+    songs, seen = [], set()
+    for it in items:
+        e = _ytm_parse_item(it)
+        if e and e["video_id"] not in seen:
+            seen.add(e["video_id"])
+            songs.append(e)
+    return {"query": q, "count": len(songs), "items": songs[:40], "provider": "ytmusic"}
+
+
+@app.get("/music/home", tags=["Music"])
+async def music_home():
+    """Curated home — popular queries via YT Music search."""
+    seeds = ["Top Hits", "Trending music", "Lo-fi beats", "Bollywood hits", "Pop songs 2024"]
+    sections = []
+    for seed in seeds:
+        data = await _ytm_post("search", {"query": seed})
+        items = []
+        _ytm_walk(data, "musicResponsiveListItemRenderer", items)
+        songs, seen = [], set()
+        for it in items:
+            e = _ytm_parse_item(it)
+            if e and e["video_id"] not in seen:
+                seen.add(e["video_id"])
+                songs.append(e)
+        if songs:
+            sections.append({"title": seed, "items": songs[:12]})
+    return {"sections": sections, "provider": "ytmusic"}
+
+
+@app.get("/music/play/{video_id}", tags=["Music"])
+async def music_play(video_id: str):
+    """Return playable sources — embed + youtube watch (browser-safe)."""
+    if not re.match(r"^[a-zA-Z0-9_-]{11}$", video_id):
+        raise HTTPException(400, "Invalid video id")
+    # metadata light
+    data = await _ytm_post("next", {"videoId": video_id})
+    title, artist, thumb = video_id, "", f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    s = json.dumps(data)
+    texts = re.findall(r'"text"\s*:\s*"([^"\\]{2,80})"', s)
+    if texts:
+        title = texts[0]
+        if len(texts) > 1:
+            artist = texts[1]
+    thumbs = re.findall(r'https://i\.ytimg\.com/[^"\\]+', s)
+    if thumbs:
+        thumb = thumbs[0].replace("\\u0026", "&")
+    sources = [
+        {
+            "type": "embed",
+            "provider": "youtube",
+            "label": "YouTube Music",
+            "url": f"https://www.youtube.com/embed/{video_id}?autoplay=1&rel=0",
+            "play_url": f"https://www.youtube.com/embed/{video_id}?autoplay=1&rel=0",
+        },
+        {
+            "type": "embed",
+            "provider": "youtube-nocookie",
+            "label": "YouTube (privacy)",
+            "url": f"https://www.youtube-nocookie.com/embed/{video_id}?autoplay=1&rel=0",
+            "play_url": f"https://www.youtube-nocookie.com/embed/{video_id}?autoplay=1&rel=0",
+        },
+    ]
+    return {
+        "video_id": video_id,
+        "title": title,
+        "artist": artist,
+        "thumb": thumb,
+        "sources": sources,
+        "watch_url": f"https://music.youtube.com/watch?v={video_id}",
+        "provider": "ytmusic",
+    }
+
+
+
+
 
 
 
@@ -2175,6 +2331,32 @@ img{display:block;max-width:100%}
 .ext-actions a,.ext-actions button{border-radius:10px;padding:10px 14px;font-weight:600;font-size:.85rem;border:1px solid var(--line);background:var(--card);cursor:pointer;color:var(--text)}
 .ext-actions a.primary,.ext-actions button.primary{background:var(--a);color:#041018;border-color:var(--a)}
 .fmt-tag{display:inline-block;font-size:.68rem;padding:2px 7px;border-radius:6px;background:rgba(0,164,220,.15);color:var(--a);margin-left:6px}
+
+/* Music */
+.music-layout{display:flex;flex-direction:column;gap:16px;padding-bottom:100px}
+.m-search{display:flex;gap:10px;margin-bottom:8px}
+.m-search input{flex:1;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 16px;color:var(--text);font-size:1rem}
+.m-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:14px}
+.m-card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;cursor:pointer;transition:transform .15s,border-color .15s}
+.m-card:hover{transform:translateY(-3px);border-color:var(--a)}
+.m-card img{width:100%;aspect-ratio:1;object-fit:cover;display:block;background:#111}
+.m-card .mi{padding:10px 12px}
+.m-card .mt{font-size:.88rem;font-weight:600;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.m-card .ma{font-size:.75rem;color:var(--mute);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.now-bar{position:fixed;left:0;right:0;bottom:0;z-index:50;background:linear-gradient(180deg,rgba(16,16,20,.92),#0c0c10);border-top:1px solid var(--line);backdrop-filter:blur(16px);padding:10px 16px;display:none;align-items:center;gap:14px}
+.now-bar.on{display:flex}
+.now-bar img{width:52px;height:52px;border-radius:8px;object-fit:cover}
+.now-meta{flex:1;min-width:0}
+.now-meta .t{font-weight:600;font-size:.9rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.now-meta .a{font-size:.75rem;color:var(--mute)}
+.now-actions{display:flex;gap:8px;align-items:center}
+.now-player{width:min(420px,40vw);height:52px;border-radius:8px;overflow:hidden;background:#000;flex-shrink:0}
+.now-player iframe{width:100%;height:100%;border:0}
+@media (max-width:860px){
+  .now-player{width:120px;height:48px}
+  .m-grid{grid-template-columns:repeat(auto-fill,minmax(130px,1fr))}
+  .side{display:none}
+}
 </style></head>
 <body>
 <div class="app">
@@ -2211,6 +2393,52 @@ function card(it){
   return `<div class="card" onclick="location.hash='#/title/${media}/${id}'"><div class="p" style="${poster}"></div><div class="t">${esc(it.name)}</div><div class="y">${esc(it.year||'')}${it.rating?(' · ★ '+Number(it.rating).toFixed(1)):''}</div></div>`;
 }
 function row(title,items){if(!items||!items.length)return'';return `<section class="sec"><h2>${esc(title)}</h2><div class="row">${items.map(card).join('')}</div></section>`}
+
+async function musicHome(){
+  setNav('music');root.innerHTML='<div class="empty">Loading music…</div>';
+  try{
+    const d=await api('/music/home');
+    let h=`<div class="music-layout"><div class="m-search"><input id="mq" placeholder="Search songs, artists…" onkeydown="if(event.key==='Enter')musicSearch(this.value)"/><button class="btn" type="button" onclick="musicSearch(document.getElementById('mq').value)">Search</button></div>`;
+    for(const sec of (d.sections||[])){
+      h+=`<section class="sec"><h2>${esc(sec.title)}</h2><div class="m-grid">${(sec.items||[]).map(musicCard).join('')||'<p class="empty">Empty</p>'}</div></section>`;
+    }
+    h+='</div>';
+    root.innerHTML=h;
+  }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
+}
+function musicCard(s){
+  return `<div class="m-card" onclick="playMusic('${esc(s.video_id||s.id)}','${esc(s.title)}','${esc(s.artist||'')}','${esc(s.thumb||'')}')">
+    <img src="${esc(s.thumb||'')}" alt="" loading="lazy"/>
+    <div class="mi"><div class="mt">${esc(s.title)}</div><div class="ma">${esc(s.artist||'YouTube Music')}</div></div>
+  </div>`;
+}
+async function musicSearch(q){
+  q=(q||'').trim(); if(!q) return;
+  setNav('music');root.innerHTML='<div class="empty">Searching…</div>';
+  try{
+    const d=await api('/music/search?q='+encodeURIComponent(q));
+    root.innerHTML=`<div class="music-layout"><div class="m-search"><input id="mq" value="${esc(q)}" onkeydown="if(event.key==='Enter')musicSearch(this.value)"/><button class="btn" type="button" onclick="musicSearch(document.getElementById('mq').value)">Search</button></div>
+      <section class="sec"><h2>Results for “${esc(q)}”</h2><div class="m-grid">${(d.items||[]).map(musicCard).join('')||'<p class="empty">No results</p>'}</div></section></div>`;
+  }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
+}
+async function playMusic(vid, title, artist, thumb){
+  const bar=document.getElementById('nowbar');
+  document.getElementById('nowtitle').textContent=title||vid;
+  document.getElementById('nowartist').textContent=artist||'YouTube Music';
+  document.getElementById('nowthumb').src=thumb||('https://i.ytimg.com/vi/'+vid+'/hqdefault.jpg');
+  document.getElementById('nowplayer').innerHTML=`<iframe src="https://www.youtube.com/embed/${esc(vid)}?autoplay=1&rel=0" allow="autoplay;encrypted-media" allowfullscreen></iframe>`;
+  bar.classList.add('on');
+  try{
+    const d=await api('/music/play/'+vid);
+    if(d.title) document.getElementById('nowtitle').textContent=d.title;
+    if(d.artist) document.getElementById('nowartist').textContent=d.artist;
+  }catch(e){}
+}
+function closeMusic(){
+  document.getElementById('nowplayer').innerHTML='';
+  document.getElementById('nowbar').classList.remove('on');
+}
+
 async function home(){
   setNav('home');root.innerHTML='<div class="empty">Loading…</div>';
   try{
@@ -2450,6 +2678,7 @@ async function router(){
   try{
     if(!p.length) return home();
     if(p[0]==='movies') return grid('movies');
+    if(p[0]==='music') return musicHome();
     if(p[0]==='series') return grid('series');
     if(p[0]==='search'&&p[1]) return search(decodeURIComponent(p[1]));
     if(p[0]==='title'&&p[1]&&p[2]) return title(p[1],p[2]);
