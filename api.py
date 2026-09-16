@@ -2159,55 +2159,120 @@ async def music_home():
     return {"sections": sections, "provider": "ytmusic"}
 
 
+
 @app.get("/music/play/{video_id}", tags=["Music"])
 async def music_play(video_id: str):
-    """Return playable sources — embed + youtube watch (browser-safe)."""
+    """SimpMusic-style: metadata + direct audio stream (yt-dlp) + embed fallback."""
     if not re.match(r"^[a-zA-Z0-9_-]{11}$", video_id):
         raise HTTPException(400, "Invalid video id")
-    # metadata light
-    data = await _ytm_post("next", {"videoId": video_id})
+
     title, artist, thumb = video_id, "", f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
-    s = json.dumps(data)
-    texts = re.findall(r'"text"\s*:\s*"([^"\\]{2,80})"', s)
-    if texts:
-        title = texts[0]
-        if len(texts) > 1:
-            artist = texts[1]
-    thumbs = re.findall(r'https://i\.ytimg\.com/[^"\\]+', s)
-    if thumbs:
-        thumb = thumbs[0].replace("\\u0026", "&")
-    sources = [
-        {
-            "type": "embed",
-            "provider": "youtube",
-            "label": "YouTube Music",
-            "url": f"https://www.youtube.com/embed/{video_id}?autoplay=1&rel=0",
-            "play_url": f"https://www.youtube.com/embed/{video_id}?autoplay=1&rel=0",
-        },
-        {
-            "type": "embed",
-            "provider": "youtube-nocookie",
-            "label": "YouTube (privacy)",
-            "url": f"https://www.youtube-nocookie.com/embed/{video_id}?autoplay=1&rel=0",
-            "play_url": f"https://www.youtube-nocookie.com/embed/{video_id}?autoplay=1&rel=0",
-        },
-    ]
+    duration = None
+    audio_url = None
+    audio_format = None
+    errors = {}
+
+    # YT Music metadata
+    try:
+        data = await _ytm_post("next", {"videoId": video_id})
+        s = json.dumps(data)
+        texts = re.findall(r'"text"\s*:\s*"([^"\\]{2,80})"', s)
+        if texts:
+            title = texts[0]
+            if len(texts) > 1:
+                artist = texts[1]
+        thumbs = re.findall(r'https://i\.ytimg\.com/[^"\\]+', s)
+        if thumbs:
+            thumb = thumbs[0].replace("\\u0026", "&")
+    except Exception as e:
+        errors["meta"] = str(e)
+
+    # Direct audio via yt-dlp (same approach family as SimpMusic stream extract)
+    def _extract():
+        try:
+            import yt_dlp  # type: ignore
+        except ImportError:
+            return None, None, None, "yt-dlp not installed"
+        url = f"https://music.youtube.com/watch?v={video_id}"
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "noplaylist": True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if not info:
+                return None, None, None, "no info"
+            formats = info.get("formats") or []
+            audio_fmts = [
+                f for f in formats
+                if f.get("url") and (f.get("vcodec") in (None, "none") or f.get("acodec") not in (None, "none"))
+                and "audio only" in (f.get("format") or "").lower()
+                or (f.get("url") and f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none"))
+            ]
+            if not audio_fmts:
+                # pick any with audio
+                audio_fmts = [f for f in formats if f.get("url") and f.get("acodec") not in (None, "none")]
+            if not audio_fmts and info.get("url"):
+                return info.get("url"), info.get("ext"), info.get("duration"), None
+            if not audio_fmts:
+                return None, None, info.get("duration"), "no audio format"
+            # prefer m4a / mp4 / webm by bitrate
+            def score(f):
+                ext = (f.get("ext") or "")
+                br = f.get("abr") or f.get("tbr") or 0
+                pref = 3 if ext == "m4a" else 2 if ext in ("mp4", "webm") else 1
+                return (pref, br)
+            audio_fmts.sort(key=score, reverse=True)
+            best = audio_fmts[0]
+            return best.get("url"), best.get("ext") or "m4a", info.get("duration") or best.get("duration"), None
+        except Exception as e:
+            return None, None, None, str(e)
+
+    try:
+        audio_url, audio_format, duration, err = await asyncio.to_thread(_extract)
+        if err:
+            errors["stream"] = err
+    except Exception as e:
+        errors["stream"] = str(e)
+
+    sources = []
+    if audio_url:
+        sources.append({
+            "type": "audio",
+            "provider": "ytmusic-direct",
+            "label": f"Audio ({audio_format or 'best'})",
+            "url": audio_url,
+            "play_url": audio_url,
+            "format": (audio_format or "m4a").upper(),
+        })
+    # Embed always as fallback
+    sources.append({
+        "type": "embed",
+        "provider": "youtube",
+        "label": "YouTube embed",
+        "url": f"https://www.youtube.com/embed/{video_id}?autoplay=1&rel=0",
+        "play_url": f"https://www.youtube.com/embed/{video_id}?autoplay=1&rel=0",
+        "format": "EMBED",
+    })
+
     return {
         "video_id": video_id,
         "title": title,
         "artist": artist,
         "thumb": thumb,
+        "duration": duration,
+        "audio_url": audio_url,
+        "audio_format": audio_format,
         "sources": sources,
         "watch_url": f"https://music.youtube.com/watch?v={video_id}",
+        "download_url": f"https://www.youtube.com/watch?v={video_id}",
         "provider": "ytmusic",
+        "errors": errors or None,
     }
-
-
-
-
-
-
-
 
 
 @app.get("/music/lyrics", tags=["Music"])
@@ -2437,6 +2502,23 @@ img{display:block;max-width:100%}
   .side{position:fixed;left:0;top:0;transform:translateX(-105%);transition:transform .2s;z-index:30;height:100vh;box-shadow:8px 0 30px rgba(0,0,0,.5)}
   .side.open{transform:none}
 }
+
+/* SimpMusic-style player */
+.sm-player{max-width:520px;margin:0 auto;padding:12px 12px 120px;display:flex;flex-direction:column;align-items:center;gap:16px}
+.sm-art-wrap{width:min(100%,340px)}
+.sm-art{width:100%;aspect-ratio:1;object-fit:cover;border-radius:16px;box-shadow:0 20px 50px rgba(0,0,0,.45);background:var(--card)}
+.sm-meta{text-align:center;width:100%}
+.sm-title{font-size:1.35rem;font-weight:700;margin:0 0 4px;line-height:1.3}
+.sm-artist{color:var(--mute);font-size:.95rem}
+.sm-progress{width:100%;padding:0 4px}
+.sm-progress input[type=range]{width:100%;accent-color:var(--a)}
+.sm-time{display:flex;justify-content:space-between;font-size:.75rem;color:var(--mute);margin-top:4px}
+.sm-controls{display:flex;align-items:center;justify-content:center;gap:14px;width:100%}
+.sm-btn{width:48px;height:48px;border-radius:50%;border:1px solid var(--line);background:var(--card);color:var(--text);font-size:1.1rem;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;text-decoration:none}
+.sm-btn.sm-play{width:64px;height:64px;background:var(--a);color:#041018;border-color:var(--a);font-size:1.4rem}
+.sm-btn:hover{border-color:var(--a)}
+.sm-extra{display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
+.sm-player .m-lyrics{width:100%;max-height:40vh}
 </style></head>
 <body>
 <div class="app">
@@ -2515,35 +2597,51 @@ async function musicSearch(q){
       <section class="sec"><h2>Results for “${esc(q)}”</h2><div class="m-grid">${(d.items||[]).map(musicCard).join('')||'<p class="empty">No results</p>'}</div></section></div>`;
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
+
 async function musicPlayPage(vid){
   setNav('music');
   root.innerHTML='<div class="empty">Loading player…</div>';
-  let title=vid, artist='', thumb='https://i.ytimg.com/vi/'+vid+'/hqdefault.jpg';
+  let title=vid, artist='', thumb='https://i.ytimg.com/vi/'+vid+'/hqdefault.jpg', audioUrl=null, duration=null;
   try{
     const d=await api('/music/play/'+vid);
     title=d.title||title; artist=d.artist||''; thumb=d.thumb||thumb;
-  }catch(e){}
-  MSTATE={vid,title,artist,thumb};
-  const yt=`https://www.youtube.com/embed/${esc(vid)}?autoplay=1&rel=0&modestbranding=1`;
+    audioUrl=d.audio_url||null; duration=d.duration||null;
+    if(!audioUrl && d.sources){
+      const a=(d.sources||[]).find(s=>s.type==='audio');
+      if(a) audioUrl=a.url||a.play_url;
+    }
+  }catch(e){toast('Stream load failed')}
+  MSTATE={vid,title,artist,thumb,audioUrl};
+
   const watch=`https://music.youtube.com/watch?v=${esc(vid)}`;
   const ytw=`https://www.youtube.com/watch?v=${esc(vid)}`;
-  root.innerHTML=`<div class="m-player-page">
-    <div class="m-stage">
-      <div class="yt"><iframe src="${yt}" allow="autoplay;encrypted-media;picture-in-picture;fullscreen" allowfullscreen></iframe></div>
-      <div class="m-info">
-        <h1 id="mp-title">${esc(title)}</h1>
-        <div class="ar" id="mp-artist">${esc(artist||'YouTube Music')}</div>
-        <div class="m-actions">
-          <a class="btn" href="${watch}" target="_blank" rel="noopener">Open in YT Music</a>
-          <a class="btn ghost" href="${ytw}" target="_blank" rel="noopener">⬇ Download / Save</a>
-          <button class="btn ghost" type="button" onclick="navigator.clipboard.writeText('${ytw}').then(()=>toast('Link copied'))">Copy link</button>
-          <button class="btn ghost" type="button" onclick="location.hash='#/music'">← Library</button>
-        </div>
-      </div>
+
+  root.innerHTML=`<div class="sm-player">
+    <div class="sm-art-wrap"><img class="sm-art" src="${esc(thumb)}" alt=""/></div>
+    <div class="sm-meta">
+      <h1 class="sm-title" id="mp-title">${esc(title)}</h1>
+      <div class="sm-artist" id="mp-artist">${esc(artist||'YouTube Music')}</div>
+    </div>
+    <div class="sm-progress">
+      <input type="range" id="sm-seek" min="0" max="1000" value="0"/>
+      <div class="sm-time"><span id="sm-cur">0:00</span><span id="sm-dur">${duration?fmtTime(duration):'—:—'}</span></div>
+    </div>
+    <div class="sm-controls">
+      <button type="button" class="sm-btn" onclick="location.hash='#/music'" title="Library">☰</button>
+      <button type="button" class="sm-btn" id="sm-prev" title="Prev">⏮</button>
+      <button type="button" class="sm-btn sm-play" id="sm-toggle" title="Play">▶</button>
+      <button type="button" class="sm-btn" id="sm-next" title="Next">⏭</button>
+      <a class="sm-btn" href="${ytw}" target="_blank" rel="noopener" title="Download">⬇</a>
+    </div>
+    <audio id="sm-audio" preload="auto" crossorigin="anonymous"></audio>
+    <div class="sm-extra">
+      <a class="btn ghost" href="${watch}" target="_blank" rel="noopener">Open in YT Music</a>
+      <button class="btn ghost" type="button" onclick="navigator.clipboard.writeText('${ytw}').then(()=>toast('Link copied'))">Copy link</button>
     </div>
     <div class="m-lyrics"><h3>Lyrics</h3><pre id="mp-lyrics">Loading lyrics…</pre></div>
   </div>`;
-  // mini bar
+
+  // now bar
   const bar=document.getElementById('nowbar');
   if(bar){
     document.getElementById('nowtitle').textContent=title;
@@ -2552,7 +2650,44 @@ async function musicPlayPage(vid){
     document.getElementById('nowplayer').innerHTML='';
     bar.classList.add('on');
   }
-  // lyrics
+
+  const audio=document.getElementById('sm-audio');
+  const toggle=document.getElementById('sm-toggle');
+  const seek=document.getElementById('sm-seek');
+  let seeking=false;
+
+  if(audioUrl){
+    audio.src=audioUrl;
+    audio.play().catch(()=>{});
+    toggle.textContent='⏸';
+  }else{
+    // fallback: embed below art
+    const wrap=document.querySelector('.sm-art-wrap');
+    if(wrap){
+      wrap.innerHTML=`<div class="yt" style="aspect-ratio:16/9;width:100%;max-width:480px;margin:0 auto;border-radius:12px;overflow:hidden"><iframe src="https://www.youtube.com/embed/${esc(vid)}?autoplay=1&rel=0" allow="autoplay;encrypted-media" allowfullscreen style="width:100%;height:100%;border:0"></iframe></div>`;
+    }
+    toggle.textContent='▶';
+    toast('Direct audio unavailable — using YouTube player');
+  }
+
+  toggle.onclick=()=>{
+    if(!audio.src) return;
+    if(audio.paused){audio.play();toggle.textContent='⏸';}
+    else{audio.pause();toggle.textContent='▶';}
+  };
+  audio.addEventListener('timeupdate',()=>{
+    if(seeking||!audio.duration) return;
+    seek.value=Math.floor((audio.currentTime/audio.duration)*1000);
+    document.getElementById('sm-cur').textContent=fmtTime(audio.currentTime);
+    document.getElementById('sm-dur').textContent=fmtTime(audio.duration);
+  });
+  audio.addEventListener('ended',()=>{toggle.textContent='▶';});
+  seek.addEventListener('input',()=>{seeking=true;});
+  seek.addEventListener('change',()=>{
+    if(audio.duration) audio.currentTime=(seek.value/1000)*audio.duration;
+    seeking=false;
+  });
+
   try{
     const L=await api('/music/lyrics?title='+encodeURIComponent(title)+'&artist='+encodeURIComponent(artist||''));
     const el=document.getElementById('mp-lyrics');
@@ -2560,13 +2695,15 @@ async function musicPlayPage(vid){
       el.textContent=L.lyrics||L.synced;
       if(L.title) document.getElementById('mp-title').textContent=L.title;
       if(L.artist) document.getElementById('mp-artist').textContent=L.artist;
-    }else{
-      el.textContent='No lyrics found for this track.';
-    }
+    }else el.textContent='No lyrics found for this track.';
   }catch(e){
     const el=document.getElementById('mp-lyrics');
     if(el) el.textContent='Lyrics unavailable.';
   }
+}
+function fmtTime(s){
+  s=Math.floor(s||0); const m=Math.floor(s/60), sec=s%60;
+  return m+':'+String(sec).padStart(2,'0');
 }
 function playMusic(vid, title, artist, thumb){
   location.hash='#/music/play/'+vid;
