@@ -2759,9 +2759,26 @@ img{display:block;max-width:100%}
 .m-info h1{font-size:1.25rem;margin-bottom:6px}
 .m-info .ar{color:var(--mute);margin-bottom:14px}
 .m-actions{display:flex;flex-wrap:wrap;gap:8px}
-.m-lyrics{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px 18px;max-height:70vh;overflow:auto}
-.m-lyrics h3{font-size:.85rem;color:var(--mute);text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px}
-.m-lyrics pre{white-space:pre-wrap;font-family:Inter,system-ui,sans-serif;font-size:.92rem;line-height:1.65;color:#d4d4dc}
+.m-lyrics{background:linear-gradient(180deg,#14141a 0%,#0e0e14 100%);border:1px solid var(--line);border-radius:20px;padding:14px 12px 18px;display:flex;flex-direction:column;max-width:520px;margin:8px auto 0;width:100%}
+.m-lyrics-head{display:flex;align-items:center;justify-content:space-between;padding:0 8px 10px}
+.m-lyrics-head h3{font-size:.8rem;color:var(--mute);text-transform:uppercase;letter-spacing:.08em;margin:0}
+.m-lyrics-head .tag{font-size:.7rem;color:var(--a);opacity:.9}
+.lrc-box{height:min(42vh,320px);overflow-y:auto;overflow-x:hidden;scroll-behavior:smooth;padding:40% 12px;mask-image:linear-gradient(180deg,transparent 0%,#000 18%,#000 82%,transparent 100%);-webkit-mask-image:linear-gradient(180deg,transparent 0%,#000 18%,#000 82%,transparent 100%);-webkit-overflow-scrolling:touch}
+.lrc-line{text-align:center;padding:10px 8px;font-size:1.05rem;line-height:1.45;color:rgba(255,255,255,.28);font-weight:500;transition:color .2s,transform .2s,font-size .2s;cursor:default}
+.lrc-line.on{color:#fff;font-size:1.28rem;font-weight:700;transform:scale(1.02)}
+.lrc-line.near{color:rgba(255,255,255,.55);font-size:1.08rem}
+.lrc-line:empty{min-height:8px}
+.m-lyrics pre{white-space:pre-wrap;font-family:Inter,system-ui,sans-serif;font-size:.92rem;line-height:1.65;color:#d4d4dc;padding:8px}
+.sm-rec-list{display:flex;flex-direction:column;gap:6px;max-width:520px;margin:0 auto;width:100%}
+.sm-rec-row{display:flex;align-items:center;gap:12px;padding:8px 10px;border-radius:12px;background:var(--card);border:1px solid var(--line);cursor:pointer;transition:background .15s}
+.sm-rec-row:hover,.sm-rec-row:active{background:var(--card2)}
+.sm-rec-row img{width:48px;height:48px;border-radius:8px;object-fit:cover;background:#222;flex-shrink:0}
+.sm-rec-row .t{font-size:.9rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sm-rec-row .a{font-size:.75rem;color:var(--mute);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sm-rec-row .meta{flex:1;min-width:0}
+.sm-player .sec{max-width:520px;margin:18px auto 0;width:100%;padding:0 4px}
+.sm-player .sec h2{font-size:1rem;margin-bottom:10px}
+
 .now-bar{position:fixed;left:0;right:0;bottom:0;z-index:50;background:linear-gradient(180deg,rgba(16,16,20,.96),#0a0a0e);border-top:1px solid var(--line);backdrop-filter:blur(16px);padding:10px 14px;display:none;align-items:center;gap:12px}
 .now-bar.on{display:flex}
 .now-bar img{width:48px;height:48px;border-radius:8px;object-fit:cover;cursor:pointer}
@@ -2923,9 +2940,26 @@ function renderSyncLyrics(t){
   for(let i=0;i<MSTATE.lines.length;i++){
     if(MSTATE.lines[i].t<=t) idx=i; else break;
   }
-  box.innerHTML=MSTATE.lines.map((ln,i)=>`<div class="lrc-line ${i===idx?'on':''}" data-i="${i}">${esc(ln.text)}</div>`).join('');
+  if(MSTATE._lrcIdx===idx && box.children.length){
+    // only update classes
+    Array.from(box.children).forEach((el,i)=>{
+      el.className='lrc-line'+(i===idx?' on':(Math.abs(i-idx)===1?' near':''));
+    });
+  }else{
+    MSTATE._lrcIdx=idx;
+    box.innerHTML=MSTATE.lines.map((ln,i)=>{
+      const cls=i===idx?' on':(Math.abs(i-idx)===1?' near':'');
+      return `<div class="lrc-line${cls}" data-i="${i}">${esc(ln.text||' ')}</div>`;
+    }).join('');
+  }
+  // Scroll ONLY inside .lrc-box — never the page
   const on=box.querySelector('.lrc-line.on');
-  if(on) try{on.scrollIntoView({block:'center',behavior:'smooth'})}catch(e){}
+  if(on){
+    const target=on.offsetTop - box.clientHeight/2 + on.clientHeight/2;
+    const max=box.scrollHeight-box.clientHeight;
+    const next=Math.max(0,Math.min(max,target));
+    if(Math.abs(box.scrollTop-next)>2) box.scrollTop=next;
+  }
 }
 function cycleLoop(){
   MSTATE.loop=MSTATE.loop==='off'?'one':(MSTATE.loop==='one'?'all':'off');
@@ -3005,8 +3039,11 @@ async function musicPlayPage(rawId){
       <button class="btn ghost" type="button" onclick="navigator.clipboard.writeText(location.origin+(MSTATE.audioUrl||'')).then(()=>toast('Stream link copied'))">Copy stream</button>
       <button class="btn ghost" type="button" onclick="location.hash='#/music'">Library</button>
     </div>
-    <div class="m-lyrics"><h3>Lyrics</h3><div id="mp-lyrics" class="lrc-box">Loading lyrics…</div></div>
-    <section class="sec" id="sm-rec"><h2>Recommended</h2><div class="empty">Loading…</div></section>
+    <div class="m-lyrics">
+      <div class="m-lyrics-head"><h3>Lyrics</h3><span class="tag" id="lrc-tag">Line synced</span></div>
+      <div id="mp-lyrics" class="lrc-box">Loading lyrics…</div>
+    </div>
+    <section class="sec" id="sm-rec"><h2>More like this</h2><div class="empty">Loading…</div></section>
   </div>`;
 
   const bar=document.getElementById('nowbar');
@@ -3064,8 +3101,8 @@ async function musicPlayPage(rawId){
       MSTATE.lines=L.lines;
       renderSyncLyrics(0);
     }else if(L.found&&(L.lyrics||L.synced)){
-      el.innerHTML='<pre style="white-space:pre-wrap;font:inherit;color:inherit;margin:0">'+esc(L.lyrics||L.synced)+'</pre>';
-    }else el.textContent='No lyrics found';
+      el.innerHTML='<pre style="white-space:pre-wrap;font:inherit;color:inherit;margin:0">'+esc(L.lyrics||L.synced)+'</pre>';const tg=document.getElementById('lrc-tag');if(tg)tg.textContent='Plain text';
+    }else el.textContent='No lyrics found';const tg=document.getElementById('lrc-tag');if(tg)tg.textContent='';
     if(L.title) document.getElementById('mp-title').textContent=L.title;
     if(L.artist) document.getElementById('mp-artist').textContent=L.artist;
   }catch(e){
@@ -3080,11 +3117,16 @@ async function musicPlayPage(rawId){
     if(recEl){
       const items=(rec.items||[]).filter(x=>(x.id||'')!==id);
       if(items.length){
-        // merge into queue for next
         const have=new Set((MSTATE.queue||[]).map(x=>x.id));
         items.forEach(it=>{if(it.id&&!have.has(it.id)){MSTATE.queue.push(it);have.add(it.id)}});
-        recEl.innerHTML=`<h2>Recommended</h2><div class="m-grid">${items.map(musicCard).join('')}</div>`;
-      }else recEl.innerHTML='<h2>Recommended</h2><p class="empty">No suggestions</p>';
+        recEl.innerHTML=`<h2>More like this</h2><div class="sm-rec-list">${items.map(it=>{
+          const rid=it.id||it.video_id||'';
+          return `<div class="sm-rec-row" onclick="location.hash='#/music/play/'+encodeURIComponent('${esc(rid)}')">
+            <img src="${esc(it.thumb||'')}" alt="" loading="lazy"/>
+            <div class="meta"><div class="t">${esc(it.title||'')}</div><div class="a">${esc(it.artist||'')}</div></div>
+          </div>`;
+        }).join('')}</div>`;
+      }else recEl.innerHTML='<h2>More like this</h2><p class="empty">No suggestions</p>';
     }
   }catch(e){
     const recEl=document.getElementById('sm-rec');
