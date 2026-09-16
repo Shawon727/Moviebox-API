@@ -739,6 +739,30 @@ async def resolve_hubdrive(file_url: str) -> List[dict]:
     raise HTTPException(502, "HubDrive: no HubCloud mirror found")
 
 
+
+async def _resolve_masked_hub(url: str) -> List[dict]:
+    """Follow intermediate download pages to HubCloud /drive/ then resolve."""
+    headers = {"User-Agent": FK_UA, "Referer": url}
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20.0, headers=headers) as client:
+        r = await client.get(url)
+        text = r.text or ""
+        final = str(r.url)
+        candidates = []
+        pattern = r"https?://[^\s\"'<>]+"
+        for u in re.findall(pattern, text + " " + final):
+            if "hubcloud." in u and "/drive/" in u:
+                candidates.append(u.split("&")[0].rstrip(").,;"))
+            if "hubdrive." in u:
+                candidates.append(u.split("&")[0].rstrip(").,;"))
+        out = []
+        for c in candidates[:3]:
+            try:
+                out.extend(await resolve_any(c))
+            except Exception:
+                continue
+        return out
+
+
 async def resolve_any(url: str) -> List[dict]:
     u = url.strip()
     if "hubcloud." in u and "/drive/" in u:
@@ -835,7 +859,7 @@ def fk_parse_releases(html: str, season: int = 0, episode: int = 0) -> List[dict
                 {
                     "label": link.get_text(strip=True) or "Source",
                     "url": href,
-                    "needs_resolve": ("hubcloud." in href or "hubdrive." in href),
+                    "needs_resolve": any(x in href for x in ("hubcloud.", "hubdrive.", "greenmotors.", "gamerxyt.")),
                 }
             )
         if not mirrors:
@@ -874,7 +898,7 @@ def fk_parse_releases(html: str, season: int = 0, episode: int = 0) -> List[dict
 
 @app.get("/health", tags=["Meta"])
 async def health():
-    return {"ok": True, "version": "5.0.0", "providers": ["moviebox", "4khdhub", "hubcloud", "tmdb", "embeds"]}
+    return {"ok": True, "version": "5.0.0", "providers": ["tmdb", "videasy", "vidsrc", "vidking", "4khdhub", "hubcloud", "moviebox-api"]}
 
 
 # ----- Mov
@@ -1121,6 +1145,47 @@ async def _clean_title(title: str) -> str:
     return clean or (title or "")
 
 
+
+TMDB_KEY = os.environ.get("TMDB_API_KEY", "1f54bd990f1cdfb230adb312546d765d")
+TMDB_BASE = "https://api.themoviedb.org/3"
+TMDB_IMG = "https://image.tmdb.org/t/p"
+
+
+async def _tmdb_get(path: str, params: Optional[dict] = None) -> dict:
+    q = {"api_key": TMDB_KEY, "language": "en-US"}
+    if params:
+        q.update(params)
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(f"{TMDB_BASE}{path}", params=q)
+        if r.status_code != 200:
+            return {}
+        return r.json()
+
+
+def _tmdb_card(item: dict, media_hint: str = None) -> dict:
+    media = media_hint or item.get("media_type")
+    if not media:
+        media = "tv" if item.get("name") and not item.get("title") else "movie"
+    if media == "person":
+        return None
+    tid = item.get("id")
+    title = item.get("title") or item.get("name") or ""
+    date = item.get("release_date") or item.get("first_air_date") or ""
+    poster = item.get("poster_path")
+    return {
+        "id": str(tid),
+        "tmdb_id": str(tid),
+        "name": title,
+        "poster": f"{TMDB_IMG}/w500{poster}" if poster else None,
+        "backdrop": f"{TMDB_IMG}/w1280{item.get('backdrop_path')}" if item.get("backdrop_path") else None,
+        "year": date[:4] if date else None,
+        "rating": item.get("vote_average"),
+        "type": "tv" if media == "tv" else "movie",
+        "provider": "tmdb",
+        "overview": item.get("overview") or "",
+    }
+
+
 async def _tmdb_search_id(title: str, media: str = "movie"):
     key = os.environ.get("TMDB_API_KEY", "1f54bd990f1cdfb230adb312546d765d")
     clean = await _clean_title(title)
@@ -1153,47 +1218,51 @@ async def _tmdb_search_id(title: str, media: str = "movie"):
 
 
 def _embed_sources_meta(meta: dict, media: str, se: int = 1, ep: int = 1):
+    """Stream embeds inspired by streambert / Flick-style players (TMDB id)."""
     sources = []
     tmdb = meta.get("tmdb")
     imdb = meta.get("imdb")
+    se = max(1, int(se or 1))
+    ep = max(1, int(ep or 1))
+    pairs = []
     if media == "movie":
         if tmdb:
             pairs = [
-                ("VidSrc", f"https://vidsrc.xyz/embed/movie/{tmdb}"),
-                ("VidSrc.to", f"https://vidsrc.to/embed/movie/{tmdb}"),
-                ("2Embed", f"https://www.2embed.cc/embed/{tmdb}"),
+                ("Videasy", f"https://player.videasy.to/movie/{tmdb}?overlay=true"),
+                ("VidSrc", f"https://vsembed.su/embed/movie/{tmdb}"),
+                ("Vidking", f"https://www.vidking.net/embed/movie/{tmdb}?autoPlay=true"),
                 ("VidLink", f"https://vidlink.pro/movie/{tmdb}"),
-                ("SuperEmbed", f"https://multiembed.mov/?video_id={tmdb}&tmdb=1"),
             ]
         elif imdb:
             pairs = [
-                ("VidSrc IMDB", f"https://vidsrc.xyz/embed/movie?imdb={imdb}"),
-                ("VidSrc.to IMDB", f"https://vidsrc.to/embed/movie/{imdb}"),
-                ("SuperEmbed IMDB", f"https://multiembed.mov/?video_id={imdb}"),
+                ("VidSrc IMDB", f"https://vsembed.su/embed/movie/{imdb}"),
+                ("Vidking IMDB", f"https://www.vidking.net/embed/movie/{imdb}?autoPlay=true"),
             ]
-        else:
-            pairs = []
     else:
         if tmdb:
             pairs = [
-                ("VidSrc", f"https://vidsrc.xyz/embed/tv/{tmdb}/{se}/{ep}"),
-                ("VidSrc.to", f"https://vidsrc.to/embed/tv/{tmdb}/{se}/{ep}"),
-                ("2Embed", f"https://www.2embed.cc/embedtv/{tmdb}&s={se}&e={ep}"),
+                ("Videasy", f"https://player.videasy.to/tv/{tmdb}/{se}/{ep}?overlay=true"),
+                ("VidSrc", f"https://vsembed.su/embed/tv/{tmdb}/{se}/{ep}"),
+                ("Vidking", f"https://www.vidking.net/embed/tv/{tmdb}/{se}/{ep}?autoPlay=true"),
                 ("VidLink", f"https://vidlink.pro/tv/{tmdb}/{se}/{ep}"),
             ]
         elif imdb:
             pairs = [
-                ("VidSrc IMDB", f"https://vidsrc.xyz/embed/tv?imdb={imdb}&season={se}&episode={ep}"),
-                ("VidSrc.to IMDB", f"https://vidsrc.to/embed/tv/{imdb}/{se}/{ep}"),
+                ("VidSrc IMDB", f"https://vsembed.su/embed/tv/{imdb}/{se}/{ep}"),
             ]
-        else:
-            pairs = []
-    for n, u in pairs:
-        sources.append({"provider": "embed", "label": n, "url": u, "format": "EMBED", "type": "embed", "headers": {}, "play_url": u})
+    for label, url in pairs:
+        sources.append({
+            "provider": "embed",
+            "label": label,
+            "url": url,
+            "play_url": url,
+            "format": "EMBED",
+            "type": "embed",
+        })
     return sources
 
 
-# keep old name as wrapper
+
 def _embed_sources(tmdb_id: str, media: str, se: int = 1, ep: int = 1):
     return _embed_sources_meta({"tmdb": tmdb_id, "imdb": None}, media, se, ep)
 
@@ -1527,128 +1596,77 @@ def _mb_items_from_ops(data) -> list:
 
 @app.get("/api/home", tags=["Catalog"])
 async def api_home():
-    """Homepage rows from MovieBox operating tabs + seeded searches."""
-    trending = popular_m = popular_t = []
+    """TMDB homepage rows (Flick/streambert style catalog)."""
+    trending_m = trending_t = popular_m = popular_t = top_m = []
     try:
-        data = await mb_request("GET", "/wefeed-mobile-bff/tab-operating?page=1&tabId=1&version=")
-        all_items = _mb_items_from_ops(data)
-        trending = all_items[:18]
-        popular_m = [x for x in all_items if x["type"] == "movie"][:18]
-        popular_t = [x for x in all_items if x["type"] == "tv"][:18]
+        d = await _tmdb_get("/trending/movie/week")
+        trending_m = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "movie"))]
     except Exception:
         pass
-    # fallback seeded queries so UI never stays empty
-    if len(trending) < 6:
-        for q in ("Avengers", "Spider", "Batman"):
-            try:
-                d = await mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2",
-                    {"keyword": q, "page": 1, "perPage": 10, "subjectType": 0})
-                trending.extend(_mb_items_from_search_data(d))
-            except Exception:
-                continue
-        # dedupe
-        seen = set()
-        uniq = []
-        for x in trending:
-            if x["id"] in seen:
-                continue
-            seen.add(x["id"])
-            uniq.append(x)
-        trending = uniq[:18]
-        if not popular_m:
-            popular_m = [x for x in trending if x["type"] == "movie"]
-        if not popular_t:
-            popular_t = [x for x in trending if x["type"] == "tv"]
+    try:
+        d = await _tmdb_get("/trending/tv/week")
+        trending_t = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "tv"))]
+    except Exception:
+        pass
+    try:
+        d = await _tmdb_get("/movie/popular")
+        popular_m = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "movie"))]
+    except Exception:
+        pass
+    try:
+        d = await _tmdb_get("/tv/popular")
+        popular_t = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "tv"))]
+    except Exception:
+        pass
+    try:
+        d = await _tmdb_get("/movie/top_rated")
+        top_m = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "movie"))]
+    except Exception:
+        pass
     return {
-        "trending_movies": [x for x in trending if x["type"] == "movie"][:18] or trending[:18],
-        "trending_tv": [x for x in trending if x["type"] == "tv"][:18] or popular_t[:18],
-        "popular_movies": popular_m[:18] or trending[:18],
-        "popular_tv": popular_t[:18] or trending[:18],
+        "trending_movies": trending_m[:18],
+        "trending_series": trending_t[:18],
+        "popular_movies": popular_m[:18],
+        "popular_series": popular_t[:18],
+        "top_movies": top_m[:18],
+        "provider": "tmdb",
     }
+
 
 
 @app.get("/api/movies", tags=["Catalog"])
 async def api_movies(page: int = 1):
-    items = []
-    errors = None
-    for kw in ("action", "love", "2024", "movie", "the"):
-        try:
-            d = await mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2",
-                {"keyword": kw, "page": page, "perPage": 24, "subjectType": 0})
-            items = [x for x in _mb_items_from_search_data(d) if x.get("type") == "movie"]
-            if not items:
-                items = _mb_items_from_search_data(d)
-            if items:
-                break
-        except Exception as e:
-            errors = str(e)
-            continue
-    if not items:
-        try:
-            home = await api_home()
-            items = home.get("trending_movies") or home.get("popular_movies") or []
-        except Exception as e:
-            errors = str(e)
-    return {"page": page, "items": items, "total_pages": 10, "error": errors}
+    d = await _tmdb_get("/movie/popular", {"page": page})
+    items = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "movie"))]
+    return {"items": items, "page": page, "provider": "tmdb"}
+
 
 
 @app.get("/api/series", tags=["Catalog"])
 async def api_series(page: int = 1):
-    items = []
-    errors = None
-    for kw in ("drama", "love", "2024", "series", "the"):
-        try:
-            d = await mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2",
-                {"keyword": kw, "page": page, "perPage": 24, "subjectType": 0})
-            items = [x for x in _mb_items_from_search_data(d) if x.get("type") == "tv"]
-            if not items:
-                items = _mb_items_from_search_data(d)
-            if items:
-                break
-        except Exception as e:
-            errors = str(e)
-            continue
-    if not items:
-        try:
-            home = await api_home()
-            items = home.get("trending_tv") or home.get("popular_tv") or []
-        except Exception as e:
-            errors = str(e)
-    return {"page": page, "items": items, "total_pages": 10, "error": errors}
+    d = await _tmdb_get("/tv/popular", {"page": page})
+    items = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "tv"))]
+    return {"items": items, "page": page, "provider": "tmdb"}
+
 
 
 @app.get("/api/search", tags=["Catalog"])
 async def api_search_catalog(q: str = Query(..., min_length=1)):
-    """Same MovieBox path as /mb/search (stable). Optional 4KHDHub secondary."""
-    mb_items = []
+    """TMDB multi-search for web + optional 4KHDHub hits."""
+    items = []
     fk_items = []
     errors = {}
     try:
-        d = await mb_request(
-            "POST",
-            "/wefeed-mobile-bff/subject-api/search/v2",
-            {"keyword": q, "page": 1, "perPage": 20, "subjectType": 0},
-        )
-        mb_items = _mb_items_from_search_data(d)
+        d = await _tmdb_get("/search/multi", {"query": q, "page": 1, "include_adult": "false"})
+        for x in d.get("results") or []:
+            c = _tmdb_card(x)
+            if c:
+                items.append(c)
     except Exception as e:
-        errors["moviebox"] = str(e)
-        # one soft retry after short pause
-        try:
-            await asyncio.sleep(1.0)
-            global _mb_token
-            _mb_token = None
-            d = await mb_request(
-                "POST",
-                "/wefeed-mobile-bff/subject-api/search/v2",
-                {"keyword": q, "page": 1, "perPage": 20, "subjectType": 0},
-            )
-            mb_items = _mb_items_from_search_data(d)
-            errors.pop("moviebox", None)
-        except Exception as e2:
-            errors["moviebox"] = str(e2)
+        errors["tmdb"] = str(e)
     try:
         html = await fk_fetch(f"?s={q}")
-        for it in fk_parse_search(html):
+        for it in fk_parse_search(html)[:12]:
             fk_items.append({
                 "id": it.get("id"),
                 "name": it.get("name"),
@@ -1661,221 +1679,134 @@ async def api_search_catalog(q: str = Query(..., min_length=1)):
         errors["4khdhub"] = str(e)
     return {
         "query": q,
-        "items": mb_items,
-        "moviebox": mb_items,
+        "items": items,
+        "tmdb": items,
         "fourkhdhub": fk_items,
-        "tmdb": [],
+        "moviebox": [],
         "errors": errors or None,
     }
 
 
+
 @app.get("/api/detail/{media}/{item_id}", tags=["Catalog"])
 async def api_detail(media: str, item_id: str):
-    """MovieBox subject detail. media is movie|tv (informational). item_id = subjectId."""
-    data = await mb_request("GET", f"/wefeed-mobile-bff/subject-api/get?subjectId={item_id}")
-    sub = data.get("subject") or data
-    stype = sub.get("subjectType") or sub.get("stype") or (2 if media == "tv" else 1)
+    """TMDB detail for web. item_id = TMDB id. MovieBox remains on /mb/detail/{id}."""
+    media = "tv" if media in ("tv", "series", "show") else "movie"
+    path = f"/{media}/{item_id}"
+    params = {"append_to_response": "external_ids,credits"}
+    if media == "tv":
+        params["append_to_response"] = "external_ids,credits"
+    d = await _tmdb_get(path, params)
+    if not d or not d.get("id"):
+        raise HTTPException(404, "Not found on TMDB")
     seasons = []
-    if stype == 2:
-        try:
-            sdata = await mb_request("GET", f"/wefeed-mobile-bff/subject-api/season-info?subjectId={item_id}")
-            # normalize seasons list
-            raw = sdata if isinstance(sdata, list) else (sdata.get("list") or sdata.get("seasons") or sdata.get("data") or [])
-            if isinstance(raw, dict):
-                raw = raw.get("list") or []
-            for s in raw or []:
-                if not isinstance(s, dict):
-                    continue
-                num = s.get("se") or s.get("season") or s.get("seasonNumber") or s.get("number")
-                if num is None:
-                    continue
-                seasons.append({
-                    "season": int(num),
-                    "name": s.get("title") or s.get("name") or f"Season {num}",
-                    "episode_count": s.get("episodeCount") or s.get("epCount") or s.get("maxEp") or len(s.get("episodes") or []),
-                    "poster": None,
-                })
-        except Exception:
-            pass
-    cover = sub.get("cover") or {}
-    poster = cover.get("url") if isinstance(cover, dict) else sub.get("coverUrl")
+    if media == "tv":
+        for s in d.get("seasons") or []:
+            num = s.get("season_number")
+            if num is None or int(num) < 1:
+                continue
+            seasons.append({
+                "season": int(num),
+                "name": s.get("name") or f"Season {num}",
+                "episode_count": s.get("episode_count") or 0,
+                "poster": f"{TMDB_IMG}/w300{s['poster_path']}" if s.get("poster_path") else None,
+            })
+        seasons.sort(key=lambda x: x["season"])
+    poster = d.get("poster_path")
+    backdrop = d.get("backdrop_path")
+    title = d.get("title") or d.get("name") or ""
+    date = d.get("release_date") or d.get("first_air_date") or ""
+    imdb = (d.get("external_ids") or {}).get("imdb_id")
     return {
-        "id": str(sub.get("subjectId") or item_id),
-        "name": sub.get("title") or sub.get("name"),
-        "overview": sub.get("description") or sub.get("intro") or sub.get("overview") or "",
-        "poster": poster,
-        "backdrop": poster,
-        "year": (sub.get("releaseDate") or "")[:4],
-        "rating": sub.get("imdbRatingValue") or sub.get("score"),
-        "genres": sub.get("genreNames") or sub.get("genres") or [],
-        "type": "tv" if stype == 2 else "movie",
+        "id": str(d["id"]),
+        "tmdb_id": str(d["id"]),
+        "imdb_id": imdb,
+        "name": title,
+        "overview": d.get("overview") or "",
+        "poster": f"{TMDB_IMG}/w500{poster}" if poster else None,
+        "backdrop": f"{TMDB_IMG}/w1280{backdrop}" if backdrop else None,
+        "year": date[:4] if date else None,
+        "rating": d.get("vote_average"),
+        "genres": [g.get("name") for g in (d.get("genres") or []) if g.get("name")],
+        "type": media,
+        "provider": "tmdb",
         "seasons": seasons,
-        "provider": "moviebox",
+        "runtime": d.get("runtime") or (d.get("episode_run_time") or [None])[0],
     }
+
 
 
 @app.get("/api/tv/{item_id}/season/{season}", tags=["Catalog"])
 async def api_season(item_id: str, season: int):
-    """Episode list ascending (1..N). Uses allEp when MovieBox provides it."""
+    """TMDB season episodes (ascending)."""
+    d = await _tmdb_get(f"/tv/{item_id}/season/{season}")
     episodes = []
-    max_ep = 24
-    try:
-        sdata = await mb_request("GET", f"/wefeed-mobile-bff/subject-api/season-info?subjectId={item_id}")
-        raw = sdata
-        if isinstance(sdata, dict):
-            raw = sdata.get("seasons") or sdata.get("list") or []
-            if isinstance(raw, dict):
-                raw = raw.get("seasons") or raw.get("list") or []
-        if not isinstance(raw, list):
-            raw = []
-        for s in raw:
-            if not isinstance(s, dict):
-                continue
-            num = s.get("se") or s.get("season") or s.get("seasonNumber") or s.get("number")
-            try:
-                num = int(num)
-            except Exception:
-                continue
-            if num != int(season):
-                continue
-            max_ep = int(s.get("episodeCount") or s.get("epCount") or s.get("maxEp") or 24)
-            eps = s.get("episodes") or s.get("episodeList") or []
-            if isinstance(eps, list) and eps:
-                for e in eps:
-                    if not isinstance(e, dict):
-                        continue
-                    epn = e.get("ep") or e.get("episode") or e.get("number") or e.get("epNum")
-                    if epn is None:
-                        continue
-                    episodes.append({
-                        "episode": int(epn),
-                        "name": e.get("title") or e.get("name") or f"Episode {epn}",
-                        "overview": e.get("description") or e.get("overview") or "",
-                        "still": e.get("cover") or e.get("still") or None,
-                    })
-            all_ep = str(s.get("allEp") or s.get("all_ep") or "").strip()
-            if not episodes and all_ep:
-                for part in all_ep.split(","):
-                    part = part.strip()
-                    if part.isdigit():
-                        n = int(part)
-                        episodes.append({
-                            "episode": n,
-                            "name": f"Episode {n}",
-                            "overview": "",
-                            "still": None,
-                        })
-            break
-    except Exception:
-        pass
-    if not episodes:
-        episodes = [
-            {"episode": i, "name": f"Episode {i}", "overview": "", "still": None}
-            for i in range(1, max_ep + 1)
-        ]
-    episodes = [e for e in episodes if e.get("episode") is not None]
-    episodes.sort(key=lambda e: int(e["episode"]))
+    for e in d.get("episodes") or []:
+        epn = e.get("episode_number")
+        if epn is None:
+            continue
+        still = e.get("still_path")
+        episodes.append({
+            "episode": int(epn),
+            "name": e.get("name") or f"Episode {epn}",
+            "overview": e.get("overview") or "",
+            "still": f"{TMDB_IMG}/w300{still}" if still else None,
+        })
+    episodes.sort(key=lambda x: x["episode"])
     return {"season": int(season), "episodes": episodes, "count": len(episodes)}
+
 
 
 
 @app.get("/api/play", tags=["Playback"])
 async def api_play(
-    subject_id: str = Query(None, description="MovieBox subject id"),
-    tmdb_id: str = Query(None, description="Ignored — kept for old UI"),
+    subject_id: str = Query(None, description="Legacy MovieBox id — ignored on web path"),
+    tmdb_id: str = Query(None, description="TMDB id for web playback"),
     media: str = Query("movie"),
     se: int = 0,
     ep: int = 0,
-    q: str = Query("", description="Title search if no subject_id"),
+    q: str = Query("", description="Title for 4KHDHub match / TMDB lookup"),
 ):
-    """Failover: MovieBox streams only (direct)."""
+    """Web playback: streambert-style embeds + 4KHDHub/HubCloud list. MovieBox is NOT used here — use /mb/stream."""
     sources = []
     errors = {}
-    sid = subject_id
-    if not sid and q:
-        try:
-            d = await mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2",
-                {"keyword": q, "page": 1, "perPage": 5, "subjectType": 0})
-            items = _mb_items_from_search_data(d)
-            if items:
-                sid = items[0]["id"]
-        except Exception as e:
-            errors["search"] = str(e)
-    # UI may pass item id as tmdb_id by mistake — treat as subject_id
-    if not sid and tmdb_id:
-        sid = tmdb_id
-    if not sid:
-        return {"count": 0, "sources": [], "errors": {"id": "subject_id required"}, "strategy": "moviebox"}
+    media = "tv" if media in ("tv", "series", "show") else "movie"
+    title = (q or "").strip()
+    tid = (tmdb_id or "").strip() or None
+    # subject_id from old UI may actually be tmdb id when provider=tmdb
+    if not tid and subject_id and str(subject_id).isdigit() and len(str(subject_id)) < 12:
+        tid = str(subject_id)
+
+    meta = None
+    if tid:
+        det = await _tmdb_get(f"/{media}/{tid}")
+        if det.get("id"):
+            title = title or det.get("title") or det.get("name") or ""
+            meta = {"tmdb": str(det["id"]), "imdb": (det.get("external_ids") or {}).get("imdb_id"), "name": title}
+            if not meta.get("imdb"):
+                ext = await _tmdb_get(f"/{media}/{tid}/external_ids")
+                meta["imdb"] = ext.get("imdb_id")
+    if not meta and title:
+        meta = await _tmdb_search_id(title, media)
+        if meta and meta.get("tmdb"):
+            tid = str(meta["tmdb"])
+            title = title or meta.get("name") or ""
 
     se_use = se if media == "tv" else 0
     ep_use = ep if media == "tv" else 0
-    try:
-        if se_use == 0 and ep_use == 0:
-            path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={sid}"
-        else:
-            path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={sid}&se={se_use}&ep={ep_use}"
-        try:
-            pdata = await mb_request("GET", path)
-        except Exception:
-            pdata = await mb_request("GET", path.replace("/play-info/v2", "/play-info"))
-        for s in _parse_mb_play_info(pdata if isinstance(pdata, dict) else {}, _mb_ua):
-            sources.append({
-                "provider": "moviebox",
-                "label": f"MovieBox {s.get('resolution') or s.get('format') or ''}".strip(),
-                "url": s["url"],
-                "format": s.get("format"),
-                "codec": s.get("codec"),
-                "type": "direct",
-                "headers": s.get("headers") or {},
-            })
-        # resource links
-        try:
-            extra = await _mb_resource_links(sid, se_use, ep_use)
-            seen = {x["url"] for x in sources}
-            for e in extra:
-                if e["url"] not in seen:
-                    sources.append({
-                        "provider": "moviebox",
-                        "label": f"MovieBox file {e.get('resolution') or ''}".strip(),
-                        "url": e["url"],
-                        "format": e.get("format"),
-                        "type": "direct",
-                        "headers": e.get("headers") or {},
-                    })
-        except Exception:
-            pass
-    except Exception as e:
-        errors["moviebox"] = str(e)
+    if media == "tv":
+        se_use = max(1, se_use or 1)
+        ep_use = max(1, ep_use or 1)
 
+    if meta:
+        sources.extend(_embed_sources_meta(meta, media, se_use or 1, ep_use or 1))
+    else:
+        errors["embed"] = "no TMDB match"
 
-    # Title for 4KHDHub match
-    title = q or ""
-    if not title and sid:
-        try:
-            det = await mb_request("GET", f"/wefeed-mobile-bff/subject-api/get?subjectId={sid}")
-            sub = det.get("subject") or det
-            title = sub.get("title") or sub.get("name") or ""
-        except Exception:
-            pass
-
-    for s in sources:
-        codec = (s.get("codec") or "").lower()
-        url_l = (s.get("url") or "").lower()
-        if "hevc" in codec or "h265" in codec or "h265" in url_l or "hev1" in codec:
-            s["codec"] = "hevc"
-            s["hevc"] = True
-            if "HEVC" not in (s.get("label") or ""):
-                s["label"] = (s.get("label") or "MovieBox") + " · HEVC"
-        if s.get("type") == "direct":
-            s["play_url"] = _proxy_url(s)
-        else:
-            s["play_url"] = s.get("url")
-
-    # --- 4KHDHub + HubCloud direct (MovieBox-TUI style, no embeds) ---
+    # 4KHDHub / HubCloud direct mirrors (list under player)
     hub_links: List[dict] = []
     clean = re.sub(r"\[[^\]]*\]", " ", title or "")
     clean = re.sub(r"\([^)]*\)", " ", clean)
-    clean = re.sub(r"\s+S\d+.*$", "", clean, flags=re.I)
     clean = re.sub(r"\s+", " ", clean).strip()
     if clean:
         try:
@@ -1884,7 +1815,7 @@ async def api_play(
             def tscore(name: str) -> int:
                 n = (name or "").lower(); c = clean.lower()
                 if n == c or n.startswith(c): return 0
-                if c.split()[0] in n and (len(c.split())==1 or c in n): return 1
+                if c.split()[0] in n: return 1
                 if c in n: return 2
                 return 9
             hits = sorted(hits, key=lambda x: tscore(x.get("name") or ""))
@@ -1892,421 +1823,360 @@ async def api_play(
                 path_id = hits[0].get("id")
                 if path_id:
                     page = await fk_fetch(path_id)
-                    releases = fk_parse_releases(page, se if media == "tv" else 0, ep if media == "tv" else 0)
-                    def rscore(r):
-                        fn = (r.get("filename") or "").lower()
-                        q = (r.get("quality") or "").lower()
-                        sc = 50
-                        if "x264" in fn or "avc" in fn: sc -= 25
-                        if "1080" in q or "1080" in fn: sc -= 10
-                        if "720" in q or "720" in fn: sc -= 8
-                        if "2160" in q or "4k" in fn: sc += 12
-                        if "remux" in fn: sc += 8
-                        return sc
-                    for rel in sorted(releases, key=rscore):
-                        if len(hub_links) >= 8:
+                    releases = fk_parse_releases(page, se_use if media == "tv" else 0, ep_use if media == "tv" else 0)
+                    for rel in releases[:10]:
+                        if len(hub_links) >= 10:
                             break
                         for mir in rel.get("mirrors") or []:
-                            if len(hub_links) >= 8:
+                            if len(hub_links) >= 10:
                                 break
                             murl = mir.get("url") or ""
-                            if "hubcloud." not in murl and "hubdrive." not in murl:
-                                continue
+                            # HubCloud often masked behind greenmotors / short redirects
+                            if not any(x in murl for x in ("hubcloud.", "hubdrive.", "greenmotors.", "gamerxyt.", "/drive/")):
+                                if not mir.get("needs_resolve"):
+                                    continue
                             try:
-                                links = await resolve_any(murl)
+                                if "hubcloud." in murl or "/drive/" in murl:
+                                    links = await resolve_any(murl)
+                                elif "hubdrive." in murl:
+                                    links = await resolve_any(murl)
+                                else:
+                                    # follow redirect page to find hubcloud
+                                    links = await _resolve_masked_hub(murl)
                             except Exception:
                                 continue
                             for L in links:
                                 u = L.get("url") or ""
                                 if not u or not _is_playable_direct(u):
                                     continue
-                                # pixeldrain → api download URL variants
                                 candidates = _pixeldrain_bypass_urls(u) if "pixeldrain." in u else [u]
                                 ok = None
                                 hdrs = L.get("headers") or {"User-Agent": FK_UA, "Referer": murl}
                                 for cand in candidates:
                                     ok = await preflight_url(cand, hdrs)
-                                    if ok:
+                                    if ok and _is_playable_direct(ok):
                                         u = ok
                                         break
-                                if not ok or not _is_playable_direct(ok):
-                                    continue  # only working links
-                                u = ok
+                                    ok = None
+                                if not ok:
+                                    continue
                                 low = u.lower()
                                 fmt = "MP4" if ".mp4" in low else ("MKV" if ".mkv" in low else "FILE")
                                 hub_links.append({
                                     "label": f"{rel.get('quality') or '?'} · {(L.get('label') or 'CDN')[:40]} · {fmt}",
                                     "filename": (rel.get("filename") or "")[:120],
-                                    "quality": rel.get("quality"),
-                                    "size": rel.get("size"),
                                     "url": u,
                                     "play_url": u,
-                                    "type": "hub",
+                                    "type": "direct",
                                     "format": fmt,
                                     "provider": "4khdhub",
                                     "headers": hdrs,
                                 })
-                                if len(hub_links) >= 8:
-                                    break
         except Exception as e:
             errors["4khdhub"] = str(e)
 
-    seen = set()
-    mb_list = []
-    hub_src = []
-    for s in sources:
-        u = s.get("url")
-        if not u or u in seen:
-            continue
-        seen.add(u)
-        if "play_url" not in s:
-            s["play_url"] = _proxy_url(s) if s.get("type") == "direct" else u
-        mb_list.append(s)
-    for h in hub_links:
-        u = h.get("url")
-        if not u or u in seen:
-            continue
-        seen.add(u)
-        hub_src.append({
-            "provider": "4khdhub",
-            "label": h.get("label") or "HubCloud",
-            "url": u,
-            "play_url": u,
-            "format": "FILE",
-            "type": "direct",
-            "headers": {},
-        })
-    # Prefer browser-friendly files: MP4/Pixeldrain before MKV, then MovieBox HEVC
     def _hub_rank(s):
         u = (s.get("url") or "").lower()
         lab = (s.get("label") or "").lower()
         fmt = (s.get("format") or "").lower()
         if "pixeldrain" in u or "pixeldrain" in lab: return 0
         if ".mp4" in u or fmt == "mp4": return 1
-        if "workers.dev" in u and ".mkv" not in u: return 2
+        if "workers.dev" in u: return 2
         if ".mkv" in u or fmt == "mkv": return 4
         return 3
-    hub_src.sort(key=_hub_rank)
-    uniq = hub_src + mb_list
+    hub_links.sort(key=_hub_rank)
+
+    hub_src = [{
+        "provider": "4khdhub",
+        "label": h.get("label") or "Hub",
+        "url": h["url"],
+        "play_url": h["url"],
+        "format": h.get("format") or "FILE",
+        "type": "direct",
+        "headers": h.get("headers") or {},
+    } for h in hub_links]
+
+    # Web order: embeds first (reliable A/V in browser), then hub files
+    uniq = []
+    seen = set()
+    for s in sources + hub_src:
+        u = s.get("url")
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        uniq.append(s)
 
     return {
-        "subject_id": sid,
+        "tmdb_id": tid,
         "media": media,
-        "se": se,
-        "ep": ep,
+        "se": se_use,
+        "ep": ep_use,
         "title": title,
         "count": len(uniq),
         "sources": uniq,
         "hub_links": hub_links,
         "errors": errors or None,
-        "strategy": "moviebox-dash(+proxy) + 4khdhub/hubcloud direct — no embeds",
-        "note": "HEVC MovieBox may be audio-only on some phones. Pick a Hub link below for file playback.",
+        "strategy": "videasy/vidsrc/vidking embeds → 4khdhub/hubcloud/pixeldrain",
+        "note": "MovieBox streams are available via /mb/stream API only (not on web UI).",
     }
+
 
 
 
 
 SPA_HTML = r"""<!DOCTYPE html>
 <html lang="en"><head>
-<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
 <title>StreamHub</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
 <script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
-<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800&display=swap" rel="stylesheet"/>
 <style>
-:root{--bg:#05060a;--card:#141722;--line:#1e2333;--text:#f0f2f8;--mute:#8b93a7;--a:#6c5ce7;--a2:#00d2d3}
-*{box-sizing:border-box;margin:0;padding:0}body{font-family:Outfit,system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
-a{color:inherit;text-decoration:none}button{font:inherit;cursor:pointer;border:0;background:0;color:inherit}
-.nav{position:sticky;top:0;z-index:40;display:flex;gap:10px;align-items:center;padding:12px 16px;background:rgba(5,6,10,.9);backdrop-filter:blur(14px);border-bottom:1px solid var(--line);flex-wrap:wrap}
-.logo{font-weight:800;font-size:1.25rem}.logo span{background:linear-gradient(135deg,var(--a),var(--a2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.nav a.n{padding:8px 12px;border-radius:10px;color:var(--mute);font-size:.9rem}.nav a.n.on,.nav a.n:hover{background:var(--card);color:var(--text)}
-.nav .r{margin-left:auto;display:flex;gap:8px;align-items:center}
-.nav input{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 12px;color:var(--text);width:min(160px,30vw)}
-.ib{width:38px;height:38px;border-radius:10px;background:var(--card);border:1px solid var(--line)}
-.menu{position:absolute;right:12px;top:56px;width:260px;background:#0e1018;border:1px solid var(--line);border-radius:14px;padding:8px;display:none;z-index:50;box-shadow:0 16px 40px #0008}
-.menu.open{display:block}.menu a{display:block;padding:10px 12px;border-radius:8px;font-size:.85rem}.menu a:hover{background:var(--card)}
-.menu h4{font-size:.65rem;color:var(--mute);text-transform:uppercase;padding:8px 12px 2px}
-main{padding-bottom:48px}.hero{position:relative;height:min(52vh,420px);overflow:hidden}
-.hero img{width:100%;height:100%;object-fit:cover;filter:brightness(.45)}
-.hero .g{position:absolute;inset:0;background:linear-gradient(0deg,var(--bg),transparent 55%)}
-.hero .b{position:absolute;left:0;right:0;bottom:0;padding:20px;max-width:600px}
-.hero h1{font-size:clamp(1.4rem,4vw,2.2rem);font-weight:800;margin-bottom:8px}
-.hero p{color:var(--mute);font-size:.9rem;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-bottom:12px}
-.btn{display:inline-flex;padding:10px 16px;border-radius:12px;font-weight:600;background:linear-gradient(135deg,var(--a),#8b7cf7);color:#fff;font-size:.9rem}
-.btn2{background:rgba(255,255,255,.08);border:1px solid var(--line);margin-left:8px}
-.sec{padding:0 14px 22px}.sec h2{font-size:1.1rem;margin:6px 0 10px}
-.row{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(105px,130px);gap:10px;overflow-x:auto;padding-bottom:6px}
-.card{cursor:pointer}.card .p{aspect-ratio:2/3;border-radius:12px;overflow:hidden;background:var(--card);border:1px solid var(--line)}
-.card img{width:100%;height:100%;object-fit:cover}.card .t{font-size:.8rem;font-weight:600;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.card .s{font-size:.7rem;color:var(--mute)}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:12px}
-.player{max-width:1000px;margin:0 auto;padding:14px}.frame{aspect-ratio:16/9;background:#000;border-radius:14px;overflow:hidden;border:1px solid var(--line)}
-.frame video,.frame iframe{width:100%;height:100%;border:0;background:#000}.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 0}
-.src{padding:7px 11px;border-radius:9px;background:var(--card);border:1px solid var(--line);font-size:.78rem}
-.src.on{border-color:var(--a);background:#6c5ce733}.ep{min-width:38px;padding:7px 9px;border-radius:9px;background:var(--card);border:1px solid var(--line)}
-.ep.on{background:var(--a);border-color:var(--a)}.empty{text-align:center;padding:48px 16px;color:var(--mute)}
-.detail{display:flex;gap:18px;flex-wrap:wrap;padding:24px 14px;max-width:1000px;margin:0 auto}
-.detail .pos{width:140px;border-radius:12px;overflow:hidden;border:1px solid var(--line)}
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#0e1018;border:1px solid var(--line);padding:10px 16px;border-radius:10px;display:none;z-index:99}
-.toast.show{display:block}
-.err{color:#ff7675;font-size:.85rem;padding:8px}
-</style></head><body>
-<nav class="nav">
-<a class="logo" href="#/">Stream<span>Hub</span></a>
-<a class="n" href="#/" data-n="home">Home</a>
-<a class="n" href="#/movies" data-n="movies">Movies</a>
-<a class="n" href="#/series" data-n="series">Series</a>
-<div class="r">
-<input id="q" placeholder="Search…" enterkeyhint="search"/>
-<button class="ib" id="mb" type="button">⋮</button>
+:root{
+  --bg:#0e0e10;--bg2:#16161a;--card:#1c1c22;--line:#2a2a32;
+  --text:#eeeef0;--mute:#9a9aa3;--a:#00a4dc;--a2:#0b6e99;--danger:#e25555;
+  --rad:10px;--nav:64px;--side:220px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:Inter,system-ui,sans-serif}
+a{color:inherit;text-decoration:none}
+button,input,select{font:inherit;color:inherit}
+img{display:block;max-width:100%}
+.app{display:flex;min-height:100%}
+.side{width:var(--side);background:var(--bg2);border-right:1px solid var(--line);padding:18px 12px;position:sticky;top:0;height:100vh;flex-shrink:0;display:flex;flex-direction:column;gap:6px;z-index:20}
+.brand{font-weight:700;font-size:1.15rem;padding:8px 12px 18px;letter-spacing:-.02em}
+.brand span{color:var(--a)}
+.nav a,.nav button{display:flex;align-items:center;gap:10px;width:100%;padding:11px 12px;border-radius:8px;border:0;background:transparent;color:var(--mute);cursor:pointer;text-align:left}
+.nav a.on,.nav button.on,.nav a:hover,.nav button:hover{background:rgba(0,164,220,.12);color:var(--text)}
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.top{height:var(--nav);display:flex;align-items:center;gap:12px;padding:0 18px;border-bottom:1px solid var(--line);background:rgba(14,14,16,.85);backdrop-filter:blur(10px);position:sticky;top:0;z-index:15}
+.search{flex:1;max-width:420px;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:10px 16px;outline:none}
+.search:focus{border-color:var(--a)}
+.content{padding:18px 18px 48px;flex:1}
+.hero{position:relative;border-radius:14px;overflow:hidden;min-height:220px;margin-bottom:22px;background:var(--card)}
+.hero img{width:100%;height:280px;object-fit:cover;opacity:.55}
+.hero .hbody{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:flex-end;padding:22px;background:linear-gradient(transparent 20%,rgba(0,0,0,.85))}
+.hero h1{font-size:clamp(1.3rem,3vw,2rem);margin-bottom:6px}
+.hero p{color:var(--mute);max-width:560px;font-size:.92rem;line-height:1.45;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.sec{margin:22px 0}
+.sec h2{font-size:1.05rem;font-weight:600;margin-bottom:12px;padding-left:2px}
+.row{display:flex;gap:12px;overflow-x:auto;padding-bottom:8px;scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch}
+.row::-webkit-scrollbar{height:6px}
+.row::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
+.card{flex:0 0 140px;scroll-snap-align:start;cursor:pointer;transition:transform .15s}
+.card:hover{transform:translateY(-3px)}
+.card .p{aspect-ratio:2/3;border-radius:var(--rad);background:var(--card) center/cover no-repeat;border:1px solid var(--line)}
+.card .t{font-size:.8rem;margin-top:7px;line-height:1.25;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.card .y{font-size:.72rem;color:var(--mute);margin-top:2px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:14px}
+.empty{padding:40px;text-align:center;color:var(--mute)}
+.err{color:var(--danger)}
+.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--card);border:1px solid var(--line);padding:10px 16px;border-radius:999px;z-index:99;font-size:.85rem;box-shadow:0 8px 30px rgba(0,0,0,.4)}
+.detail{display:grid;grid-template-columns:200px 1fr;gap:22px}
+.detail .poster{border-radius:12px;aspect-ratio:2/3;background:var(--card) center/cover;border:1px solid var(--line)}
+.detail h1{font-size:1.6rem;margin-bottom:8px}
+.meta{color:var(--mute);font-size:.9rem;margin-bottom:12px}
+.overview{line-height:1.55;color:#c8c8d0;margin-bottom:16px}
+.btn{display:inline-flex;align-items:center;gap:8px;background:var(--a);color:#041018;border:0;padding:11px 18px;border-radius:8px;font-weight:600;cursor:pointer}
+.btn.ghost{background:var(--card);color:var(--text);border:1px solid var(--line)}
+.player-wrap{background:#000;border-radius:12px;overflow:hidden;border:1px solid var(--line);aspect-ratio:16/9;max-height:70vh}
+#frame{width:100%;height:100%;background:#000}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0;color:var(--mute);font-size:.85rem}
+.src,.ep{background:var(--card);border:1px solid var(--line);padding:8px 12px;border-radius:8px;cursor:pointer}
+.src.on,.ep.on{background:rgba(0,164,220,.2);border-color:var(--a);color:var(--a)}
+.hubbox{margin-top:14px}
+.hubbox h3{font-size:.85rem;color:var(--mute);margin-bottom:8px}
+.hubbox .src{display:block;width:100%;text-align:left;margin:5px 0}
+.se-select{background:var(--card);border:1px solid var(--line);padding:8px 10px;border-radius:8px}
+.menu-btn{display:none;background:var(--card);border:1px solid var(--line);padding:8px 12px;border-radius:8px}
+@media (max-width:860px){
+  .side{position:fixed;left:0;top:0;transform:translateX(-105%);transition:transform .2s;box-shadow:8px 0 30px rgba(0,0,0,.5)}
+  .side.open{transform:none}
+  .menu-btn{display:inline-flex}
+  .detail{grid-template-columns:1fr}
+  .detail .poster{max-width:160px}
+  .card{flex-basis:110px}
+  .hero img{height:200px}
+}
+</style></head>
+<body>
+<div class="app">
+  <aside class="side" id="side">
+    <div class="brand">Stream<span>Hub</span></div>
+    <nav class="nav">
+      <a href="#/" id="n-home">Home</a>
+      <a href="#/movies" id="n-movies">Movies</a>
+      <a href="#/series" id="n-series">Series</a>
+      <a href="#/api" id="n-api">API Docs</a>
+    </nav>
+    <div style="flex:1"></div>
+    <div style="font-size:.72rem;color:var(--mute);padding:8px 12px;line-height:1.4">TMDB · Videasy · VidSrc · 4KHDHub<br/>MovieBox API → /mb/*</div>
+  </aside>
+  <div class="main">
+    <div class="top">
+      <button class="menu-btn" type="button" onclick="document.getElementById('side').classList.toggle('open')">☰</button>
+      <input class="search" id="q" placeholder="Search movies & series…" onkeydown="if(event.key==='Enter')goSearch()"/>
+      <button class="btn ghost" type="button" onclick="goSearch()">Search</button>
+    </div>
+    <div class="content" id="root"><div class="empty">Loading…</div></div>
+  </div>
 </div>
-</nav>
-<div class="menu" id="menu">
-<h4>API</h4>
-<a href="/docs" target="_blank">Swagger</a>
-<a href="/mb/search?q=Avatar" target="_blank">MovieBox /mb</a>
-<a href="/fk/search?q=Dune" target="_blank">4KHDHub /fk</a>
-<a href="/tools/resolve?url=https://hubcloud.ist/drive/x" target="_blank">HubCloud</a>
-<a href="/api/home" target="_blank">Catalog JSON</a>
-<a href="/health" target="_blank">Health</a>
-</div>
-<main id="root"><div class="empty">Loading…</div></main>
-<div class="toast" id="toast"></div>
 <script>
 const root=document.getElementById('root');
-const toast=m=>{const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2400)};
-document.getElementById('mb').onclick=e=>{e.stopPropagation();document.getElementById('menu').classList.toggle('open')};
-document.onclick=()=>document.getElementById('menu').classList.remove('open');
-document.getElementById('q').onkeydown=e=>{if(e.key==='Enter'&&e.target.value.trim())location.hash='#/search/'+encodeURIComponent(e.target.value.trim())};
-const esc=s=>String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function api(p){
-  const r=await fetch(p);
-  const tx=await r.text();
-  let j=null;
-  try{ j=JSON.parse(tx); }catch(e){
-    throw new Error(r.ok ? 'Invalid JSON from API' : ('HTTP '+r.status));
-  }
-  if(!r.ok){
-    const d=(j&&(j.detail||j.error||j.message))||('HTTP '+r.status);
-    throw new Error(typeof d==='string'?d:JSON.stringify(d));
-  }
-  return j;
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function toast(m,ms=2800){let t=document.querySelector('.toast');if(!t){t=document.createElement('div');t.className='toast';document.body.appendChild(t)}t.textContent=m;clearTimeout(t._x);t._x=setTimeout(()=>t.remove(),ms)}
+async function api(path){const r=await fetch(path);if(!r.ok)throw new Error(path+' → '+r.status);return r.json()}
+function setNav(k){['home','movies','series','api'].forEach(id=>{const el=document.getElementById('n-'+id);if(el)el.classList.toggle('on',id===k)});document.getElementById('side').classList.remove('open')}
+function card(it){
+  const media=it.type==='tv'?'tv':'movie';
+  const id=it.tmdb_id||it.id;
+  const poster=it.poster?`background-image:url('${esc(it.poster)}')`:'';
+  return `<div class="card" onclick="location.hash='#/title/${media}/${id}'"><div class="p" style="${poster}"></div><div class="t">${esc(it.name)}</div><div class="y">${esc(it.year||'')}${it.rating?(' · ★ '+Number(it.rating).toFixed(1)):''}</div></div>`;
 }
-function card(i){
-  const t=i.type||'movie';
-  const id=i.id;
-  return `<div class="card" onclick="location.hash='#/title/${t}/${id}'"><div class="p">${i.poster?`<img loading="lazy" src="${esc(i.poster)}" alt="">`:''}</div><div class="t">${esc(i.name)}</div><div class="s">${esc(i.year||'')} · ${t}</div></div>`;
-}
-function row(title,items){if(!items||!items.length)return '';return `<section class="sec"><h2>${esc(title)}</h2><div class="row">${items.map(card).join('')}</div></section>`}
-function setNav(n){document.querySelectorAll('[data-n]').forEach(a=>a.classList.toggle('on',a.dataset.n===n))}
+function row(title,items){if(!items||!items.length)return'';return `<section class="sec"><h2>${esc(title)}</h2><div class="row">${items.map(card).join('')}</div></section>`}
 async function home(){
-  setNav('home'); root.innerHTML='<div class="empty">Loading home…</div>';
+  setNav('home');root.innerHTML='<div class="empty">Loading…</div>';
   try{
     const d=await api('/api/home');
-    const list=[...(d.trending_movies||[]),...(d.trending_tv||[])];
-    const h=list[0];
-    let html='';
-    if(h) html+=`<div class="hero"><img src="${esc(h.backdrop||h.poster||'')}" alt=""><div class="g"></div><div class="b"><h1>${esc(h.name)}</h1><p>${esc(h.overview||'Stream from MovieBox')}</p>
-      <a class="btn" href="#/watch/${h.type}/${h.id}">▶ Watch</a>
-      <a class="btn btn2" href="#/title/${h.type}/${h.id}">Details</a></div></div>`;
-    html+=row('Trending Movies',d.trending_movies)+row('Trending Series',d.trending_tv)+row('More Movies',d.popular_movies)+row('More Series',d.popular_tv);
-    if(!list.length) html='<div class="empty">No catalog data. Check /api/home or MovieBox login.</div>';
-    root.innerHTML=html;
+    const hero=(d.trending_movies&&d.trending_movies[0])||(d.trending_series&&d.trending_series[0]);
+    let h='';
+    if(hero){
+      const media=hero.type==='tv'?'tv':'movie';
+      const bg=hero.backdrop||hero.poster||'';
+      h=`<div class="hero">${bg?`<img src="${esc(bg)}" alt=""/>`:''}<div class="hbody"><h1>${esc(hero.name)}</h1><p>${esc(hero.overview||'')}</p><div style="margin-top:12px"><button class="btn" onclick="location.hash='#/watch/${media}/${hero.tmdb_id||hero.id}'">▶ Play</button>
+      <button class="btn ghost" style="margin-left:8px" onclick="location.hash='#/title/${media}/${hero.tmdb_id||hero.id}'">Details</button></div></div></div>`;
+    }
+    root.innerHTML=h+row('Trending Movies',d.trending_movies)+row('Trending Series',d.trending_series)+row('Popular Movies',d.popular_movies)+row('Popular Series',d.popular_series)+row('Top Rated',d.top_movies);
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
 async function grid(k){
-  setNav(k); root.innerHTML='<div class="empty">Loading…</div>';
+  setNav(k);root.innerHTML='<div class="empty">Loading…</div>';
   try{
     const d=await api(k==='movies'?'/api/movies':'/api/series');
-    root.innerHTML=`<section class="sec" style="padding-top:18px"><h2>${k==='movies'?'Movies':'Series'}</h2><div class="grid">${(d.items||[]).map(card).join('')||'<p class="empty">Empty</p>'}</div></section>`;
+    root.innerHTML=`<section class="sec" style="padding-top:6px"><h2>${k==='movies'?'Movies':'Series'}</h2><div class="grid">${(d.items||[]).map(card).join('')||'<p class="empty">Empty</p>'}</div></section>`;
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
 async function search(q){
-  setNav(''); root.innerHTML='<div class="empty">Searching…</div>';
+  setNav('');root.innerHTML='<div class="empty">Searching…</div>';
   try{
-    let items=[];
-    try{
-      const d=await api('/api/search?q='+encodeURIComponent(q));
-      items=d.items||d.moviebox||[];
-      if(!items.length){
-        const mb=await api('/mb/search?q='+encodeURIComponent(q));
-        items=(mb.items||[]).map(x=>({id:x.subject_id||x.id,name:x.name,poster:x.poster_url||x.poster,year:x.year,type:x.type==='series'?'tv':'movie',provider:'moviebox'}));
-      }
-      let html=`<section class="sec" style="padding-top:18px"><h2>Results · ${esc(q)}</h2><div class="grid">${items.map(card).join('')||'<p class="empty">No MovieBox results</p>'}</div></section>`;
-      root.innerHTML=html;
-    }catch(e1){
-      const mb=await api('/mb/search?q='+encodeURIComponent(q));
-      items=(mb.items||[]).map(x=>({id:x.subject_id||x.id,name:x.name,poster:x.poster_url||x.poster,year:x.year,type:x.type==='series'?'tv':'movie',provider:'moviebox'}));
-      root.innerHTML=`<section class="sec" style="padding-top:18px"><h2>Results · ${esc(q)}</h2><div class="grid">${items.map(card).join('')||'<p class="empty">No results</p>'}</div></section>`;
-    }
+    const d=await api('/api/search?q='+encodeURIComponent(q));
+    const items=d.items||d.tmdb||[];
+    root.innerHTML=`<section class="sec"><h2>Results for “${esc(q)}”</h2><div class="grid">${items.map(card).join('')||'<p class="empty">No results</p>'}</div></section>`;
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
+function goSearch(){const q=document.getElementById('q').value.trim();if(q)location.hash='#/search/'+encodeURIComponent(q)}
 async function title(media,id){
-  setNav(''); root.innerHTML='<div class="empty">Loading…</div>';
+  setNav('');root.innerHTML='<div class="empty">Loading…</div>';
   try{
     const d=await api(`/api/detail/${media}/${id}`);
-    root.innerHTML=`<div class="detail"><div class="pos">${d.poster?`<img src="${esc(d.poster)}" style="width:100%" alt="">`:''}</div>
-      <div style="flex:1;min-width:200px"><h1 style="font-size:1.6rem;font-weight:800;margin-bottom:8px">${esc(d.name)}</h1>
-      <p style="color:var(--mute);margin-bottom:8px">${esc(d.year||'')} · ${d.rating||''}</p>
-      <p style="color:var(--mute);line-height:1.5;margin-bottom:14px">${esc(d.overview||'')}</p>
-      <a class="btn" href="#/watch/${d.type||media}/${id}${ (d.type||media)==='tv'?'?se=1&ep=1':'' }">▶ Play</a></div></div>
-      ${(d.type||media)==='tv'&&d.seasons&&d.seasons.length?`<section class="sec"><h2>Seasons</h2><div class="row">${d.seasons.slice().sort((a,b)=>(a.season||0)-(b.season||0)).map(s=>`<div class="card" onclick="location.hash='#/watch/tv/${id}?se=${s.season}&ep=1'"><div class="p" style="display:flex;align-items:center;justify-content:center;font-size:1.4rem;color:var(--a)">S${s.season}</div><div class="t">${esc(s.name||('Season '+s.season))} · ${s.episode_count||'?'} ep</div></div>`).join('')}</div></section>`:''}`;
+    const poster=d.poster?`background-image:url('${esc(d.poster)}')`:'';
+    root.innerHTML=`<div class="detail"><div class="poster" style="${poster}"></div><div>
+      <h1>${esc(d.name)}</h1>
+      <div class="meta">${esc(d.year||'')} · ${esc(d.type)} ${d.rating?('· ★ '+Number(d.rating).toFixed(1)):''} ${(d.genres||[]).slice(0,4).map(g=>'· '+esc(g)).join('')}</div>
+      <p class="overview">${esc(d.overview||'')}</p>
+      <button class="btn" onclick="location.hash='#/watch/${media}/${id}'">▶ Play</button>
+      ${d.seasons&&d.seasons.length?`<section class="sec"><h2>Seasons</h2><div class="row">${d.seasons.map(s=>`<div class="card" onclick="location.hash='#/watch/tv/${id}?se=${s.season}&ep=1'"><div class="p" style="display:flex;align-items:center;justify-content:center;font-size:1.5rem;color:var(--a);aspect-ratio:1">S${s.season}</div><div class="t">${esc(s.name)} · ${s.episode_count||'?'} ep</div></div>`).join('')}</div></section>`:''}
+    </div></div>`;
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
-let PS={sources:[],idx:0};
-
+let PS={sources:[],idx:0,se:1,ep:1};
 let dashPlayer=null;
-function destroyPlayer(){
-  try{ if(dashPlayer){ dashPlayer.reset(); dashPlayer=null; } }catch(e){}
-}
+function destroyPlayer(){try{if(dashPlayer){dashPlayer.reset();dashPlayer=null}}catch(e){}}
 function renderP(){
-  const s=PS.sources[PS.idx]; const f=document.getElementById('frame');
+  const s=PS.sources[PS.idx];const f=document.getElementById('frame');
   if(!s){f.innerHTML='<div class="empty">No sources</div>';return}
   destroyPlayer();
   const play=s.play_url||s.url;
   const st=document.getElementById('st');
   if(st) st.textContent=(PS.idx+1)+'/'+PS.sources.length+' · '+s.label;
-  const ext=document.getElementById('extPlay');
-  if(ext){ ext.href=play; ext.style.display=s.type==='direct'?'inline-flex':'none'; }
   document.querySelectorAll('.src[data-i]').forEach((b,i)=>b.classList.toggle('on',i===PS.idx));
   const qsel=document.getElementById('qsel');
-  if(qsel){ qsel.innerHTML=''; qsel.style.display='none'; }
-
+  if(qsel){qsel.innerHTML='';qsel.style.display='none'}
   if(s.type==='embed'){
     f.innerHTML=`<iframe src="${esc(play)}" allowfullscreen allow="autoplay;encrypted-media;picture-in-picture" style="width:100%;height:100%;border:0;background:#000"></iframe>`;
     return;
   }
-
-  const isDash=/\.mpd(\?|$)/i.test(s.url||'')||/\.mpd(\?|$)/i.test(play)||(s.format||'').toUpperCase()==='DASH'||!!s.hevc;
+  const isDash=/\\.mpd(\\?|$)/i.test(s.url||'')||/\\.mpd(\\?|$)/i.test(play)||(s.format||'').toUpperCase()==='DASH';
   f.innerHTML='';
   const v=document.createElement('video');
-  v.controls=true; v.autoplay=true; v.playsInline=true;
-  v.setAttribute('playsinline','');
+  v.controls=true;v.autoplay=true;v.playsInline=true;v.setAttribute('playsinline','');
   v.style.cssText='width:100%;height:100%;background:#000';
   f.appendChild(v);
-
-  if(isDash && window.dashjs){
+  if(isDash&&window.dashjs){
     try{
       dashPlayer=dashjs.MediaPlayer().create();
-      dashPlayer.updateSettings({
-        streaming:{
-          abr:{autoSwitchBitrate:{video:true}},
-          buffer:{fastSwitchEnabled:true}
-        }
-      });
-      dashPlayer.initialize(v, play, true);
-      dashPlayer.on(dashjs.MediaPlayer.events.ERROR, function(){
-        toast('Stream error — next source');
-        setTimeout(function(){ window.__nx && window.__nx(); }, 800);
-      });
-      dashPlayer.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, function(){
+      dashPlayer.initialize(v,play,true);
+      dashPlayer.on(dashjs.MediaPlayer.events.ERROR,()=>{toast('Stream error — next');setTimeout(()=>window.__nx&&window.__nx(),800)});
+      dashPlayer.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED,()=>{
         try{
           const bitrates=dashPlayer.getBitrateInfoListFor('video')||[];
-          if(qsel && bitrates.length){
+          if(qsel&&bitrates.length){
             qsel.style.display='inline-block';
-            qsel.innerHTML='<option value="auto">Auto quality</option>'+
-              bitrates.map(function(b,i){
-                return '<option value="'+i+'">'+(b.height||'?')+'p · '+Math.round((b.bitrate||0)/1000)+'kbps</option>';
-              }).join('');
-            qsel.onchange=function(){
-              const val=qsel.value;
-              if(val==='auto'){
-                dashPlayer.updateSettings({streaming:{abr:{autoSwitchBitrate:{video:true}}}});
-              }else{
-                dashPlayer.updateSettings({streaming:{abr:{autoSwitchBitrate:{video:false}}}});
-                dashPlayer.setQualityFor('video', parseInt(val,10));
-              }
-            };
+            qsel.innerHTML='<option value="auto">Auto</option>'+bitrates.map((b,i)=>`<option value="${i}">${b.height||'?'}p</option>`).join('');
+            qsel.onchange=()=>{const val=qsel.value;if(val==='auto')dashPlayer.updateSettings({streaming:{abr:{autoSwitchBitrate:{video:true}}}});else{dashPlayer.updateSettings({streaming:{abr:{autoSwitchBitrate:{video:false}}}});dashPlayer.setQualityFor('video',parseInt(val,10))}};
           }
         }catch(e){}
       });
-      setTimeout(function(){
-        try{
-          if(v.videoWidth===0 && v.currentTime>0.3){
-            toast('HEVC: audio only on this device — try desktop/Safari or external player');
-            const n=document.getElementById('hevcTip');
-            if(n) n.style.display='block';
-          }
-        }catch(e){}
-      }, 4000);
-    }catch(e){
-      window.__nx && window.__nx();
-    }
+    }catch(e){window.__nx&&window.__nx()}
   }else{
     v.src=play;
-    v.onerror=function(){ window.__nx && window.__nx(); };
+    v.onerror=()=>{window.__nx&&window.__nx()};
   }
 }
 window.__nx=()=>{if(PS.idx<PS.sources.length-1){PS.idx++;toast('Next source…');renderP()}else toast('All sources failed')};
-function playHub(i){
-  const h=(PS.hub||[])[i];
-  if(!h) return;
-  // inject as current source and play
-  const src={provider:'4khdhub',label:h.label,url:h.url,play_url:h.play_url||h.url,type:'direct',format:'FILE',headers:{}};
-  // replace or append
-  let found=-1;
-  PS.sources.forEach(function(s,idx){ if(s.url===src.url) found=idx; });
-  if(found>=0) PS.idx=found;
-  else { PS.sources.push(src); PS.idx=PS.sources.length-1;
-    const box=document.getElementById('srcs');
-    if(box) box.innerHTML=PS.sources.map((s,i)=>`<button type="button" class="src ${i===PS.idx?'on':''}" data-i="${i}" onclick="PS.idx=${i};renderP()">${esc(s.label)}</button>`).join('');
-  }
-  renderP();
-  toast('Playing hub file…');
-}
-
-
 async function watch(media,id,se,ep){
-  setNav(''); PS={sources:[],idx:0,media,id,se:se||1,ep:ep||1};
-  root.innerHTML=`<div class="player"><div class="frame" id="frame"><div class="empty">Resolving streams…</div></div>
-    <div class="bar"><span id="st" style="color:var(--mute);font-size:.8rem">…</span>
-    <select id="qsel" class="se-select" style="display:none;margin:0 6px"></select><div id="hevcTip" style="display:none;width:100%;color:#ffa502;font-size:.8rem;margin-top:6px">This MovieBox stream is HEVC (H.265). Many phones play audio only. Use desktop Chrome/Safari, or open the stream in VLC.</div>
-    <button class="src" type="button" onclick="window.__nx()">Next source ↻</button><a class="src" id="extPlay" href="#" target="_blank" rel="noopener">Open stream URL</a>
+  setNav('');PS={sources:[],idx:0,se:se||1,ep:ep||1};
+  root.innerHTML=`<div class="player-wrap"><div id="frame" class="empty">Loading stream…</div></div>
+    <div class="bar"><span id="st">…</span>
+    <select id="qsel" class="se-select" style="display:none"></select>
+    <button class="src" type="button" onclick="window.__nx()">Next source ↻</button>
     <a class="src" href="#/title/${media}/${id}">Details</a></div>
-    <div id="srcs" style="display:flex;flex-wrap:wrap;gap:6px"></div><div id="hublist"></div><div id="eps"></div></div>`;
+    <div id="srcs"></div><div id="hublist"></div><div id="eps"></div>`;
   try{
-    const d=await api(`/api/play?subject_id=${encodeURIComponent(id)}&media=${media}&se=${PS.se}&ep=${PS.ep}`);
+    let url=`/api/play?tmdb_id=${encodeURIComponent(id)}&media=${media}`;
+    if(media==='tv')url+=`&se=${PS.se}&ep=${PS.ep}`;
+    const d=await api(url);
     PS.sources=d.sources||[];
-    PS.hub=d.hub_links||[];
-    const hub=PS.sources.filter(s=>s.provider==='4khdhub');
-    const other=PS.sources;
     document.getElementById('srcs').innerHTML=
-      (other.length?('<div style="width:100%;font-size:.75rem;color:var(--mute);margin:4px 0">Sources</div>'):'')+
-      other.map((s,i)=>`<button type="button" class="src ${i===0?'on':''}" data-i="${i}" onclick="PS.idx=${i};renderP()">${esc(s.label)}</button>`).join('')
+      (PS.sources.length?('<div style="font-size:.75rem;color:var(--mute);margin:4px 0 6px">Sources</div>'):'')+
+      PS.sources.map((s,i)=>`<button type="button" class="src ${i===0?'on':''}" data-i="${i}" onclick="PS.idx=${i};renderP()">${esc(s.label)}</button>`).join('')
       ||'<span class="err">No streams</span>';
+    const hubs=PS.sources.map((s,i)=>({s,i})).filter(x=>x.s.provider==='4khdhub');
     const hubEl=document.getElementById('hublist');
     if(hubEl){
-      const hubs=PS.sources.map((s,i)=>({s,i})).filter(x=>x.s.provider==='4khdhub');
       hubEl.innerHTML=hubs.length
-        ? ('<div style="margin-top:12px"><div style="font-size:.8rem;color:var(--mute);margin-bottom:6px">Hub / Pixeldrain mirrors (working only)</div>'+
-           hubs.map(({s,i})=>`<button type="button" class="src" style="display:block;width:100%;text-align:left;margin:4px 0" onclick="PS.idx=${i};renderP()">▶ ${esc(s.label)} · ${esc(s.format||'')}</button>`).join('')+'</div>')
+        ? `<div class="hubbox"><h3>4K / HubCloud / Pixeldrain (working links)</h3>${hubs.map(({s,i})=>`<button type="button" class="src" onclick="PS.idx=${i};renderP()">▶ ${esc(s.label)}</button>`).join('')}</div>`
         : '';
     }
-    // HubCloud direct file list
-    let hubHtml='';
-    if(PS.hub.length){
-      hubHtml='<div style="margin-top:14px"><div style="font-weight:700;margin-bottom:8px">HubCloud / 4K files</div>'+
-        PS.hub.map(function(h,i){
-          return '<button type="button" class="src" style="display:block;width:100%;text-align:left;margin-bottom:6px" onclick="playHub('+i+')">'+
-            esc(h.label||'File')+(h.size?(' · '+esc(h.size)):'')+
-            (h.filename?('<div style="font-size:.7rem;color:var(--mute);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(h.filename)+'</div>'):'')+
-            '</button>';
-        }).join('')+'</div>';
-    }
-    const eps=document.getElementById('eps');
-    if(eps){ const box=document.createElement('div'); box.id='hubBox'; box.innerHTML=hubHtml; eps.parentNode.insertBefore(box, eps); }
-    if(d.note) toast(d.note, 4000);
-    if(d.errors) toast(JSON.stringify(d.errors));
+    if(d.note) toast(d.note,3500);
     renderP();
   }catch(e){document.getElementById('frame').innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
   if(media==='tv'){
     try{
       const sd=await api(`/api/tv/${id}/season/${PS.se}`);
       const epsList=(sd.episodes||[]).slice().sort((a,b)=>(a.episode||0)-(b.episode||0));
-      document.getElementById('eps').innerHTML=`<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px;flex-direction:row">${epsList.map(e=>`<button type="button" class="ep ${e.episode==PS.ep?'on':''}" onclick="location.hash='#/watch/tv/${id}?se=${PS.se}&ep=${e.episode}'">E${e.episode}</button>`).join('')}</div>`;
+      document.getElementById('eps').innerHTML=`<div style="margin-top:12px"><div style="font-size:.8rem;color:var(--mute);margin-bottom:6px">Episodes · S${PS.se}</div><div style="display:flex;flex-wrap:wrap;gap:6px">${epsList.map(e=>`<button type="button" class="ep ${e.episode==PS.ep?'on':''}" onclick="location.hash='#/watch/tv/${id}?se=${PS.se}&ep=${e.episode}'">E${e.episode}</button>`).join('')}</div></div>`;
     }catch{}
   }
 }
+async function apiDocs(){
+  setNav('api');
+  root.innerHTML=`<section class="sec"><h2>API reference</h2>
+  <p style="color:var(--mute);margin-bottom:14px;line-height:1.5">Web UI uses <b>TMDB + Videasy/VidSrc/Vidking + 4KHDHub</b>. MovieBox remains available as a pure API under <code>/mb/*</code>.</p>
+  <div class="grid" style="grid-template-columns:1fr;gap:10px;font-size:.88rem">
+    <div class="src" style="cursor:default"><b>GET /api/home</b> — TMDB trending rows</div>
+    <div class="src" style="cursor:default"><b>GET /api/search?q=</b> — TMDB multi-search</div>
+    <div class="src" style="cursor:default"><b>GET /api/detail/{movie|tv}/{tmdb_id}</b> — details + seasons</div>
+    <div class="src" style="cursor:default"><b>GET /api/play?tmdb_id=&media=&se=&ep=</b> — embeds + 4K list</div>
+    <div class="src" style="cursor:default"><b>GET /mb/search?q=</b> — MovieBox search (API only)</div>
+    <div class="src" style="cursor:default"><b>GET /mb/stream/{subject_id}?se=&ep=</b> — MovieBox DASH + cookies</div>
+    <div class="src" style="cursor:default"><b>GET /fk/search?q=</b> · <b>/fk/stream</b> — 4KHDHub</div>
+    <div class="src" style="cursor:default"><b>GET /tools/resolve?url=</b> — HubCloud → direct</div>
+    <div class="src" style="cursor:default"><b>GET /docs</b> — OpenAPI Swagger</div>
+  </div></section>`;
+}
 async function router(){
-  const h=location.hash.slice(1)||'/'; const [path,qs]=h.split('?');
+  const h=location.hash.slice(1)||'/';const [path,qs]=h.split('?');
   const params=Object.fromEntries(new URLSearchParams(qs||''));
   const p=path.split('/').filter(Boolean);
   try{
@@ -2315,14 +2185,16 @@ async function router(){
     if(p[0]==='series') return grid('series');
     if(p[0]==='search'&&p[1]) return search(decodeURIComponent(p[1]));
     if(p[0]==='title'&&p[1]&&p[2]) return title(p[1],p[2]);
-    if(p[0]==='watch'&&p[1]&&p[2]) return watch(p[1],p[2],+(params.se||1),+(params.ep||1));
+    if(p[0]==='watch'&&p[1]&&p[2]) return watch(p[1],p[2],parseInt(params.se||'1',10),parseInt(params.ep||'1',10));
+    if(p[0]==='api') return apiDocs();
     root.innerHTML='<div class="empty">Not found</div>';
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
 window.addEventListener('hashchange',router);
 router();
-</script>
-</body></html>"""
+</script></body></html>
+"""
+
 
 
 @app.get("/site", response_class=HTMLResponse, tags=["Meta"])
@@ -2334,3 +2206,6 @@ async def site_spa():
 @app.get("/", response_class=HTMLResponse, tags=["Meta"], include_in_schema=False)
 async def root_spa():
     return HTMLResponse(SPA_HTML)
+
+
+
