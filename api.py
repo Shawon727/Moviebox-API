@@ -2049,8 +2049,9 @@ async def api_play(
     }
 
 
+
 # ═══════════════════════════════════════════════════════════
-# MUSIC — YouTube Music (SimpMusic-style Innertube client)
+# MUSIC — JioSaavn (vivi-music style) + YT Music + synced lyrics
 # ═══════════════════════════════════════════════════════════
 
 YT_MUSIC_KEY = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30"
@@ -2067,6 +2068,10 @@ YT_MUSIC_HEADERS = {
     "Content-Type": "application/json",
     "Origin": "https://music.youtube.com",
     "Referer": "https://music.youtube.com/",
+}
+SAAVN_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
 }
 
 
@@ -2101,7 +2106,6 @@ def _ytm_parse_item(it: dict) -> Optional[dict]:
         return None
     vid = vid_m.group(1)
     texts = re.findall(r'"text"\s*:\s*"([^"\\]{1,120})"', s)
-    # filter noise
     noise = {"Video", "Song", "Album", "Playlist", "Start mix", "Play next", "Shuffle", "Subscribe", "Share", "Episode"}
     clean = [x for x in texts if x not in noise and not x.startswith("\\u") and len(x) > 1]
     title = clean[0] if clean else vid
@@ -2120,245 +2124,420 @@ def _ytm_parse_item(it: dict) -> Optional[dict]:
         "thumb": thumb,
         "type": "song",
         "provider": "ytmusic",
+        "source": "ytmusic",
     }
 
 
-@app.get("/music/search", tags=["Music"])
-async def music_search(q: str = Query(..., min_length=1)):
-    """YouTube Music search (SimpMusic / Innertube)."""
-    data = await _ytm_post("search", {"query": q.strip()[:100]})
-    items = []
-    _ytm_walk(data, "musicResponsiveListItemRenderer", items)
-    _ytm_walk(data, "musicTwoRowItemRenderer", items)
-    songs, seen = [], set()
-    for it in items:
-        e = _ytm_parse_item(it)
-        if e and e["video_id"] not in seen:
-            seen.add(e["video_id"])
-            songs.append(e)
-    return {"query": q, "count": len(songs), "items": songs[:40], "provider": "ytmusic"}
+async def _saavn_get(params: dict) -> Any:
+    q = {"_format": "json", "_marker": "0", "api_version": "4", "ctx": "web6dot0"}
+    q.update(params)
+    async with httpx.AsyncClient(timeout=20.0, headers=SAAVN_HEADERS) as client:
+        r = await client.get("https://www.jiosaavn.com/api.php", params=q)
+        if r.status_code != 200:
+            return {}
+        text = r.text
+        try:
+            return r.json()
+        except Exception:
+            m = re.search(r"(\{.*\}|\[.*\])", text, re.S)
+            if m:
+                try:
+                    return json.loads(m.group(1))
+                except Exception:
+                    return {}
+            return {}
 
 
-@app.get("/music/home", tags=["Music"])
-async def music_home():
-    """Curated home — popular queries via YT Music search."""
-    seeds = ["Top Hits", "Trending music", "Lo-fi beats", "Bollywood hits", "Pop songs 2024"]
-    sections = []
-    for seed in seeds:
-        data = await _ytm_post("search", {"query": seed})
-        items = []
-        _ytm_walk(data, "musicResponsiveListItemRenderer", items)
-        songs, seen = [], set()
-        for it in items:
-            e = _ytm_parse_item(it)
-            if e and e["video_id"] not in seen:
-                seen.add(e["video_id"])
-                songs.append(e)
-        if songs:
-            sections.append({"title": seed, "items": songs[:12]})
-    return {"sections": sections, "provider": "ytmusic"}
-
-
-
-
-@app.get("/music/play/{video_id}", tags=["Music"])
-async def music_play(video_id: str):
-    """SimpMusic-style: metadata + best-effort direct audio + always-working YT fallback."""
-    if not re.match(r"^[a-zA-Z0-9_-]{11}$", video_id):
-        raise HTTPException(400, "Invalid video id")
-
-    title, artist, thumb = video_id, "", f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
-    duration = None
-    audio_url = None
-    audio_format = None
-    errors: Dict[str, str] = {}
-
+def _saavn_card(song: dict) -> Optional[dict]:
+    if not isinstance(song, dict):
+        return None
+    sid = song.get("id")
+    title = song.get("title") or song.get("song") or ""
+    if not sid or not title:
+        return None
+    mi = song.get("more_info") if isinstance(song.get("more_info"), dict) else {}
+    artists = (
+        song.get("primary_artists")
+        or mi.get("music")
+        or song.get("subtitle")
+        or ""
+    )
+    if isinstance(artists, list):
+        artists = ", ".join(str(a) for a in artists)
+    image = song.get("image") or ""
+    # prefer higher res
+    image = image.replace("-50x50", "-500x500").replace("-150x150", "-500x500")
+    enc = mi.get("encrypted_media_url") or song.get("encrypted_media_url") or ""
+    dur = mi.get("duration") or song.get("duration")
     try:
-        data = await _ytm_post("next", {"videoId": video_id})
-        s = json.dumps(data)
-        texts = re.findall(r'"text"\s*:\s*"([^"\\]{2,100})"', s)
-        noise = {"Video", "Song", "Album", "Subscribe", "Share", "Play", "Next", "Previous", "Shuffle"}
-        clean = [x for x in texts if x not in noise and len(x) > 1]
-        if clean:
-            title = clean[0]
-            for c in clean[1:]:
-                if c != title and "views" not in c.lower() and not re.match(r"^\d", c):
-                    artist = c
-                    break
-        thumbs = re.findall(r'https://i\.ytimg\.com/[^"\\]+', s)
-        if thumbs:
-            thumb = thumbs[0].replace("\\u0026", "&")
-    except Exception as e:
-        errors["meta"] = str(e)
+        dur = int(dur) if dur else None
+    except Exception:
+        dur = None
+    return {
+        "id": f"saavn:{sid}",
+        "saavn_id": sid,
+        "video_id": None,
+        "title": title,
+        "artist": artists,
+        "thumb": image,
+        "duration": dur,
+        "encrypted_media_url": enc,
+        "type": "song",
+        "provider": "jiosaavn",
+        "source": "jiosaavn",
+        "perma_url": song.get("perma_url"),
+    }
 
+
+async def _saavn_search(q: str, n: int = 20) -> List[dict]:
+    data = await _saavn_get({"__call": "search.getResults", "p": "1", "q": q, "n": str(n)})
+    results = data.get("results") or []
+    out = []
+    for s in results:
+        c = _saavn_card(s)
+        if c:
+            out.append(c)
+    return out
+
+
+async def _saavn_auth_url(encrypted: str, bitrate: int = 320) -> Optional[str]:
+    if not encrypted:
+        return None
+    data = await _saavn_get({
+        "__call": "song.generateAuthToken",
+        "url": encrypted,
+        "bitrate": str(bitrate),
+    })
+    url = data.get("auth_url") if isinstance(data, dict) else None
+    if url and url.startswith("http"):
+        return url
+    return None
+
+
+async def _saavn_stream_by_id(sid: str) -> Optional[dict]:
+    # api_version 4 returns {songs:[...]} ; without version returns {pid: song}
+    data = await _saavn_get({"__call": "song.getDetails", "cc": "in", "pids": sid})
+    song = None
+    if isinstance(data, dict):
+        if sid in data and isinstance(data[sid], dict):
+            song = data[sid]
+        elif isinstance(data.get("songs"), list) and data["songs"]:
+            for s in data["songs"]:
+                if isinstance(s, dict) and (s.get("id") == sid or not song):
+                    song = s
+                    if s.get("id") == sid:
+                        break
+        else:
+            for v in data.values():
+                if isinstance(v, dict) and (v.get("id") == sid or v.get("song") or v.get("title")):
+                    song = v
+                    break
+                if isinstance(v, list):
+                    for s in v:
+                        if isinstance(s, dict) and s.get("id") == sid:
+                            song = s
+                            break
+    if not isinstance(song, dict):
+        return None
+    card = _saavn_card(song)
+    if not card:
+        # minimal card
+        card = {
+            "id": f"saavn:{sid}",
+            "saavn_id": sid,
+            "title": song.get("song") or song.get("title") or sid,
+            "artist": song.get("primary_artists") or song.get("singers") or "",
+            "thumb": (song.get("image") or "").replace("-150x150", "-500x500").replace("-50x50", "-500x500"),
+            "provider": "jiosaavn",
+            "source": "jiosaavn",
+        }
+    enc = (
+        song.get("encrypted_media_url")
+        or (song.get("more_info") or {}).get("encrypted_media_url")
+        or card.get("encrypted_media_url")
+        or ""
+    )
+    if not enc:
+        return card  # metadata only
+    for br in (320, 160, 96):
+        audio = await _saavn_auth_url(enc, br)
+        if audio:
+            card["audio_url"] = audio
+            card["audio_format"] = "mp4"
+            card["bitrate"] = br
+            break
+    return card
+
+
+async def _saavn_match(title: str, artist: str = "") -> Optional[dict]:
+    q = f"{title} {artist}".strip()
+    if not q:
+        return None
+    hits = await _saavn_search(q, 8)
+    if not hits:
+        return None
+    tlow = re.sub(r"\s*\(.*?\)\s*", " ", title).lower().strip()
+    alow = (artist or "").lower()
+    def score(h):
+        ht = (h.get("title") or "").lower()
+        ha = (h.get("artist") or "").lower()
+        s = 0
+        if ht == tlow or tlow in ht or ht in tlow:
+            s += 5
+        if alow and alow.split(",")[0].strip() in ha:
+            s += 3
+        return s
+    hits = sorted(hits, key=score, reverse=True)
+    best = hits[0]
+    if score(best) < 3 and len(tlow) > 3:
+        # still try first result for popular songs
+        pass
+    return await _saavn_stream_by_id(best["saavn_id"])
+
+
+async def _ytdlp_audio(video_id: str) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[str]]:
     def _extract():
         try:
             import yt_dlp  # type: ignore
         except ImportError:
-            return None, None, None, "yt-dlp not installed — add yt-dlp to requirements"
-        clients_try = [
-            ["android", "ios"],
-            ["android"],
-            ["ios"],
-            ["mweb"],
-            ["tv"],
+            return None, None, None, "yt-dlp not installed"
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        # try several player clients (vivi/NewPipe style fallbacks)
+        clients = [
+            "android,web",
+            "android_music,android",
+            "ios,web",
+            "tv_embedded",
+            "web",
         ]
         last_err = None
-        for clients in clients_try:
+        for client in clients:
             opts = {
                 "quiet": True,
                 "no_warnings": True,
                 "skip_download": True,
+                "format": "bestaudio[ext=m4a]/bestaudio/best",
                 "noplaylist": True,
-                "format": "bestaudio/best",
-                "extractor_args": {"youtube": {"player_client": clients}},
+                "extractor_args": {"youtube": {"player_client": client.split(",")}},
             }
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(
-                        f"https://www.youtube.com/watch?v={video_id}", download=False
-                    )
+                    info = ydl.extract_info(url, download=False)
                 if not info:
                     continue
                 formats = info.get("formats") or []
-                audio_fmts = []
-                for f in formats:
-                    if not f.get("url"):
-                        continue
-                    vcodec = f.get("vcodec")
-                    acodec = f.get("acodec")
-                    # pure audio only
-                    if vcodec in (None, "none") and acodec not in (None, "none"):
-                        # skip storyboards / images
-                        if (f.get("ext") or "") in ("mhtml", "jpg", "png", "webp"):
-                            continue
-                        if "storyboard" in (f.get("format") or "").lower():
-                            continue
-                        audio_fmts.append(f)
+                audio_fmts = [
+                    f for f in formats
+                    if f.get("url")
+                    and f.get("acodec") not in (None, "none")
+                    and f.get("vcodec") in (None, "none")
+                ]
+                if not audio_fmts and info.get("url"):
+                    return info.get("url"), info.get("ext"), info.get("duration"), None
                 if not audio_fmts:
                     continue
-
                 def score(f):
                     ext = (f.get("ext") or "")
                     br = f.get("abr") or f.get("tbr") or 0
-                    pref = 4 if ext == "m4a" else 3 if ext == "webm" else 2 if ext == "mp4" else 1
+                    pref = 3 if ext == "m4a" else 2 if ext in ("mp4", "webm") else 1
                     return (pref, br)
-
                 audio_fmts.sort(key=score, reverse=True)
                 best = audio_fmts[0]
-                ttl = info.get("title") or ""
-                art = ""
-                if info.get("artist"):
-                    art = info["artist"]
-                elif info.get("uploader"):
-                    art = info["uploader"]
-                return (
-                    best.get("url"),
-                    best.get("ext") or "m4a",
-                    info.get("duration"),
-                    None,
-                    ttl,
-                    art,
-                )
+                return best.get("url"), best.get("ext") or "m4a", info.get("duration"), None
             except Exception as e:
                 last_err = str(e)
                 continue
-        return None, None, None, last_err or "all clients failed", None, None
+        return None, None, None, last_err or "all clients failed"
+    return await asyncio.to_thread(_extract)
 
+
+@app.get("/music/search", tags=["Music"])
+async def music_search(q: str = Query(..., min_length=1)):
+    """Search JioSaavn (primary, reliable streams) + YouTube Music."""
+    q = q.strip()[:100]
+    saavn, ytm = [], []
+    errors = {}
     try:
-        result = await asyncio.to_thread(_extract)
-        audio_url, audio_format, duration, err = result[0], result[1], result[2], result[3]
-        if len(result) > 4 and result[4]:
-            title = result[4] or title
-        if len(result) > 5 and result[5]:
-            artist = result[5] or artist
-        if err:
-            errors["stream"] = err
+        saavn = await _saavn_search(q, 20)
     except Exception as e:
-        errors["stream"] = str(e)
+        errors["jiosaavn"] = str(e)
+    try:
+        data = await _ytm_post("search", {"query": q})
+        items = []
+        _ytm_walk(data, "musicResponsiveListItemRenderer", items)
+        _ytm_walk(data, "musicTwoRowItemRenderer", items)
+        seen = set()
+        for it in items:
+            e = _ytm_parse_item(it)
+            if e and e["video_id"] not in seen:
+                seen.add(e["video_id"])
+                ytm.append(e)
+    except Exception as e:
+        errors["ytmusic"] = str(e)
+    # Saavn first (playable), then YT
+    items = saavn + ytm[:20]
+    return {
+        "query": q,
+        "count": len(items),
+        "items": items,
+        "jiosaavn": saavn,
+        "ytmusic": ytm[:20],
+        "provider": "jiosaavn+ytmusic",
+        "errors": errors or None,
+    }
 
+
+@app.get("/music/home", tags=["Music"])
+async def music_home():
+    """Home rows — Saavn charts + YT Music curated searches."""
+    seeds = [
+        ("Trending India", "trending hindi songs"),
+        ("Bollywood Hits", "bollywood hits"),
+        ("Punjabi", "punjabi hits"),
+        ("English Pop", "top pop songs"),
+        ("Lo-fi", "lofi beats"),
+    ]
+    sections = []
+    for title, q in seeds:
+        try:
+            items = await _saavn_search(q, 12)
+            if items:
+                sections.append({"title": title, "items": items, "source": "jiosaavn"})
+        except Exception:
+            continue
+    if not sections:
+        # YT fallback
+        for title, q in [("Top Hits", "Top Hits"), ("Trending", "Trending music")]:
+            data = await _ytm_post("search", {"query": q})
+            items = []
+            _ytm_walk(data, "musicResponsiveListItemRenderer", items)
+            songs, seen = [], set()
+            for it in items:
+                e = _ytm_parse_item(it)
+                if e and e["video_id"] not in seen:
+                    seen.add(e["video_id"])
+                    songs.append(e)
+            if songs:
+                sections.append({"title": title, "items": songs[:12], "source": "ytmusic"})
+    return {"sections": sections, "provider": "jiosaavn"}
+
+
+@app.get("/music/play/{item_id:path}", tags=["Music"])
+async def music_play(item_id: str):
+    """
+    Playable audio stream — vivi-music style:
+    1) JioSaavn direct CDN (reliable)
+    2) yt-dlp multi-client fallback
+    3) YouTube embed fallback
+    item_id = saavn:ID  OR  11-char YouTube video id
+    """
+    errors = {}
+    title, artist, thumb = item_id, "", ""
+    duration = None
+    audio_url = None
+    audio_format = None
+    video_id = None
+    saavn_id = None
     sources = []
-    # Proxy path when we have direct audio (avoids CORS + helps mobile)
+
+    if item_id.startswith("saavn:"):
+        saavn_id = item_id.split(":", 1)[1]
+        try:
+            card = await _saavn_stream_by_id(saavn_id)
+            if card:
+                title = card.get("title") or title
+                artist = card.get("artist") or ""
+                thumb = card.get("thumb") or ""
+                duration = card.get("duration")
+                audio_url = card.get("audio_url")
+                audio_format = card.get("audio_format") or "mp4"
+        except Exception as e:
+            errors["jiosaavn"] = str(e)
+    elif re.match(r"^[a-zA-Z0-9_-]{11}$", item_id):
+        video_id = item_id
+        # YT meta
+        try:
+            data = await _ytm_post("next", {"videoId": video_id})
+            s = json.dumps(data)
+            texts = re.findall(r'"text"\s*:\s*"([^"\\]{2,80})"', s)
+            if texts:
+                title = texts[0]
+                if len(texts) > 1:
+                    artist = texts[1]
+            thumbs = re.findall(r'https://i\.ytimg\.com/[^"\\]+', s)
+            if thumbs:
+                thumb = thumbs[0].replace("\\u0026", "&")
+            else:
+                thumb = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+        except Exception as e:
+            errors["meta"] = str(e)
+            thumb = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+        # Prefer Saavn match (no bot check)
+        try:
+            match = await _saavn_match(title, artist)
+            if match and match.get("audio_url"):
+                audio_url = match["audio_url"]
+                audio_format = match.get("audio_format") or "mp4"
+                duration = match.get("duration") or duration
+                saavn_id = match.get("saavn_id")
+                if match.get("thumb"):
+                    thumb = match["thumb"]
+                # keep better title from saavn if similar
+                if match.get("title"):
+                    title = match["title"]
+                if match.get("artist"):
+                    artist = match["artist"]
+        except Exception as e:
+            errors["saavn_match"] = str(e)
+
+        if not audio_url:
+            try:
+                u, fmt, dur, err = await _ytdlp_audio(video_id)
+                if u:
+                    audio_url, audio_format, duration = u, fmt, dur or duration
+                elif err:
+                    errors["yt-dlp"] = err
+            except Exception as e:
+                errors["yt-dlp"] = str(e)
+    else:
+        raise HTTPException(400, "Invalid id — use saavn:ID or YouTube videoId")
+
     if audio_url:
         sources.append({
             "type": "audio",
-            "provider": "ytmusic-direct",
-            "label": f"Audio ({audio_format or 'best'})",
+            "provider": "jiosaavn" if saavn_id else "ytmusic-direct",
+            "label": f"Audio ({audio_format or 'mp4'})",
             "url": audio_url,
-            "play_url": f"/music/proxy/{video_id}",
-            "format": (audio_format or "m4a").upper(),
+            "play_url": audio_url,
+            "format": (audio_format or "mp4").upper(),
         })
-    sources.append({
-        "type": "youtube",
-        "provider": "youtube-iframe",
-        "label": "YouTube player",
-        "url": f"https://www.youtube.com/embed/{video_id}?enablejsapi=1&autoplay=1&rel=0",
-        "play_url": f"https://www.youtube.com/embed/{video_id}?enablejsapi=1&autoplay=1&rel=0",
-        "format": "YT",
-    })
+    if video_id:
+        sources.append({
+            "type": "embed",
+            "provider": "youtube",
+            "label": "YouTube embed",
+            "url": f"https://www.youtube.com/embed/{video_id}?autoplay=1&rel=0",
+            "play_url": f"https://www.youtube.com/embed/{video_id}?autoplay=1&rel=0",
+            "format": "EMBED",
+        })
 
     return {
+        "id": item_id,
         "video_id": video_id,
+        "saavn_id": saavn_id,
         "title": title,
         "artist": artist,
         "thumb": thumb,
         "duration": duration,
         "audio_url": audio_url,
         "audio_format": audio_format,
-        "proxy_url": f"/music/proxy/{video_id}" if audio_url else None,
         "sources": sources,
-        "watch_url": f"https://music.youtube.com/watch?v={video_id}",
-        "download_url": f"https://www.youtube.com/watch?v={video_id}",
-        "provider": "ytmusic",
+        "watch_url": f"https://music.youtube.com/watch?v={video_id}" if video_id else None,
+        "download_url": audio_url or (f"https://www.youtube.com/watch?v={video_id}" if video_id else None),
+        "provider": "jiosaavn" if saavn_id and audio_url else "ytmusic",
         "errors": errors or None,
     }
-
-
-@app.get("/music/proxy/{video_id}", tags=["Music"])
-async def music_proxy(video_id: str, request: Request):
-    """Proxy audio bytes — fixes CORS / mobile playback when direct googlevideo is blocked."""
-    if not re.match(r"^[a-zA-Z0-9_-]{11}$", video_id):
-        raise HTTPException(400, "Invalid video id")
-    # re-extract (short cache would be better; keep simple)
-    play = await music_play(video_id)
-    url = play.get("audio_url")
-    if not url:
-        raise HTTPException(502, play.get("errors") or "No audio stream")
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Referer": "https://www.youtube.com/",
-    }
-    range_h = request.headers.get("range")
-    if range_h:
-        headers["Range"] = range_h
-    try:
-        client = httpx.AsyncClient(follow_redirects=True, timeout=60.0)
-        upstream = await client.get(url, headers=headers)
-        if upstream.status_code >= 400:
-            await client.aclose()
-            raise HTTPException(upstream.status_code, "upstream audio failed")
-        out = {
-            "cache-control": "no-store",
-            "access-control-allow-origin": "*",
-            "access-control-expose-headers": "Content-Length, Content-Range, Accept-Ranges",
-        }
-        for k in ("content-type", "content-length", "content-range", "accept-ranges"):
-            if k in upstream.headers:
-                out[k] = upstream.headers[k]
-        media = (upstream.headers.get("content-type") or "audio/mp4").split(";")[0]
-
-        async def body():
-            try:
-                yield upstream.content
-            finally:
-                await client.aclose()
-
-        return StreamingResponse(body(), status_code=upstream.status_code, media_type=media, headers=out)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(502, f"proxy: {e}")
 
 
 @app.get("/music/lyrics", tags=["Music"])
@@ -2366,13 +2545,15 @@ async def music_lyrics(
     title: str = Query(..., min_length=1),
     artist: str = Query("", description="Artist name optional"),
 ):
-    """Fetch lyrics from LRCLIB (used by SimpMusic)."""
-    params = {"track_name": title[:120], "artist_name": (artist or "")[:80]}
+    """LRCLIB lyrics — plain + synced (LRC). Used by SimpMusic / vivi-music."""
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get("https://lrclib.net/api/search", params={"q": f"{artist} {title}".strip()})
+            r = await client.get(
+                "https://lrclib.net/api/search",
+                params={"q": f"{artist} {title}".strip()},
+            )
             if r.status_code != 200:
-                return {"found": False, "lyrics": None, "synced": None, "source": "lrclib"}
+                return {"found": False, "lyrics": None, "synced": None, "lines": [], "source": "lrclib"}
             items = r.json() if isinstance(r.json(), list) else []
             best = None
             tlow = title.lower()
@@ -2385,22 +2566,31 @@ async def music_lyrics(
                         best = it
                         if tlow == tn:
                             break
-            if not best and items:
-                best = items[0] if isinstance(items[0], dict) else None
+            if not best and items and isinstance(items[0], dict):
+                best = items[0]
             if not best:
-                return {"found": False, "lyrics": None, "synced": None, "source": "lrclib"}
+                return {"found": False, "lyrics": None, "synced": None, "lines": [], "source": "lrclib"}
+            synced = best.get("syncedLyrics") or ""
+            lines = []
+            # Parse LRC: [mm:ss.xx] text
+            for m in re.finditer(r"\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)", synced):
+                mins, secs, text = int(m.group(1)), float(m.group(2)), m.group(3).strip()
+                if text:
+                    lines.append({"t": mins * 60 + secs, "text": text})
             return {
-                "found": bool(best.get("plainLyrics") or best.get("syncedLyrics")),
+                "found": bool(best.get("plainLyrics") or synced),
                 "title": best.get("trackName"),
                 "artist": best.get("artistName"),
                 "album": best.get("albumName"),
                 "lyrics": best.get("plainLyrics"),
-                "synced": best.get("syncedLyrics"),
+                "synced": synced,
+                "lines": lines,
                 "duration": best.get("duration"),
                 "source": "lrclib",
             }
     except Exception as e:
-        return {"found": False, "lyrics": None, "error": str(e), "source": "lrclib"}
+        return {"found": False, "lyrics": None, "synced": None, "lines": [], "error": str(e), "source": "lrclib"}
+
 
 
 
@@ -2661,31 +2851,31 @@ function row(title,items){if(!items||!items.length)return'';return `<section cla
 
 let MSTATE={vid:'',title:'',artist:'',thumb:''};
 
+
+let MSTATE={id:'',vid:'',title:'',artist:'',thumb:'',audioUrl:null,lines:[]};
+
 async function musicHome(){
   setNav('music');root.innerHTML='<div class="empty">Loading music…</div>';
   try{
     const d=await api('/music/home');
-    const chips=['Arijit Singh','Taylor Swift','Queen','Lo-fi','BTS','Ed Sheeran','Bollywood','Hip Hop','Nightcore','Rahman'];
+    const chips=['Arijit Singh','Taylor Swift','Saiyaara','Lo-fi','BTS','Ed Sheeran','Bollywood','Punjabi','Rahman','Shreya Ghoshal'];
     let h=`<div class="music-layout">
-      <div class="m-hero"><h1>♪ Music</h1><p>YouTube Music catalog · lyrics · play — SimpMusic-style</p></div>
-      <div class="m-search"><input id="mq" placeholder="Search songs, artists, albums…" onkeydown="if(event.key==='Enter')musicSearch(this.value)"/><button class="btn" type="button" onclick="musicSearch(document.getElementById('mq').value)">Search</button></div>
+      <div class="m-hero"><h1>♪ Music</h1><p>JioSaavn · YouTube Music · synced lyrics</p></div>
+      <div class="m-search"><input id="mq" placeholder="Search songs, artists…" onkeydown="if(event.key==='Enter')musicSearch(this.value)"/><button class="btn" type="button" onclick="musicSearch(document.getElementById('mq').value)">Search</button></div>
       <div class="m-chips">${chips.map(c=>`<button type="button" class="chip" onclick="musicSearch('${c}')">${c}</button>`).join('')}</div>`;
     for(const sec of (d.sections||[])){
       h+=`<section class="sec"><h2>${esc(sec.title)}</h2><div class="m-grid">${(sec.items||[]).map(musicCard).join('')||'<p class="empty">Empty</p>'}</div></section>`;
     }
-    if(!(d.sections||[]).length) h+=`<p class="empty">No sections — try search above</p>`;
+    if(!(d.sections||[]).length) h+=`<p class="empty">No sections — try search</p>`;
     h+='</div>';
     root.innerHTML=h;
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
 function musicCard(s){
-  const vid=s.video_id||s.id||'';
-  const title=(s.title||'Song').replace(/'/g,"\\'");
-  const artist=(s.artist||'').replace(/'/g,"\\'");
-  const thumb=(s.thumb||'').replace(/'/g,"\\'");
-  return `<div class="m-card" role="button" tabindex="0" data-vid="${esc(vid)}" onclick="location.hash='#/music/play/${esc(vid)}'">
+  const id=s.id||s.video_id||s.saavn_id||'';
+  return `<div class="m-card" role="button" tabindex="0" onclick="location.hash='#/music/play/${encodeURIComponent(id)}'">
     <img src="${esc(s.thumb||'')}" alt="" loading="lazy"/>
-    <div class="mi"><div class="mt">${esc(s.title)}</div><div class="ma">${esc(s.artist||'YouTube Music')}</div></div>
+    <div class="mi"><div class="mt">${esc(s.title)}</div><div class="ma">${esc(s.artist||s.provider||'')}</div></div>
   </div>`;
 }
 async function musicSearch(q){
@@ -2694,218 +2884,125 @@ async function musicSearch(q){
   try{
     const d=await api('/music/search?q='+encodeURIComponent(q));
     root.innerHTML=`<div class="music-layout"><div class="m-search"><input id="mq" value="${esc(q)}" onkeydown="if(event.key==='Enter')musicSearch(this.value)"/><button class="btn" type="button" onclick="musicSearch(document.getElementById('mq').value)">Search</button></div>
-      <section class="sec"><h2>Results for “${esc(q)}”</h2><div class="m-grid">${(d.items||[]).map(musicCard).join('')||'<p class="empty">No results</p>'}</div></section></div>`;
+      <section class="sec"><h2>Results · ${(d.items||[]).length}</h2><div class="m-grid">${(d.items||[]).map(musicCard).join('')||'<p class="empty">No results</p>'}</div></section></div>`;
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
-
-
-async function musicPlayPage(vid){
+function fmtTime(s){s=Math.floor(s||0);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')}
+function renderSyncLyrics(t){
+  const box=document.getElementById('mp-lyrics');
+  if(!box||!MSTATE.lines||!MSTATE.lines.length) return;
+  let idx=-1;
+  for(let i=0;i<MSTATE.lines.length;i++){
+    if(MSTATE.lines[i].t<=t) idx=i; else break;
+  }
+  box.innerHTML=MSTATE.lines.map((ln,i)=>`<div class="lrc-line ${i===idx?'on':''}" data-i="${i}">${esc(ln.text)}</div>`).join('');
+  const on=box.querySelector('.lrc-line.on');
+  if(on) try{on.scrollIntoView({block:'center',behavior:'smooth'})}catch(e){}
+}
+async function musicPlayPage(rawId){
+  const id=decodeURIComponent(rawId||'');
   setNav('music');
-  root.innerHTML='<div class="empty">Loading…</div>';
-  let title=vid, artist='', thumb='https://i.ytimg.com/vi/'+vid+'/hqdefault.jpg';
-  let audioUrl=null, proxyUrl=null, duration=null, useYT=false;
+  root.innerHTML='<div class="empty">Loading player…</div>';
+  let title=id, artist='', thumb='', audioUrl=null, duration=null, videoId=null;
   try{
-    const d=await api('/music/play/'+vid);
-    title=d.title||title; artist=d.artist||''; thumb=d.thumb||thumb;
-    duration=d.duration||null;
-    audioUrl=d.audio_url||null;
-    proxyUrl=d.proxy_url||null;
-    if(!audioUrl){
-      const a=(d.sources||[]).find(s=>s.type==='audio');
-      if(a){audioUrl=a.url; proxyUrl=a.play_url;}
-    }
-  }catch(e){toast(String(e.message||e))}
-  useYT=!audioUrl;
-  MSTATE={vid,title,artist,thumb,audioUrl};
+    const d=await api('/music/play/'+encodeURIComponent(id));
+    title=d.title||title; artist=d.artist||''; thumb=d.thumb||'';
+    audioUrl=d.audio_url||null; duration=d.duration||null; videoId=d.video_id||null;
+    if(!audioUrl&&d.sources){const a=(d.sources||[]).find(s=>s.type==='audio');if(a)audioUrl=a.url||a.play_url}
+  }catch(e){toast('Stream failed: '+e.message)}
+  MSTATE={id,vid:videoId,title,artist,thumb,audioUrl,lines:[]};
 
   root.innerHTML=`<div class="sm-player">
-    <div class="sm-art-wrap">
-      <img class="sm-art" id="sm-art" src="${esc(thumb)}" alt=""/>
-      <div id="yt-box" class="yt-hidden"></div>
-    </div>
+    <div class="sm-art-wrap">${thumb?`<img class="sm-art" src="${esc(thumb)}" alt=""/>`:'<div class="sm-art"></div>'}</div>
     <div class="sm-meta">
       <div class="sm-now">NOW PLAYING</div>
       <h1 class="sm-title" id="mp-title">${esc(title)}</h1>
-      <div class="sm-artist" id="mp-artist">${esc(artist||'YouTube Music')}</div>
+      <div class="sm-artist" id="mp-artist">${esc(artist||'Unknown artist')}</div>
     </div>
     <div class="sm-progress">
       <input type="range" id="sm-seek" min="0" max="1000" value="0"/>
-      <div class="sm-time"><span id="sm-cur">0:00</span><span id="sm-dur">${duration?fmtTime(duration):'0:00'}</span></div>
+      <div class="sm-time"><span id="sm-cur">0:00</span><span id="sm-dur">${duration?fmtTime(duration):'—:—'}</span></div>
     </div>
     <div class="sm-controls">
-      <button type="button" class="sm-btn" onclick="location.hash='#/music'" title="Back">▼</button>
+      <button type="button" class="sm-btn" onclick="location.hash='#/music'" title="Library">☰</button>
       <button type="button" class="sm-btn" id="sm-prev" title="Prev">⏮</button>
       <button type="button" class="sm-btn sm-play" id="sm-toggle" title="Play">▶</button>
       <button type="button" class="sm-btn" id="sm-next" title="Next">⏭</button>
-      <a class="sm-btn" id="sm-dl" href="https://www.youtube.com/watch?v=${esc(vid)}" target="_blank" rel="noopener" title="Download">⬇</a>
+      <a class="sm-btn" id="sm-dl" href="${esc(audioUrl||'#')}" download title="Download">⬇</a>
     </div>
     <audio id="sm-audio" preload="auto"></audio>
     <div class="sm-extra">
-      <a class="btn ghost" href="https://music.youtube.com/watch?v=${esc(vid)}" target="_blank" rel="noopener">Open in YT Music</a>
-      <button class="btn ghost" type="button" onclick="navigator.clipboard.writeText('https://www.youtube.com/watch?v=${esc(vid)}').then(()=>toast('Link copied'))">Copy link</button>
+      ${videoId?`<a class="btn ghost" href="https://music.youtube.com/watch?v=${esc(videoId)}" target="_blank" rel="noopener">YT Music</a>`:''}
+      <button class="btn ghost" type="button" onclick="navigator.clipboard.writeText(MSTATE.audioUrl||location.href).then(()=>toast('Link copied'))">Copy stream</button>
     </div>
-    <div class="m-lyrics"><h3>Lyrics</h3><div id="mp-lyrics" class="lyric-lines">Loading lyrics…</div></div>
+    <div class="m-lyrics"><h3>Lyrics</h3><div id="mp-lyrics" class="lrc-box">Loading lyrics…</div></div>
   </div>`;
 
   const bar=document.getElementById('nowbar');
   if(bar){
     document.getElementById('nowtitle').textContent=title;
-    document.getElementById('nowartist').textContent=artist||'YouTube Music';
-    document.getElementById('nowthumb').src=thumb;
+    document.getElementById('nowartist').textContent=artist||'';
+    document.getElementById('nowthumb').src=thumb||'';
+    document.getElementById('nowplayer').innerHTML='';
     bar.classList.add('on');
   }
 
   const audio=document.getElementById('sm-audio');
   const toggle=document.getElementById('sm-toggle');
   const seek=document.getElementById('sm-seek');
-  let seeking=false, ytPlayer=null, lyricData=[], raf=0;
+  let seeking=false;
 
-  function setPlaying(on){ toggle.textContent=on?'⏸':'▶'; }
-
-  function tickLyrics(t){
-    if(!lyricData.length) return;
-    let idx=-1;
-    for(let i=0;i<lyricData.length;i++){
-      if(lyricData[i].t<=t) idx=i; else break;
-    }
-    const box=document.getElementById('mp-lyrics');
-    if(!box) return;
-    const lines=box.querySelectorAll('.ll');
-    lines.forEach((el,i)=>{
-      el.classList.toggle('on', i===idx);
-      el.classList.toggle('past', i<idx);
-    });
-    if(idx>=0 && lines[idx]) lines[idx].scrollIntoView({block:'center',behavior:'smooth'});
-  }
-
-  function onTime(t,dur){
-    if(!seeking && dur){
-      seek.value=Math.floor((t/dur)*1000);
-      document.getElementById('sm-cur').textContent=fmtTime(t);
-      document.getElementById('sm-dur').textContent=fmtTime(dur);
-    }else if(!seeking){
-      document.getElementById('sm-cur').textContent=fmtTime(t);
-    }
-    tickLyrics(t);
-  }
-
-  if(!useYT && (proxyUrl||audioUrl)){
-    audio.src=proxyUrl||audioUrl;
-    audio.play().then(()=>setPlaying(true)).catch(()=>{
-      // fallback YT
-      useYT=true; startYT();
-    });
-    audio.addEventListener('timeupdate',()=>onTime(audio.currentTime, audio.duration||duration));
-    audio.addEventListener('ended',()=>setPlaying(false));
-    audio.addEventListener('error',()=>{ if(!useYT){ useYT=true; startYT(); }});
-    toggle.onclick=()=>{
-      if(useYT && ytPlayer){
-        const st=ytPlayer.getPlayerState();
-        if(st===1){ytPlayer.pauseVideo();setPlaying(false);} else {ytPlayer.playVideo();setPlaying(true);}
-        return;
-      }
-      if(audio.paused){audio.play();setPlaying(true);} else {audio.pause();setPlaying(false);}
-    };
-    seek.addEventListener('input',()=>{seeking=true;});
-    seek.addEventListener('change',()=>{
-      const dur=audio.duration||duration||0;
-      if(dur) audio.currentTime=(seek.value/1000)*dur;
-      seeking=false;
-    });
+  if(audioUrl){
+    audio.src=audioUrl;
+    audio.play().then(()=>{toggle.textContent='⏸'}).catch(()=>{toast('Tap ▶ to play')});
+  }else if(videoId){
+    document.querySelector('.sm-art-wrap').innerHTML=`<div class="yt" style="aspect-ratio:16/9;width:100%;border-radius:12px;overflow:hidden"><iframe src="https://www.youtube.com/embed/${esc(videoId)}?autoplay=1&rel=0" allow="autoplay;encrypted-media" allowfullscreen style="width:100%;height:100%;border:0"></iframe></div>`;
+    toast('Using YouTube player (direct audio blocked)');
   }else{
-    startYT();
+    toast('No playable stream');
   }
 
-  function startYT(){
-    useYT=true;
-    toast('Playing via YouTube');
-    const box=document.getElementById('yt-box');
-    if(box){ box.className='yt-box'; box.innerHTML='<div id="yt-iframe"></div>'; }
-    function boot(){
-      if(!window.YT||!YT.Player){ setTimeout(boot,200); return; }
-      ytPlayer=new YT.Player('yt-iframe',{
-        height:'200', width:'100%',
-        videoId:vid,
-        playerVars:{autoplay:1,rel:0,modestbranding:1,playsinline:1},
-        events:{
-          onReady:(e)=>{ e.target.playVideo(); setPlaying(true);
-            const loop=()=>{
-              try{
-                const t=ytPlayer.getCurrentTime()||0;
-                const d=ytPlayer.getDuration()||duration||0;
-                onTime(t,d);
-              }catch(x){}
-              raf=requestAnimationFrame(loop);
-            };
-            cancelAnimationFrame(raf); raf=requestAnimationFrame(loop);
-          },
-          onStateChange:(e)=>{
-            if(e.data===1) setPlaying(true);
-            if(e.data===2||e.data===0) setPlaying(false);
-          }
-        }
-      });
-    }
-    if(!document.getElementById('yt-api')){
-      const s=document.createElement('script'); s.id='yt-api'; s.src='https://www.youtube.com/iframe_api';
-      document.head.appendChild(s);
-    }
-    window.onYouTubeIframeAPIReady=boot;
-    if(window.YT&&YT.Player) boot();
-    toggle.onclick=()=>{
-      if(!ytPlayer) return;
-      const st=ytPlayer.getPlayerState();
-      if(st===1){ytPlayer.pauseVideo();setPlaying(false);} else {ytPlayer.playVideo();setPlaying(true);}
-    };
-    seek.addEventListener('input',()=>{seeking=true;});
-    seek.addEventListener('change',()=>{
-      if(!ytPlayer) return;
-      const d=ytPlayer.getDuration()||0;
-      if(d) ytPlayer.seekTo((seek.value/1000)*d,true);
-      seeking=false;
-    });
-  }
+  toggle.onclick=()=>{
+    if(!audio.src) return;
+    if(audio.paused){audio.play();toggle.textContent='⏸'}
+    else{audio.pause();toggle.textContent='▶'}
+  };
+  audio.addEventListener('timeupdate',()=>{
+    if(seeking||!audio.duration) return;
+    seek.value=Math.floor((audio.currentTime/audio.duration)*1000);
+    document.getElementById('sm-cur').textContent=fmtTime(audio.currentTime);
+    document.getElementById('sm-dur').textContent=fmtTime(audio.duration);
+    renderSyncLyrics(audio.currentTime);
+  });
+  audio.addEventListener('ended',()=>{toggle.textContent='▶'});
+  seek.addEventListener('input',()=>{seeking=true});
+  seek.addEventListener('change',()=>{
+    if(audio.duration) audio.currentTime=(seek.value/1000)*audio.duration;
+    seeking=false;
+  });
 
-  // lyrics — prefer synced
   try{
     const L=await api('/music/lyrics?title='+encodeURIComponent(title)+'&artist='+encodeURIComponent(artist||''));
-    const box=document.getElementById('mp-lyrics');
-    if(L.found && (L.synced||L.lyrics)){
-      if(L.title) document.getElementById('mp-title').textContent=L.title;
-      if(L.artist) document.getElementById('mp-artist').textContent=L.artist;
-      if(L.synced){
-        lyricData=parseLRC(L.synced);
-        box.innerHTML=lyricData.map((x,i)=>`<div class="ll" data-i="${i}">${esc(x.text)}</div>`).join('')||esc(L.lyrics||'');
-      }else{
-        box.innerHTML=`<pre class="lyric-plain">${esc(L.lyrics)}</pre>`;
-      }
-    }else box.textContent='No lyrics found.';
+    const el=document.getElementById('mp-lyrics');
+    if(L.lines&&L.lines.length){
+      MSTATE.lines=L.lines;
+      renderSyncLyrics(0);
+    }else if(L.found&&(L.lyrics||L.synced)){
+      el.innerHTML='<pre style="white-space:pre-wrap;font:inherit;color:inherit;margin:0">'+esc(L.lyrics||L.synced)+'</pre>';
+    }else{
+      el.textContent='No lyrics found';
+    }
+    if(L.title) document.getElementById('mp-title').textContent=L.title;
+    if(L.artist) document.getElementById('mp-artist').textContent=L.artist;
   }catch(e){
-    const box=document.getElementById('mp-lyrics');
-    if(box) box.textContent='Lyrics unavailable.';
+    const el=document.getElementById('mp-lyrics');
+    if(el) el.textContent='Lyrics unavailable';
   }
 }
-function parseLRC(src){
-  const out=[];
-  const re=/\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\](.*)/g;
-  let m;
-  while((m=re.exec(src||''))){
-    const min=+m[1], sec=+m[2], ms=m[3]?parseInt((m[3]+'000').slice(0,3),10):0;
-    const text=(m[4]||'').trim();
-    if(text) out.push({t:min*60+sec+ms/1000, text});
-  }
-  return out;
-}
-function fmtTime(s){
-  s=Math.floor(Number(s)||0); if(s<0)s=0;
-  const m=Math.floor(s/60), sec=s%60;
-  return m+':'+String(sec).padStart(2,'0');
-}
-
-function playMusic(vid, title, artist, thumb){
-  location.hash='#/music/play/'+vid;
-}
+function playMusic(vid){location.hash='#/music/play/'+encodeURIComponent(vid)}
 function closeMusic(){
+  const a=document.getElementById('sm-audio');
+  if(a){try{a.pause()}catch(e){}}
   const np=document.getElementById('nowplayer');
   if(np) np.innerHTML='';
   const bar=document.getElementById('nowbar');
@@ -3164,7 +3261,7 @@ async function router(){
   try{
     if(!p.length) return home();
     if(p[0]==='movies') return grid('movies');
-    if(p[0]==='music'&&p[1]==='play'&&p[2]) return musicPlayPage(p[2]);
+    if(p[0]==='music'&&p[1]==='play'&&p[2]) return musicPlayPage(p.slice(2).join('/'));
     if(p[0]==='music') return musicHome();
     if(p[0]==='series') return grid('series');
     if(p[0]==='search'&&p[1]) return search(decodeURIComponent(p[1]));
