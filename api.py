@@ -1331,26 +1331,30 @@ def _embed_sources_meta(meta: dict, media: str, se: int = 1, ep: int = 1):
         if tmdb:
             pairs = [
                 ("Videasy", f"https://player.videasy.to/movie/{tmdb}?overlay=true"),
-                ("VidSrc", f"https://vsembed.su/embed/movie/{tmdb}"),
+                ("VidSrc", f"https://vidsrc.xyz/embed/movie/{tmdb}"),
+                ("VidSrc CC", f"https://vidsrc.cc/v2/embed/movie/{tmdb}"),
                 ("Vidking", f"https://www.vidking.net/embed/movie/{tmdb}?autoPlay=true"),
                 ("VidLink", f"https://vidlink.pro/movie/{tmdb}"),
+                ("EmbedSU", f"https://embed.su/embed/movie/{tmdb}"),
             ]
         elif imdb:
             pairs = [
-                ("VidSrc IMDB", f"https://vsembed.su/embed/movie/{imdb}"),
+                ("VidSrc IMDB", f"https://vidsrc.xyz/embed/movie/{imdb}"),
                 ("Vidking IMDB", f"https://www.vidking.net/embed/movie/{imdb}?autoPlay=true"),
             ]
     else:
         if tmdb:
             pairs = [
                 ("Videasy", f"https://player.videasy.to/tv/{tmdb}/{se}/{ep}?overlay=true"),
-                ("VidSrc", f"https://vsembed.su/embed/tv/{tmdb}/{se}/{ep}"),
+                ("VidSrc", f"https://vidsrc.xyz/embed/tv/{tmdb}/{se}/{ep}"),
+                ("VidSrc CC", f"https://vidsrc.cc/v2/embed/tv/{tmdb}/{se}/{ep}"),
                 ("Vidking", f"https://www.vidking.net/embed/tv/{tmdb}/{se}/{ep}?autoPlay=true"),
                 ("VidLink", f"https://vidlink.pro/tv/{tmdb}/{se}/{ep}"),
+                ("EmbedSU", f"https://embed.su/embed/tv/{tmdb}/{se}/{ep}"),
             ]
         elif imdb:
             pairs = [
-                ("VidSrc IMDB", f"https://vsembed.su/embed/tv/{imdb}/{se}/{ep}"),
+                ("VidSrc IMDB", f"https://vidsrc.xyz/embed/tv/{imdb}/{se}/{ep}"),
             ]
     for label, url in pairs:
         sources.append({
@@ -2474,6 +2478,7 @@ async def music_lyrics(
                 mins, secs, text = int(m.group(1)), float(m.group(2)), m.group(3).strip()
                 if text:
                     lines.append({"t": mins * 60 + secs, "text": text})
+            lines.sort(key=lambda x: x["t"])
             return {
                 "found": bool(best.get("plainLyrics") or synced),
                 "title": best.get("trackName"),
@@ -2777,11 +2782,12 @@ img{display:block;max-width:100%}
 .m-lyrics-head{display:flex;align-items:center;justify-content:space-between;padding:0 8px 10px}
 .m-lyrics-head h3{font-size:.8rem;color:var(--mute);text-transform:uppercase;letter-spacing:.08em;margin:0}
 .m-lyrics-head .tag{font-size:.68rem;color:var(--a);opacity:.9;background:var(--a-soft);padding:3px 9px;border-radius:999px}
-.lrc-box{height:min(42vh,320px);overflow-y:auto;overflow-x:hidden;scroll-behavior:smooth;padding:40% 12px;mask-image:linear-gradient(180deg,transparent 0%,#000 18%,#000 82%,transparent 100%);-webkit-mask-image:linear-gradient(180deg,transparent 0%,#000 18%,#000 82%,transparent 100%);-webkit-overflow-scrolling:touch}
-.lrc-line{text-align:center;padding:10px 8px;font-size:1.05rem;line-height:1.45;color:rgba(255,255,255,.28);font-weight:500;transition:color .2s,transform .2s,font-size .2s;cursor:default}
-.lrc-line.on{color:#fff;font-size:1.28rem;font-weight:700;transform:scale(1.02);text-shadow:0 0 18px var(--a-soft)}
-.lrc-line.near{color:rgba(255,255,255,.55);font-size:1.08rem}
-.lrc-line:empty{min-height:8px}
+.lrc-box{height:min(48vh,360px);overflow:hidden;position:relative;mask-image:linear-gradient(180deg,transparent 0%,#000 12%,#000 88%,transparent 100%);-webkit-mask-image:linear-gradient(180deg,transparent 0%,#000 12%,#000 88%,transparent 100%)}
+.lrc-track{position:absolute;left:0;right:0;top:0;padding:0 14px;will-change:transform;transition:transform .28s cubic-bezier(.22,.61,.36,1)}
+.lrc-line{text-align:center;padding:12px 6px;font-size:1.02rem;line-height:1.4;color:rgba(255,255,255,.22);font-weight:500;transition:color .2s,font-size .2s,opacity .2s}
+.lrc-line.on{color:#fff;font-size:1.35rem;font-weight:700}
+.lrc-line.near{color:rgba(255,255,255,.5);font-size:1.08rem}
+.lrc-line.far{opacity:.55}
 .m-lyrics pre{white-space:pre-wrap;font-family:Inter,system-ui,sans-serif;font-size:.92rem;line-height:1.65;color:#d4d4dc;padding:8px}
 .sm-rec-list{display:flex;flex-direction:column;gap:6px;max-width:520px;margin:0 auto;width:100%}
 .sm-rec-row{display:flex;align-items:center;gap:12px;padding:8px 10px;border-radius:12px;background:var(--card);border:1px solid var(--line);cursor:pointer;transition:background .15s}
@@ -2901,7 +2907,7 @@ img{display:block;max-width:100%}
     <div class="top">
       <button class="menu-btn" type="button" onclick="document.getElementById('side').classList.toggle('open')">☰</button>
       <button class="btn ghost top-nav-music" type="button" onclick="location.hash='#/music'">♪ Music</button>
-      <input class="search" id="q" placeholder="Search movies, series, music…" onkeydown="if(event.key==='Enter')goSearch()"/>
+      <input class="search" id="q" placeholder="Search movies, series…" onkeydown="if(event.key==='Enter')goSearch()"/>
       <button class="btn ghost" type="button" onclick="goSearch()">Search</button>
     </div>
     <div class="content" id="root"><div class="empty">Loading…</div></div>
@@ -2981,13 +2987,12 @@ async function musicHome(){
     const d=await api('/music/home');
     const chips=['Arijit Singh','Shubh','Saiyaara','Lo-fi','Bollywood','Punjabi','Taylor Swift','Rahman'];
     let h=`<div class="music-layout">
-      <div class="m-hero"><h1>♪ Music</h1><p>JioSaavn · synced lyrics · queue · loop</p></div>
-      <div class="m-search"><input id="mq" placeholder="Search songs, artists…" onkeydown="if(event.key==='Enter')musicSearch(this.value)"/><button class="btn" type="button" onclick="musicSearch(document.getElementById('mq').value)">Search</button></div>
-      <div class="m-chips">${chips.map(c=>`<button type="button" class="chip" onclick="this.parentElement.querySelectorAll('.chip').forEach(x=>x.classList.remove('on'));this.classList.add('on');musicSearch('${c}')">${c}</button>`).join('')}</div>`;
+      <div class="m-hero"><h1>♪ Music</h1><p>JioSaavn · synced lyrics · queue · loop · next</p></div>
+      <div class="m-chips">${chips.map(c=>`<button type="button" class="chip" onclick="location.hash='#/music/search/'+encodeURIComponent('${c}')">${c}</button>`).join('')}</div>`;
     for(const sec of (d.sections||[])){
       h+=`<section class="sec"><h2>${esc(sec.title)}</h2><div class="m-grid">${(sec.items||[]).map(musicCard).join('')||'<p class="empty">Empty</p>'}</div></section>`;
     }
-    if(!(d.sections||[]).length) h+=`<p class="empty">No sections — try search</p>`;
+    if(!(d.sections||[]).length) h+=`<p class="empty">No sections — try search above</p>`;
     h+='</div>';
     root.innerHTML=h;
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
@@ -3001,13 +3006,15 @@ function musicCard(s){
 }
 async function musicSearch(q){
   q=(q||'').trim(); if(!q) return;
-  setNav('music');root.innerHTML='<div class="empty">Searching…</div>';
+  setNav('music');
+  const topq=document.getElementById('q'); if(topq){topq.value=q; topq.placeholder='Search songs, artists…'}
+  root.innerHTML='<div class="empty">Searching…</div>';
   try{
     const d=await api('/music/search?q='+encodeURIComponent(q));
     const items=d.items||[];
-    MSTATE.queue=items.slice(0,30);
-    root.innerHTML=`<div class="music-layout"><div class="m-search"><input id="mq" value="${esc(q)}" onkeydown="if(event.key==='Enter')musicSearch(this.value)"/><button class="btn" type="button" onclick="musicSearch(document.getElementById('mq').value)">Search</button></div>
-      <section class="sec"><h2>Results · ${items.length}</h2><div class="m-grid">${items.map(musicCard).join('')||'<p class="empty">No results</p>'}</div></section></div>`;
+    MSTATE.queue=items.slice(0,40);
+    MSTATE.qIdx=0;
+    root.innerHTML=`<div class="music-layout"><section class="sec"><h2>Results · ${items.length}</h2><div class="m-grid">${items.map(musicCard).join('')||'<p class="empty">No results</p>'}</div></section></div>`;
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
 function fmtTime(s){s=Math.floor(s||0);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')}
@@ -3016,27 +3023,31 @@ function renderSyncLyrics(t){
   if(!box||!MSTATE.lines||!MSTATE.lines.length) return;
   let idx=-1;
   for(let i=0;i<MSTATE.lines.length;i++){
-    if(MSTATE.lines[i].t<=t) idx=i; else break;
+    if(MSTATE.lines[i].t<=(t+0.05)) idx=i; else break;
   }
-  if(MSTATE._lrcIdx===idx && box.children.length){
-    // only update classes
-    Array.from(box.children).forEach((el,i)=>{
-      el.className='lrc-line'+(i===idx?' on':(Math.abs(i-idx)===1?' near':''));
-    });
-  }else{
-    MSTATE._lrcIdx=idx;
-    box.innerHTML=MSTATE.lines.map((ln,i)=>{
-      const cls=i===idx?' on':(Math.abs(i-idx)===1?' near':'');
-      return `<div class="lrc-line${cls}" data-i="${i}">${esc(ln.text||' ')}</div>`;
-    }).join('');
+  if(idx<0) idx=0;
+  let track=box.querySelector('.lrc-track');
+  if(!track || MSTATE._lrcBuilt!==MSTATE.lines.length){
+    MSTATE._lrcBuilt=MSTATE.lines.length;
+    MSTATE._lrcIdx=-1;
+    box.innerHTML='<div class="lrc-track">'+MSTATE.lines.map((ln,i)=>
+      `<div class="lrc-line" data-i="${i}">${esc(ln.text||' ')}</div>`
+    ).join('')+'</div>';
+    track=box.querySelector('.lrc-track');
   }
-  // Scroll ONLY inside .lrc-box — never the page
-  const on=box.querySelector('.lrc-line.on');
-  if(on){
-    const target=on.offsetTop - box.clientHeight/2 + on.clientHeight/2;
-    const max=box.scrollHeight-box.clientHeight;
-    const next=Math.max(0,Math.min(max,target));
-    if(Math.abs(box.scrollTop-next)>2) box.scrollTop=next;
+  if(MSTATE._lrcIdx===idx) return;
+  MSTATE._lrcIdx=idx;
+  const lines=track.children;
+  for(let i=0;i<lines.length;i++){
+    const d=Math.abs(i-idx);
+    lines[i].className='lrc-line'+(i===idx?' on':(d===1?' near':(d>3?' far':'')));
+  }
+  // Center active line via transform (no page scroll)
+  const active=lines[idx];
+  if(active){
+    const mid=box.clientHeight/2;
+    const y=active.offsetTop + active.offsetHeight/2;
+    track.style.transform='translateY('+(mid-y)+'px)';
   }
 }
 function cycleLoop(){
@@ -3294,7 +3305,19 @@ async function search(q){
     root.innerHTML=`<section class="sec"><h2>Results for “${esc(q)}”</h2><div class="grid">${items.map(card).join('')||'<p class="empty">No results</p>'}</div></section>`;
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
-function goSearch(){const q=document.getElementById('q').value.trim();if(q)location.hash='#/search/'+encodeURIComponent(q)}
+function goSearch(){
+  const q=(document.getElementById('q')||{}).value||'';
+  const qq=q.trim(); if(!qq) return;
+  const h=location.hash||'';
+  if(h.indexOf('#/music')===0) location.hash='#/music/search/'+encodeURIComponent(qq);
+  else location.hash='#/search/'+encodeURIComponent(qq);
+}
+function setSearchPlaceholder(){
+  const q=document.getElementById('q'); if(!q) return;
+  const h=location.hash||'';
+  if(h.indexOf('#/music')===0){q.placeholder='Search songs, artists…';}
+  else{q.placeholder='Search movies, series…';}
+}
 async function title(media,id){
   setNav('');root.innerHTML='<div class="empty">Loading…</div>';
   try{
@@ -3340,7 +3363,7 @@ function renderP(){
   if(ext) ext.innerHTML='';
 
   if(s.type==='embed'){
-    f.innerHTML=`<iframe src="${esc(play)}" allowfullscreen allow="autoplay;encrypted-media;picture-in-picture;fullscreen" style="width:100%;height:100%;border:0;background:#000"></iframe>`;
+    f.innerHTML=`<iframe src="${esc(play)}" allowfullscreen allow="autoplay;encrypted-media;picture-in-picture;fullscreen;clipboard-write" referrerpolicy="no-referrer" style="width:100%;height:100%;border:0;background:#000"></iframe>`;
     return;
   }
 
@@ -3535,6 +3558,7 @@ async function router(){
     if(!p.length) return home();
     if(p[0]==='movies') return grid('movies');
     if(p[0]==='music'&&p[1]==='play'&&p[2]) return musicPlayPage(p.slice(2).join('/'));
+    if(p[0]==='music'&&p[1]==='search'&&p[2]) return musicSearch(decodeURIComponent(p.slice(2).join('/')));
     if(p[0]==='music') return musicHome();
     if(p[0]==='series') return grid('series');
     if(p[0]==='search'&&p[1]) return search(decodeURIComponent(p[1]));
