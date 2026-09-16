@@ -420,11 +420,10 @@ def _pixeldrain_file_id(url: str) -> Optional[str]:
 
 
 def _pixeldrain_api(url: str) -> Optional[str]:
-    """Prefer GameDrive bypass CDN for direct play/download."""
+    """GameDrive bypass CDN entry (resolved further at preflight)."""
     fid = _pixeldrain_file_id(url)
     if not fid:
         return None
-    # gamedrive bypass — streams with Accept-Ranges
     return f"https://cdn.pixeldrain.eu.cc/{fid}"
 
 
@@ -452,27 +451,37 @@ def _pixeldrain_bypass_urls(api_url: str) -> List[str]:
 
 
 async def preflight_url(url: str, headers: Optional[dict] = None) -> Optional[str]:
-    """Range probe — only accept non-HTML binary responses (TUI-style)."""
+    """Light probe — HEAD first, then tiny Range GET. Keeps final redirected URL."""
     h = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Range": "bytes=0-2047",
         "Accept": "*/*",
     }
     if headers:
-        h.update({k: v for k, v in headers.items() if k.lower() != "range"})
+        h.update({k: v for k, v in headers.items() if k.lower() not in ("range",)})
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
-            r = await client.get(url, headers=h)
+        async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+            # HEAD is enough for CDN availability
+            try:
+                rh = await client.head(url, headers=h)
+                if rh.status_code in (200, 206):
+                    ctype = (rh.headers.get("content-type") or "").lower()
+                    if "text/html" not in ctype and "application/json" not in ctype:
+                        final = str(rh.url)
+                        if _is_playable_direct(final):
+                            return final
+            except Exception:
+                pass
+            h2 = {**h, "Range": "bytes=0-1023"}
+            r = await client.get(url, headers=h2)
             if r.status_code not in (200, 206):
                 return None
-            if len(r.content) < 64:
+            if len(r.content) < 32:
                 return None
             ctype = (r.headers.get("content-type") or "").lower()
-            if "text/html" in ctype or "text/plain" in ctype and len(r.content) < 500:
+            if "text/html" in ctype or "application/json" in ctype:
                 return None
-            # reject if body looks like HTML
-            head = r.content[:200].lstrip().lower()
-            if head.startswith(b"<!doctype") or head.startswith(b"<html"):
+            head = r.content[:120].lstrip().lower()
+            if head.startswith(b"<!doctype") or head.startswith(b"<html") or head.startswith(b"{"):
                 return None
             final = str(r.url)
             if not _is_playable_direct(final):
@@ -481,6 +490,8 @@ async def preflight_url(url: str, headers: Optional[dict] = None) -> Optional[st
     except Exception:
         return None
     return None
+
+
 
 
 async def collect_4k_mirrors(title: str, se: int = 0, ep: int = 0, limit: int = 12) -> List[dict]:
@@ -603,10 +614,10 @@ def _is_playable_direct(url: str) -> bool:
             return False
         # Allowed CDN / storage hosts (MovieBox-TUI priority list)
         good = (
-            "pixeldrain.", "workers.dev", "r2.dev", "cloudflarestorage",
+            "pixeldrain.", "pixeldrain.eu.cc", "workers.dev", "r2.dev", "cloudflarestorage",
             "googleusercontent.com", "storage.googleapis.com", "googleapis.com",
             "gofile.", "workupload.", "streamtape.", "pixel.",
-            "download.", "cdn.", "hubcloud.fans", "hubcloud.cx",
+            "download.", "cdn.", "hubcloud.fans", "hubcloud.cx", "hubcloud.ist",
         )
         if any(g in host for g in good):
             return True
@@ -1922,11 +1933,11 @@ async def api_play(
                 if path_id:
                     page = await fk_fetch(path_id)
                     releases = fk_parse_releases(page, se_use if media == "tv" else 0, ep_use if media == "tv" else 0)
-                    for rel in releases[:5]:
-                        if len(hub_links) >= 6:
+                    for rel in releases[:4]:
+                        if len(hub_links) >= 4:
                             break
                         for mir in rel.get("mirrors") or []:
-                            if len(hub_links) >= 6:
+                            if len(hub_links) >= 4:
                                 break
                             murl = mir.get("url") or ""
                             # HubCloud often masked behind greenmotors / short redirects
@@ -1948,11 +1959,13 @@ async def api_play(
                                 if not u or not _is_playable_direct(u):
                                     continue
                                 hdrs = L.get("headers") or {"User-Agent": FK_UA, "Referer": murl}
-                                # Pixeldrain → GameDrive CDN (no preflight needed)
-                                if "pixeldrain." in u or "pixeldra.in" in u:
-                                    bypass = _pixeldrain_api(u)
-                                    if bypass:
-                                        u = bypass
+                                # Pixeldrain → GameDrive CDN, verify live (skip dead IDs)
+                                if "pixeldrain." in u or "pixeldra.in" in u or "pixeldrain.eu.cc" in u:
+                                    bypass = _pixeldrain_api(u) or u
+                                    ok = await preflight_url(bypass, hdrs)
+                                    if not ok:
+                                        continue
+                                    u = ok  # final cdnXX.pixeldrain.eu.cc/api/file/ID
                                 else:
                                     ok = await preflight_url(u, hdrs)
                                     if not ok or not _is_playable_direct(ok):
@@ -2053,6 +2066,8 @@ SPA_HTML = r"""<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
 <script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/plyr@3.7.8/dist/plyr.css"/>
+<script src="https://cdn.jsdelivr.net/npm/plyr@3.7.8/dist/plyr.polyfilled.min.js"></script>
 <style>
 :root{
   --bg:#0e0e10;--bg2:#16161a;--card:#1c1c22;--line:#2a2a32;
@@ -2148,6 +2163,18 @@ img{display:block;max-width:100%}
 .dl-ico{width:40px;height:40px;border-radius:10px;background:rgba(0,164,220,.15);color:var(--a);display:flex;align-items:center;justify-content:center;font-size:1.1rem;flex-shrink:0}
 .dl-title{font-size:.88rem;font-weight:600;line-height:1.25}
 .dl-sub{font-size:.72rem;color:var(--mute);margin-top:3px}
+
+.player-shell{background:#0a0a0c;border-radius:14px;overflow:hidden;border:1px solid var(--line);box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.player-wrap{aspect-ratio:16/9;max-height:72vh;background:#000;position:relative}
+.plyr{height:100%}
+.plyr__video-wrapper{background:#000}
+.ext-panel{padding:16px 18px;background:linear-gradient(180deg,#14141a,#0e0e12);border-top:1px solid var(--line)}
+.ext-panel h4{font-size:.95rem;margin-bottom:6px}
+.ext-panel p{font-size:.82rem;color:var(--mute);line-height:1.45;margin-bottom:12px}
+.ext-actions{display:flex;flex-wrap:wrap;gap:8px}
+.ext-actions a,.ext-actions button{border-radius:10px;padding:10px 14px;font-weight:600;font-size:.85rem;border:1px solid var(--line);background:var(--card);cursor:pointer;color:var(--text)}
+.ext-actions a.primary,.ext-actions button.primary{background:var(--a);color:#041018;border-color:var(--a)}
+.fmt-tag{display:inline-block;font-size:.68rem;padding:2px 7px;border-radius:6px;background:rgba(0,164,220,.15);color:var(--a);margin-left:6px}
 </style></head>
 <body>
 <div class="app">
@@ -2249,34 +2276,68 @@ async function title(media,id){
 }
 let PS={sources:[],idx:0,se:1,ep:1};
 let dashPlayer=null;
-function destroyPlayer(){try{if(dashPlayer){dashPlayer.reset();dashPlayer=null}}catch(e){}}
+let plyrInst=null;
+function destroyPlayer(){
+  try{ if(dashPlayer){ dashPlayer.reset(); dashPlayer=null; } }catch(e){}
+  try{ if(plyrInst){ plyrInst.destroy(); plyrInst=null; } }catch(e){}
+}
+function isBrowserPlayable(url, format){
+  const u=(url||'').toLowerCase();
+  const f=(format||'').toLowerCase();
+  if(/\.mp4(\?|$)/i.test(u) || f==='mp4') return true;
+  if(/\.webm(\?|$)/i.test(u) || f==='webm') return true;
+  if(/\.m3u8(\?|$)/i.test(u) || f==='hls') return true;
+  if(/\.mpd(\?|$)/i.test(u) || f==='dash') return true;
+  // MKV/AVI often fail in HTML5 — still try, fallback panel if error
+  return false;
+}
 function renderP(){
-  const s=PS.sources[PS.idx];const f=document.getElementById('frame');
+  const s=PS.sources[PS.idx]; const f=document.getElementById('frame');
   if(!s){f.innerHTML='<div class="empty">No sources</div>';return}
   destroyPlayer();
   const play=s.play_url||s.url;
   const st=document.getElementById('st');
-  if(st) st.textContent=(PS.idx+1)+'/'+PS.sources.length+' · '+s.label;
+  if(st) st.innerHTML=(PS.idx+1)+'/'+PS.sources.length+' · '+esc(s.label)+(s.format?('<span class="fmt-tag">'+esc(s.format)+'</span>'):'');
   document.querySelectorAll('.src[data-i]').forEach((b,i)=>b.classList.toggle('on',i===PS.idx));
   const qsel=document.getElementById('qsel');
   if(qsel){qsel.innerHTML='';qsel.style.display='none'}
+  const ext=document.getElementById('extpanel');
+  if(ext) ext.innerHTML='';
+
   if(s.type==='embed'){
-    // sandbox reduces some popups; allow-scripts/same-origin needed for players
-    f.innerHTML=`<iframe src="${esc(play)}" allowfullscreen allow="autoplay;encrypted-media;picture-in-picture;fullscreen"
-      style="width:100%;height:100%;border:0;background:#000"></iframe>`;
+    f.innerHTML=`<iframe src="${esc(play)}" allowfullscreen allow="autoplay;encrypted-media;picture-in-picture;fullscreen" style="width:100%;height:100%;border:0;background:#000"></iframe>`;
     return;
   }
-  const isDash=/\\.mpd(\\?|$)/i.test(s.url||'')||/\\.mpd(\\?|$)/i.test(play)||(s.format||'').toUpperCase()==='DASH';
+
+  const isDash=/\\.mpd(\\?|$)/i.test(play)||/\\.mpd(\\?|$)/i.test(s.url||'')||(s.format||'').toUpperCase()==='DASH';
+  const tryNative=isBrowserPlayable(play,s.format)||isDash||/\\.mkv/i.test(play)||(s.format||'').toUpperCase()==='MKV'||(s.format||'').toUpperCase()==='FILE';
+
   f.innerHTML='';
   const v=document.createElement('video');
-  v.controls=true;v.autoplay=true;v.playsInline=true;v.setAttribute('playsinline','');
-  v.style.cssText='width:100%;height:100%;background:#000';
+  v.id='vmain'; v.playsInline=true; v.setAttribute('playsinline',''); v.setAttribute('crossorigin','anonymous');
+  v.controls=true; v.style.cssText='width:100%;height:100%;background:#000';
   f.appendChild(v);
-  if(isDash&&window.dashjs){
+
+  const showExt=()=>{
+    if(!ext) return;
+    ext.innerHTML=`<div class="ext-panel">
+      <h4>Advanced playback</h4>
+      <p>This file may use codecs (MKV / HEVC / DTS) that browsers block. Use an external player like <b>VLC</b>, <b>mpv</b>, or <b>PotPlayer</b> for full quality — same approach as MovieBox-TUI.</p>
+      <div class="ext-actions">
+        <a class="primary" href="${esc(play)}" target="_blank" rel="noopener">Open / Download file</a>
+        <button type="button" class="primary" onclick="navigator.clipboard.writeText('${esc(play).replace(/'/g,"\\'")}').then(()=>toast('Link copied — paste into VLC → Open Network Stream'))">Copy stream URL</button>
+        <button type="button" onclick="window.__nx()">Try next source</button>
+      </div>
+    </div>`;
+  };
+
+  if(isDash && window.dashjs){
     try{
       dashPlayer=dashjs.MediaPlayer().create();
-      dashPlayer.initialize(v,play,true);
-      dashPlayer.on(dashjs.MediaPlayer.events.ERROR,()=>{toast('Stream error — next');setTimeout(()=>window.__nx&&window.__nx(),800)});
+      dashPlayer.updateSettings({streaming:{abr:{autoSwitchBitrate:{video:true}},buffer:{fastSwitchEnabled:true}}});
+      dashPlayer.initialize(v, play, true);
+      if(window.Plyr){ try{ plyrInst=new Plyr(v,{controls:['play-large','play','progress','current-time','duration','mute','volume','settings','fullscreen'],settings:['quality','speed']}); }catch(e){} }
+      dashPlayer.on(dashjs.MediaPlayer.events.ERROR,()=>{toast('DASH error');showExt();});
       dashPlayer.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED,()=>{
         try{
           const bitrates=dashPlayer.getBitrateInfoListFor('video')||[];
@@ -2287,16 +2348,39 @@ function renderP(){
           }
         }catch(e){}
       });
-    }catch(e){window.__nx&&window.__nx()}
+    }catch(e){showExt();}
   }else{
     v.src=play;
-    v.onerror=()=>{window.__nx&&window.__nx()};
+    if(window.Plyr){
+      try{
+        plyrInst=new Plyr(v,{
+          controls:['play-large','play','progress','current-time','duration','mute','volume','settings','pip','fullscreen'],
+          settings:['speed'],
+          keyboard:{focused:true,global:true},
+          tooltips:{controls:true,seek:true},
+          autoplay:true
+        });
+      }catch(e){}
+    }else{
+      v.autoplay=true;
+    }
+    let erred=false;
+    v.addEventListener('error',()=>{if(erred)return;erred=true;toast('Browser cannot decode this file');showExt();});
+    // If MKV and no progress after 4s with readyState low
+    if(/\\.mkv/i.test(play)||(s.format||'').toUpperCase()==='MKV'){
+      setTimeout(()=>{
+        try{
+          if(v.readyState<2 && v.videoWidth===0){ showExt(); }
+        }catch(e){}
+      },4000);
+    }
   }
 }
-window.__nx=()=>{if(PS.idx<PS.sources.length-1){PS.idx++;toast('Next source…');renderP()}else toast('All sources failed')};
+window.__nx=
+()=>{if(PS.idx<PS.sources.length-1){PS.idx++;toast('Next source…');renderP()}else toast('All sources failed')};
 async function watch(media,id,se,ep){
   setNav('');PS={sources:[],idx:0,se:se||1,ep:ep||1};
-  root.innerHTML=`<div class="player-wrap"><div id="frame" class="empty">Loading stream…</div></div>
+  root.innerHTML=`<div class="player-shell"><div class="player-wrap"><div id="frame" class="empty">Loading stream…</div></div><div id="extpanel"></div></div>
     <div class="bar"><span id="st">…</span>
     <select id="qsel" class="se-select" style="display:none"></select>
     <button class="src" type="button" onclick="window.__nx()">Next source ↻</button>
