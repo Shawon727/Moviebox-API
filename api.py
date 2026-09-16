@@ -1000,7 +1000,7 @@ def fk_parse_releases(html: str, season: int = 0, episode: int = 0) -> List[dict
 
 @app.get("/health", tags=["Meta"])
 async def health():
-    return {"ok": True, "version": "5.1.0", "providers": ["tmdb", "videasy", "vidsrc", "vidking", "4khdhub", "hubcloud", "moviebox-api"]}
+    return {"ok": True, "version": "5.1.0", "providers": ["tmdb", "videasy", "vidsrc", "vidking", "4khdhub", "hubcloud", "ytmusic", "moviebox-api"]}
 
 
 # ----- Mov
@@ -2357,6 +2357,21 @@ img{display:block;max-width:100%}
   .m-grid{grid-template-columns:repeat(auto-fill,minmax(130px,1fr))}
   .side{display:none}
 }
+
+.api-table{display:flex;flex-direction:column;gap:8px}
+.api-row{display:grid;grid-template-columns:100px 1fr 1.2fr;gap:10px;align-items:center;padding:12px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;font-size:.85rem}
+.api-g{font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--a)}
+.api-e{font-size:.8rem;color:#e8e8f0;word-break:break-all}
+.api-d{color:var(--mute);font-size:.8rem}
+@media (max-width:860px){.api-row{grid-template-columns:1fr;gap:4px}}
+.side a.on{background:rgba(0,164,220,.15);color:var(--a)}
+
+.m-hero{margin-bottom:4px}
+.m-hero h1{font-size:1.6rem;margin:0 0 4px}
+.m-hero p{color:var(--mute);font-size:.88rem;margin:0 0 12px}
+.m-chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px}
+.chip{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:999px;padding:7px 14px;font-size:.8rem;cursor:pointer}
+.chip:hover{border-color:var(--a);color:var(--a)}
 </style></head>
 <body>
 <div class="app">
@@ -2366,10 +2381,11 @@ img{display:block;max-width:100%}
       <a href="#/" id="n-home">Home</a>
       <a href="#/movies" id="n-movies">Movies</a>
       <a href="#/series" id="n-series">Series</a>
+      <a href="#/music" id="n-music">Music</a>
       <a href="#/api" id="n-api">API Docs</a>
     </nav>
     <div style="flex:1"></div>
-    <div style="font-size:.72rem;color:var(--mute);padding:8px 12px;line-height:1.4">TMDB · Videasy · VidSrc · 4KHDHub<br/>MovieBox API → /mb/*</div>
+    <div style="font-size:.72rem;color:var(--mute);padding:8px 12px;line-height:1.4">TMDB · YT Music · 4KHDHub<br/>MovieBox → /mb/* · /docs</div>
   </aside>
   <div class="main">
     <div class="top">
@@ -2385,7 +2401,7 @@ const root=document.getElementById('root');
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function toast(m,ms=2800){let t=document.querySelector('.toast');if(!t){t=document.createElement('div');t.className='toast';document.body.appendChild(t)}t.textContent=m;clearTimeout(t._x);t._x=setTimeout(()=>t.remove(),ms)}
 async function api(path){const r=await fetch(path);if(!r.ok)throw new Error(path+' → '+r.status);return r.json()}
-function setNav(k){['home','movies','series','api'].forEach(id=>{const el=document.getElementById('n-'+id);if(el)el.classList.toggle('on',id===k)});document.getElementById('side').classList.remove('open')}
+function setNav(k){['home','movies','series','music','api'].forEach(id=>{const el=document.getElementById('n-'+id);if(el)el.classList.toggle('on',id===k)});const side=document.getElementById('side');if(side)side.classList.remove('open')}
 function card(it){
   const media=it.type==='tv'?'tv':'movie';
   const id=it.tmdb_id||it.id;
@@ -2394,14 +2410,19 @@ function card(it){
 }
 function row(title,items){if(!items||!items.length)return'';return `<section class="sec"><h2>${esc(title)}</h2><div class="row">${items.map(card).join('')}</div></section>`}
 
-async function musicHome(){
+async async function musicHome(){
   setNav('music');root.innerHTML='<div class="empty">Loading music…</div>';
   try{
     const d=await api('/music/home');
-    let h=`<div class="music-layout"><div class="m-search"><input id="mq" placeholder="Search songs, artists…" onkeydown="if(event.key==='Enter')musicSearch(this.value)"/><button class="btn" type="button" onclick="musicSearch(document.getElementById('mq').value)">Search</button></div>`;
+    const chips=['Arijit Singh','Taylor Swift','Queen','Lo-fi','BTS','Ed Sheeran','Bollywood','Hip Hop'];
+    let h=`<div class="music-layout">
+      <div class="m-hero"><h1>Music</h1><p>YouTube Music · search & play — inspired by SimpMusic</p></div>
+      <div class="m-search"><input id="mq" placeholder="Search songs, artists, albums…" onkeydown="if(event.key==='Enter')musicSearch(this.value)"/><button class="btn" type="button" onclick="musicSearch(document.getElementById('mq').value)">Search</button></div>
+      <div class="m-chips">${chips.map(c=>`<button type="button" class="chip" onclick="musicSearch('${c}')">${c}</button>`).join('')}</div>`;
     for(const sec of (d.sections||[])){
       h+=`<section class="sec"><h2>${esc(sec.title)}</h2><div class="m-grid">${(sec.items||[]).map(musicCard).join('')||'<p class="empty">Empty</p>'}</div></section>`;
     }
+    if(!(d.sections||[]).length) h+=`<p class="empty">No sections — try search</p>`;
     h+='</div>';
     root.innerHTML=h;
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
@@ -2412,7 +2433,7 @@ function musicCard(s){
     <div class="mi"><div class="mt">${esc(s.title)}</div><div class="ma">${esc(s.artist||'YouTube Music')}</div></div>
   </div>`;
 }
-async function musicSearch(q){
+async async function musicSearch(q){
   q=(q||'').trim(); if(!q) return;
   setNav('music');root.innerHTML='<div class="empty">Searching…</div>';
   try{
@@ -2657,19 +2678,31 @@ async function watch(media,id,se,ep){
 }
 async function apiDocs(){
   setNav('api');
-  root.innerHTML=`<section class="sec"><h2>API reference</h2>
-  <p style="color:var(--mute);margin-bottom:14px;line-height:1.5">Web UI uses <b>TMDB + Videasy/VidSrc/Vidking + 4KHDHub</b>. MovieBox remains available as a pure API under <code>/mb/*</code>.</p>
-  <div class="grid" style="grid-template-columns:1fr;gap:10px;font-size:.88rem">
-    <div class="src" style="cursor:default"><b>GET /api/home</b> — TMDB trending rows</div>
-    <div class="src" style="cursor:default"><b>GET /api/search?q=</b> — TMDB multi-search</div>
-    <div class="src" style="cursor:default"><b>GET /api/detail/{movie|tv}/{tmdb_id}</b> — details + seasons</div>
-    <div class="src" style="cursor:default"><b>GET /api/play?tmdb_id=&media=&se=&ep=</b> — embeds + 4K list</div>
-    <div class="src" style="cursor:default"><b>GET /mb/search?q=</b> — MovieBox search (API only)</div>
-    <div class="src" style="cursor:default"><b>GET /mb/stream/{subject_id}?se=&ep=</b> — MovieBox DASH + cookies</div>
-    <div class="src" style="cursor:default"><b>GET /fk/search?q=</b> · <b>/fk/stream</b> — 4KHDHub</div>
-    <div class="src" style="cursor:default"><b>GET /tools/resolve?url=</b> — HubCloud → direct</div>
-    <div class="src" style="cursor:default"><b>GET /docs</b> — OpenAPI Swagger</div>
-  </div></section>`;
+  const rows=[
+    ['Catalog','GET /api/home','TMDB home rows (trending, popular, …)'],
+    ['Catalog','GET /api/movies?page=','Movies grid + pagination'],
+    ['Catalog','GET /api/series?page=','Series grid + pagination'],
+    ['Catalog','GET /api/search?q=','TMDB multi-search'],
+    ['Catalog','GET /api/detail/{movie|tv}/{id}','Details + seasons'],
+    ['Catalog','GET /api/tv/{id}/season/{n}','Episode list'],
+    ['Stream','GET /api/play?tmdb_id=&media=&se=&ep=','Videasy/VidSrc + 4K/Pixeldrain'],
+    ['Music','GET /music/home','YT Music curated sections'],
+    ['Music','GET /music/search?q=','YT Music search (SimpMusic-style)'],
+    ['Music','GET /music/play/{video_id}','Embed sources + metadata'],
+    ['4K','GET /fk/search?q=','4KHDHub search'],
+    ['4K','GET /fk/stream?q=','4K releases + mirrors'],
+    ['Tools','GET /tools/resolve?url=','HubCloud / greenmotors → direct'],
+    ['MovieBox','GET /mb/search?q=','MovieBox search (API only)'],
+    ['MovieBox','GET /mb/stream/{subject_id}','MovieBox DASH + cookies'],
+    ['Meta','GET /health','Health + providers'],
+    ['Meta','GET /docs','Swagger OpenAPI UI'],
+    ['Meta','GET /site or /','This SPA'],
+  ];
+  root.innerHTML=`<section class="sec"><h2>API Docs</h2>
+  <p style="color:var(--mute);margin-bottom:16px;line-height:1.55">Full interactive docs: <a href="/docs" target="_blank" style="color:var(--a)">/docs</a> (Swagger). Web UI: TMDB + embeds + 4K. Music: YouTube Music. MovieBox under <code>/mb/*</code> only.</p>
+  <div class="api-table">${rows.map(([g,e,d])=>`<div class="api-row"><span class="api-g">${g}</span><code class="api-e">${e}</code><span class="api-d">${d}</span></div>`).join('')}</div>
+  <p style="margin-top:18px"><a class="btn" href="/docs" target="_blank">Open Swagger →</a></p>
+  </section>`;
 }
 async function router(){
   const h=location.hash.slice(1)||'/';const [path,qs]=h.split('?');
@@ -2689,7 +2722,15 @@ async function router(){
 }
 window.addEventListener('hashchange',router);
 router();
-</script></body></html>
+</script>
+<div id="nowbar" class="now-bar">
+  <img id="nowthumb" alt=""/>
+  <div class="now-meta"><div class="t" id="nowtitle">—</div><div class="a" id="nowartist"></div></div>
+  <div class="now-player" id="nowplayer"></div>
+  <div class="now-actions"><button class="src" type="button" onclick="closeMusic()">✕</button></div>
+</div>
+<div id="toast"></div>
+</body></html>
 """
 
 
