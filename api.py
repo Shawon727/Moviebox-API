@@ -395,44 +395,60 @@ FK_UA = (
 )
 
 
-def _pixeldrain_api(url: str) -> Optional[str]:
+def _pixeldrain_file_id(url: str) -> Optional[str]:
     try:
         p = urlparse(url)
-        if "pixeldrain." not in (p.hostname or ""):
+        host = (p.hostname or "").lower()
+        if "pixeldrain." not in host and "pixeldra.in" not in host and "pixeldrain.eu.cc" not in host:
             return None
-        path = p.path
-        if path.startswith("/u/"):
-            fid = path[3:].strip("/")
-        elif path.startswith("/api/file/"):
-            fid = path[len("/api/file/") :].strip("/")
+        path = p.path or ""
+        fid = None
+        if "/u/" in path:
+            fid = path.split("/u/")[-1].strip("/").split("/")[0]
+        elif "/api/file/" in path:
+            fid = path.split("/api/file/")[-1].strip("/").split("/")[0].split("?")[0]
         else:
-            return None
-        if not fid or not re.match(r"^[\w\-]+$", fid):
-            return None
-        host = p.hostname
-        return f"https://{host}/api/file/{fid}?download"
+            # bare /{id} on bypass CDN
+            parts = [x for x in path.split("/") if x]
+            if len(parts) == 1 and re.match(r"^[\w\-]+$", parts[0]):
+                fid = parts[0]
+        if fid and re.match(r"^[\w\-]+$", fid):
+            return fid
     except Exception:
         return None
+    return None
+
+
+def _pixeldrain_api(url: str) -> Optional[str]:
+    """Prefer GameDrive bypass CDN for direct play/download."""
+    fid = _pixeldrain_file_id(url)
+    if not fid:
+        return None
+    # gamedrive bypass — streams with Accept-Ranges
+    return f"https://cdn.pixeldrain.eu.cc/{fid}"
+
 
 def _pixeldrain_bypass_urls(api_url: str) -> List[str]:
-    """Alternate hosts that often work when pixeldrain rate-limits hotlinking."""
-    urls = [api_url]
-    try:
-        p = urlparse(api_url)
-        fid = p.path.split("/api/file/")[-1].split("?")[0].strip("/")
-        if fid:
-            # common community bypass / mirror patterns
-            urls.append(f"https://pixeldrain.com/api/file/{fid}?download")
-            urls.append(f"https://pixeldrain.dev/api/file/{fid}?download")
-    except Exception:
-        pass
-    # dedupe
+    """GameDrive / pixeldrain-bypass.gamedrive.org CDN first, then official API."""
+    fid = _pixeldrain_file_id(api_url)
+    if not fid:
+        # try extract from any url string
+        m = re.search(r"(?:pixeldrain\.[a-z.]+/(?:u|api/file)/|cdn\.pixeldrain\.eu\.cc/)([\w\-]+)", api_url or "")
+        fid = m.group(1) if m else None
+    urls = []
+    if fid:
+        urls.append(f"https://cdn.pixeldrain.eu.cc/{fid}")
+        urls.append(f"https://pixeldrain.com/api/file/{fid}?download")
+        urls.append(f"https://pixeldrain.dev/api/file/{fid}?download")
+    if api_url and api_url not in urls:
+        urls.append(api_url)
     out, seen = [], set()
     for u in urls:
-        if u not in seen:
+        if u and u not in seen:
             seen.add(u)
             out.append(u)
     return out
+
 
 
 async def preflight_url(url: str, headers: Optional[dict] = None) -> Optional[str]:
@@ -1723,9 +1739,6 @@ async def api_movies(page: int = 1):
 
 @app.get("/api/series", tags=["Catalog"])
 async def api_series(page: int = 1):
-    d = await _tmdb_get("/tv/popular", {"page": page})
-    items = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "tv"))]
-async def api_series(page: int = 1):
     d = await _tmdb_get("/tv/popular", {"page": max(1, page)})
     items = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "tv"))]
     return {
@@ -1909,11 +1922,11 @@ async def api_play(
                 if path_id:
                     page = await fk_fetch(path_id)
                     releases = fk_parse_releases(page, se_use if media == "tv" else 0, ep_use if media == "tv" else 0)
-                    for rel in releases[:10]:
-                        if len(hub_links) >= 10:
+                    for rel in releases[:5]:
+                        if len(hub_links) >= 6:
                             break
                         for mir in rel.get("mirrors") or []:
-                            if len(hub_links) >= 10:
+                            if len(hub_links) >= 6:
                                 break
                             murl = mir.get("url") or ""
                             # HubCloud often masked behind greenmotors / short redirects
@@ -1934,17 +1947,17 @@ async def api_play(
                                 u = L.get("url") or ""
                                 if not u or not _is_playable_direct(u):
                                     continue
-                                candidates = _pixeldrain_bypass_urls(u) if "pixeldrain." in u else [u]
-                                ok = None
                                 hdrs = L.get("headers") or {"User-Agent": FK_UA, "Referer": murl}
-                                for cand in candidates:
-                                    ok = await preflight_url(cand, hdrs)
-                                    if ok and _is_playable_direct(ok):
-                                        u = ok
-                                        break
-                                    ok = None
-                                if not ok:
-                                    continue
+                                # Pixeldrain → GameDrive CDN (no preflight needed)
+                                if "pixeldrain." in u or "pixeldra.in" in u:
+                                    bypass = _pixeldrain_api(u)
+                                    if bypass:
+                                        u = bypass
+                                else:
+                                    ok = await preflight_url(u, hdrs)
+                                    if not ok or not _is_playable_direct(ok):
+                                        continue
+                                    u = ok
                                 low = u.lower()
                                 fmt = "MP4" if ".mp4" in low else ("MKV" if ".mkv" in low else "FILE")
                                 hub_links.append({
@@ -1964,7 +1977,8 @@ async def api_play(
         u = (s.get("url") or "").lower()
         lab = (s.get("label") or "").lower()
         fmt = (s.get("format") or "").lower()
-        if "pixeldrain" in u or "pixeldrain" in lab: return 0
+        if "cdn.pixeldrain.eu.cc" in u: return 0
+        if "pixeldrain" in u or "pixeldrain" in lab: return 1
         if ".mp4" in u or fmt == "mp4": return 1
         if "workers.dev" in u: return 2
         if ".mkv" in u or fmt == "mkv": return 4
@@ -1991,6 +2005,28 @@ async def api_play(
         seen.add(u)
         uniq.append(s)
 
+    downloads = []
+    for h in hub_links:
+        u = h.get("url") or ""
+        downloads.append({
+            "label": h.get("label") or "Download",
+            "url": u,
+            "format": h.get("format") or "FILE",
+            "quality": h.get("quality") or "",
+            "filename": h.get("filename") or "",
+        })
+    # also expose embed-less direct sources as downloads
+    for s in uniq:
+        if s.get("type") == "direct" and s.get("url"):
+            if not any(d["url"] == s["url"] for d in downloads):
+                downloads.append({
+                    "label": s.get("label") or "File",
+                    "url": s["url"],
+                    "format": s.get("format") or "FILE",
+                    "quality": "",
+                    "filename": "",
+                })
+
     return {
         "tmdb_id": tid,
         "media": media,
@@ -2000,9 +2036,10 @@ async def api_play(
         "count": len(uniq),
         "sources": uniq,
         "hub_links": hub_links,
+        "downloads": downloads,
         "errors": errors or None,
-        "strategy": "videasy/vidsrc/vidking embeds → 4khdhub/hubcloud/pixeldrain",
-        "note": "MovieBox streams are available via /mb/stream API only (not on web UI).",
+        "strategy": "videasy/vidsrc/vidking → 4khdhub + pixeldrain-bypass (cdn.pixeldrain.eu.cc)",
+        "note": "Pixeldrain via GameDrive CDN for direct play/download. MovieBox API: /mb/*",
     }
 
 
@@ -2102,6 +2139,15 @@ img{display:block;max-width:100%}
   .pager{width:100%;justify-content:space-between}
   .brand{font-size:1.05rem}
 }
+
+.dlbox{margin-top:18px}
+.dlbox h3,.hubbox h3{font-size:.8rem;color:var(--mute);margin-bottom:10px;text-transform:uppercase;letter-spacing:.06em}
+.dl-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}
+.dl-card{display:flex;gap:12px;align-items:center;padding:12px 14px;background:linear-gradient(145deg,#1a1a22,#141418);border:1px solid var(--line);border-radius:12px;transition:border-color .15s,transform .15s}
+.dl-card:hover{border-color:var(--a);transform:translateY(-2px)}
+.dl-ico{width:40px;height:40px;border-radius:10px;background:rgba(0,164,220,.15);color:var(--a);display:flex;align-items:center;justify-content:center;font-size:1.1rem;flex-shrink:0}
+.dl-title{font-size:.88rem;font-weight:600;line-height:1.25}
+.dl-sub{font-size:.72rem;color:var(--mute);margin-top:3px}
 </style></head>
 <body>
 <div class="app">
@@ -2217,8 +2263,6 @@ function renderP(){
   if(s.type==='embed'){
     // sandbox reduces some popups; allow-scripts/same-origin needed for players
     f.innerHTML=`<iframe src="${esc(play)}" allowfullscreen allow="autoplay;encrypted-media;picture-in-picture;fullscreen"
-      referrerpolicy="no-referrer" loading="eager"
-      sandbox="allow-scripts allow-same-origin allow-presentation allow-forms allow-popups-to-escape-sandbox"
       style="width:100%;height:100%;border:0;background:#000"></iframe>`;
     return;
   }
@@ -2270,9 +2314,23 @@ async function watch(media,id,se,ep){
     const hubs=PS.sources.map((s,i)=>({s,i})).filter(x=>x.s.provider==='4khdhub');
     const hubEl=document.getElementById('hublist');
     if(hubEl){
-      hubEl.innerHTML=hubs.length
-        ? `<div class="hubbox"><h3>4K / HubCloud / Pixeldrain (working links)</h3>${hubs.map(({s,i})=>`<button type="button" class="src" onclick="PS.idx=${i};renderP()">▶ ${esc(s.label)}</button>`).join('')}</div>`
-        : '';
+      let html='';
+      if(hubs.length){
+        html+=`<div class="hubbox"><h3>4K / Hub / Pixeldrain — Play</h3>${hubs.map(({s,i})=>`<button type="button" class="src" onclick="PS.idx=${i};renderP()">▶ ${esc(s.label)}</button>`).join('')}</div>`;
+      }
+      const dls=d.downloads||hubs.map(x=>x.s);
+      if(dls.length){
+        html+=`<div class="dlbox"><h3>Download</h3><div class="dl-grid">${dls.map(s=>{
+          const u=s.url||s.play_url||'';
+          const lab=s.label||'File';
+          const fmt=s.format||'';
+          return `<a class="dl-card" href="${esc(u)}" target="_blank" rel="noopener" download>
+            <div class="dl-ico">⬇</div>
+            <div class="dl-meta"><div class="dl-title">${esc(lab)}</div><div class="dl-sub">${esc(fmt)}${s.filename?(' · '+esc(String(s.filename).slice(0,40))):''}</div></div>
+          </a>`;
+        }).join('')}</div></div>`;
+      }
+      hubEl.innerHTML=html;
     }
     if(d.note) toast(d.note,3500);
     renderP();
