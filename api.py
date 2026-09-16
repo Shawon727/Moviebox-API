@@ -1000,7 +1000,7 @@ def fk_parse_releases(html: str, season: int = 0, episode: int = 0) -> List[dict
 
 @app.get("/health", tags=["Meta"])
 async def health():
-    return {"ok": True, "version": "5.1.0", "providers": ["tmdb", "videasy", "vidsrc", "vidking", "4khdhub", "hubcloud", "ytmusic", "moviebox-api"]}
+    return {"ok": True, "version": "5.2.0", "providers": ["tmdb", "videasy", "vidsrc", "vidking", "4khdhub", "hubcloud", "ytmusic", "moviebox-api"]}
 
 
 # ----- Mov
@@ -2285,20 +2285,19 @@ async def music_search(q: str = Query(..., min_length=1)):
 
 @app.get("/music/home", tags=["Music"])
 async def music_home():
-    """Home rows — Saavn charts + YT Music curated searches."""
+    """Home rows — limited seeds to keep memory/CPU low on small hosts."""
     seeds = [
         ("Trending India", "trending hindi songs"),
         ("Bollywood Hits", "bollywood hits"),
         ("Punjabi", "punjabi hits"),
-        ("English Pop", "top pop songs"),
-        ("Lo-fi", "lofi beats"),
+        ("English Pop", "top pop english"),
     ]
     sections = []
     for title, q in seeds:
         try:
-            items = await _saavn_search(q, 12)
+            items = await _saavn_search(q, 8)
             if items:
-                sections.append({"title": title, "items": items, "source": "jiosaavn"})
+                sections.append({"title": title, "items": items[:8], "source": "jiosaavn"})
         except Exception:
             continue
     if not sections:
@@ -2494,9 +2493,22 @@ async def music_lyrics(
 
 
 
+
+
+@app.get("/music/related", tags=["Music"])
+async def music_related(q: str = Query(..., min_length=1), limit: int = 8):
+    """Recommended / similar songs (JioSaavn search around query)."""
+    limit = max(1, min(12, limit))
+    try:
+        items = await _saavn_search(q, limit + 4)
+        return {"query": q, "items": items[:limit], "provider": "jiosaavn"}
+    except Exception as e:
+        return {"query": q, "items": [], "error": str(e)}
+
+
 @app.api_route("/music/stream/{token}", methods=["GET", "HEAD"], tags=["Music"])
 async def music_stream_proxy(token: str, request: Request):
-    """Proxy Saavn/YT audio so browser can play (Range + CORS)."""
+    """Proxy Saavn audio with streaming (low memory) + Range + CORS."""
     try:
         meta = _b64url_decode(token)
     except Exception:
@@ -2513,15 +2525,29 @@ async def music_stream_proxy(token: str, request: Request):
     range_h = request.headers.get("range") if request else None
     if range_h:
         headers["Range"] = range_h
-    async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-        try:
-            if request.method == "HEAD":
-                upstream = await client.head(url, headers=headers)
-            else:
-                upstream = await client.get(url, headers=headers)
-        except Exception as e:
-            raise HTTPException(502, f"stream proxy: {e}")
+
+    client = httpx.AsyncClient(follow_redirects=True, timeout=60.0)
+    try:
+        if request.method == "HEAD":
+            upstream = await client.head(url, headers=headers)
+            out_headers = {
+                "cache-control": "no-store",
+                "access-control-allow-origin": "*",
+                "access-control-expose-headers": "Content-Length, Content-Range, Accept-Ranges",
+                "accept-ranges": upstream.headers.get("accept-ranges") or "bytes",
+            }
+            for k in ("content-type", "content-length", "content-range"):
+                if k in upstream.headers:
+                    out_headers[k] = upstream.headers[k]
+            media = (upstream.headers.get("content-type") or "audio/mp4").split(";")[0]
+            await client.aclose()
+            return Response(status_code=upstream.status_code, headers=out_headers, media_type=media)
+
+        req = client.build_request("GET", url, headers=headers)
+        upstream = await client.send(req, stream=True)
         if upstream.status_code >= 400:
+            await upstream.aclose()
+            await client.aclose()
             raise HTTPException(upstream.status_code, f"upstream {upstream.status_code}")
         out_headers = {
             "cache-control": "no-store",
@@ -2533,14 +2559,29 @@ async def music_stream_proxy(token: str, request: Request):
             if k in upstream.headers:
                 out_headers[k] = upstream.headers[k]
         media = (upstream.headers.get("content-type") or "audio/mp4").split(";")[0]
-        if request.method == "HEAD":
-            return Response(status_code=upstream.status_code, headers=out_headers, media_type=media)
-        return Response(
-            content=upstream.content,
+
+        async def body_iter():
+            try:
+                async for chunk in upstream.aiter_bytes(65536):
+                    yield chunk
+            finally:
+                await upstream.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            body_iter(),
             status_code=upstream.status_code,
             media_type=media,
             headers=out_headers,
         )
+    except HTTPException:
+        raise
+    except Exception as e:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        raise HTTPException(502, f"stream proxy: {e}")
 
 
 def _music_proxy_url(audio_url: str) -> str:
@@ -2788,6 +2829,11 @@ img{display:block;max-width:100%}
   .side{padding:20px 14px}
 }
 .player-wrap iframe{width:100%;height:100%;border:0;display:block}
+
+.sm-vol{display:flex;align-items:center;gap:10px;width:100%;max-width:320px;margin:0 auto}
+.sm-vol input{flex:1;accent-color:var(--a)}
+.sm-btn.on{border-color:var(--a);color:var(--a);background:rgba(0,164,220,.12)}
+.sm-extra .btn{min-width:120px;justify-content:center}
 </style></head>
 <body>
 <div class="app">
@@ -2829,15 +2875,18 @@ function row(title,items){if(!items||!items.length)return'';return `<section cla
 
 
 
-let MSTATE={id:'',vid:'',title:'',artist:'',thumb:'',audioUrl:null,lines:[]};
+
+
+
+let MSTATE={id:'',vid:'',title:'',artist:'',thumb:'',audioUrl:null,lines:[],queue:[],qIdx:0,loop:'off',shuffle:false};
 
 async function musicHome(){
   setNav('music');root.innerHTML='<div class="empty">Loading music…</div>';
   try{
     const d=await api('/music/home');
-    const chips=['Arijit Singh','Taylor Swift','Saiyaara','Lo-fi','BTS','Ed Sheeran','Bollywood','Punjabi','Rahman','Shreya Ghoshal'];
+    const chips=['Arijit Singh','Shubh','Saiyaara','Lo-fi','Bollywood','Punjabi','Taylor Swift','Rahman'];
     let h=`<div class="music-layout">
-      <div class="m-hero"><h1>♪ Music</h1><p>JioSaavn · YouTube Music · synced lyrics</p></div>
+      <div class="m-hero"><h1>♪ Music</h1><p>JioSaavn · synced lyrics · queue · loop</p></div>
       <div class="m-search"><input id="mq" placeholder="Search songs, artists…" onkeydown="if(event.key==='Enter')musicSearch(this.value)"/><button class="btn" type="button" onclick="musicSearch(document.getElementById('mq').value)">Search</button></div>
       <div class="m-chips">${chips.map(c=>`<button type="button" class="chip" onclick="musicSearch('${c}')">${c}</button>`).join('')}</div>`;
     for(const sec of (d.sections||[])){
@@ -2860,8 +2909,10 @@ async function musicSearch(q){
   setNav('music');root.innerHTML='<div class="empty">Searching…</div>';
   try{
     const d=await api('/music/search?q='+encodeURIComponent(q));
+    const items=d.items||[];
+    MSTATE.queue=items.slice(0,30);
     root.innerHTML=`<div class="music-layout"><div class="m-search"><input id="mq" value="${esc(q)}" onkeydown="if(event.key==='Enter')musicSearch(this.value)"/><button class="btn" type="button" onclick="musicSearch(document.getElementById('mq').value)">Search</button></div>
-      <section class="sec"><h2>Results · ${(d.items||[]).length}</h2><div class="m-grid">${(d.items||[]).map(musicCard).join('')||'<p class="empty">No results</p>'}</div></section></div>`;
+      <section class="sec"><h2>Results · ${items.length}</h2><div class="m-grid">${items.map(musicCard).join('')||'<p class="empty">No results</p>'}</div></section></div>`;
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
 function fmtTime(s){s=Math.floor(s||0);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')}
@@ -2876,18 +2927,55 @@ function renderSyncLyrics(t){
   const on=box.querySelector('.lrc-line.on');
   if(on) try{on.scrollIntoView({block:'center',behavior:'smooth'})}catch(e){}
 }
+function cycleLoop(){
+  MSTATE.loop=MSTATE.loop==='off'?'one':(MSTATE.loop==='one'?'all':'off');
+  const b=document.getElementById('sm-loop');
+  if(b){b.textContent=MSTATE.loop==='off'?'🔁':(MSTATE.loop==='one'?'🔂':'🔁');b.classList.toggle('on',MSTATE.loop!=='off');b.title='Loop: '+MSTATE.loop}
+  toast('Loop: '+MSTATE.loop);
+}
+function toggleShuffle(){
+  MSTATE.shuffle=!MSTATE.shuffle;
+  const b=document.getElementById('sm-shuffle');
+  if(b) b.classList.toggle('on',MSTATE.shuffle);
+  toast(MSTATE.shuffle?'Shuffle on':'Shuffle off');
+}
+function musicNext(){
+  if(!MSTATE.queue||!MSTATE.queue.length){toast('No queue');return}
+  if(MSTATE.shuffle){
+    MSTATE.qIdx=Math.floor(Math.random()*MSTATE.queue.length);
+  }else{
+    MSTATE.qIdx=(MSTATE.qIdx+1)%MSTATE.queue.length;
+  }
+  const it=MSTATE.queue[MSTATE.qIdx];
+  if(it) location.hash='#/music/play/'+encodeURIComponent(it.id||it.video_id||'');
+}
+function musicPrev(){
+  if(!MSTATE.queue||!MSTATE.queue.length){toast('No queue');return}
+  MSTATE.qIdx=(MSTATE.qIdx-1+MSTATE.queue.length)%MSTATE.queue.length;
+  const it=MSTATE.queue[MSTATE.qIdx];
+  if(it) location.hash='#/music/play/'+encodeURIComponent(it.id||it.video_id||'');
+}
 async function musicPlayPage(rawId){
   const id=decodeURIComponent(rawId||'');
   setNav('music');
   root.innerHTML='<div class="empty">Loading player…</div>';
-  let title=id, artist='', thumb='', audioUrl=null, duration=null, videoId=null;
+  let title=id, artist='', thumb='', audioUrl=null, duration=null, videoId=null, downloadUrl=null;
   try{
     const d=await api('/music/play/'+encodeURIComponent(id));
     title=d.title||title; artist=d.artist||''; thumb=d.thumb||'';
     audioUrl=d.play_url||d.audio_url||null; duration=d.duration||null; videoId=d.video_id||null;
+    downloadUrl=d.audio_url||d.download_url||null;
     if(!audioUrl&&d.sources){const a=(d.sources||[]).find(s=>s.type==='audio');if(a)audioUrl=a.play_url||a.url}
-  }catch(e){toast('Stream failed: '+e.message)}
-  MSTATE={id,vid:videoId,title,artist,thumb,audioUrl,lines:[]};
+  }catch(e){toast('Stream failed: '+(e.message||e))}
+  // queue index
+  if(MSTATE.queue&&MSTATE.queue.length){
+    const ix=MSTATE.queue.findIndex(x=>(x.id||x.video_id)===id);
+    if(ix>=0) MSTATE.qIdx=ix;
+  }else{
+    MSTATE.queue=[{id,title,artist,thumb}];
+    MSTATE.qIdx=0;
+  }
+  MSTATE={...MSTATE,id,vid:videoId,title,artist,thumb,audioUrl,lines:[]};
 
   root.innerHTML=`<div class="sm-player">
     <div class="sm-art-wrap">${thumb?`<img class="sm-art" src="${esc(thumb)}" alt=""/>`:'<div class="sm-art"></div>'}</div>
@@ -2900,19 +2988,25 @@ async function musicPlayPage(rawId){
       <input type="range" id="sm-seek" min="0" max="1000" value="0"/>
       <div class="sm-time"><span id="sm-cur">0:00</span><span id="sm-dur">${duration?fmtTime(duration):'—:—'}</span></div>
     </div>
-    <div class="sm-controls">
-      <button type="button" class="sm-btn" onclick="location.hash='#/music'" title="Library">☰</button>
-      <button type="button" class="sm-btn" id="sm-prev" title="Prev">⏮</button>
-      <button type="button" class="sm-btn sm-play" id="sm-toggle" title="Play">▶</button>
-      <button type="button" class="sm-btn" id="sm-next" title="Next">⏭</button>
-      <a class="sm-btn" id="sm-dl" href="${esc(audioUrl||'#')}" download title="Download">⬇</a>
+    <div class="sm-vol">
+      <span>🔊</span>
+      <input type="range" id="sm-vol" min="0" max="100" value="100"/>
     </div>
-    <audio id="sm-audio" preload="auto"></audio>
+    <div class="sm-controls">
+      <button type="button" class="sm-btn" id="sm-shuffle" onclick="toggleShuffle()" title="Shuffle">🔀</button>
+      <button type="button" class="sm-btn" id="sm-prev" onclick="musicPrev()" title="Previous">⏮</button>
+      <button type="button" class="sm-btn sm-play" id="sm-toggle" title="Play">▶</button>
+      <button type="button" class="sm-btn" id="sm-next" onclick="musicNext()" title="Next">⏭</button>
+      <button type="button" class="sm-btn" id="sm-loop" onclick="cycleLoop()" title="Loop">🔁</button>
+    </div>
+    <audio id="sm-audio" preload="metadata"></audio>
     <div class="sm-extra">
-      ${videoId?`<a class="btn ghost" href="https://music.youtube.com/watch?v=${esc(videoId)}" target="_blank" rel="noopener">YT Music</a>`:''}
-      <button class="btn ghost" type="button" onclick="navigator.clipboard.writeText(MSTATE.audioUrl||location.href).then(()=>toast('Link copied'))">Copy stream</button>
+      <a class="btn" id="sm-dl" href="${esc(downloadUrl||audioUrl||'#')}" target="_blank" rel="noopener" download>⬇ Download</a>
+      <button class="btn ghost" type="button" onclick="navigator.clipboard.writeText(location.origin+(MSTATE.audioUrl||'')).then(()=>toast('Stream link copied'))">Copy stream</button>
+      <button class="btn ghost" type="button" onclick="location.hash='#/music'">Library</button>
     </div>
     <div class="m-lyrics"><h3>Lyrics</h3><div id="mp-lyrics" class="lrc-box">Loading lyrics…</div></div>
+    <section class="sec" id="sm-rec"><h2>Recommended</h2><div class="empty">Loading…</div></section>
   </div>`;
 
   const bar=document.getElementById('nowbar');
@@ -2927,6 +3021,7 @@ async function musicPlayPage(rawId){
   const audio=document.getElementById('sm-audio');
   const toggle=document.getElementById('sm-toggle');
   const seek=document.getElementById('sm-seek');
+  const vol=document.getElementById('sm-vol');
   let seeking=false;
 
   if(audioUrl){
@@ -2934,16 +3029,15 @@ async function musicPlayPage(rawId){
     audio.play().then(()=>{toggle.textContent='⏸'}).catch(()=>{toast('Tap ▶ to play')});
   }else if(videoId){
     document.querySelector('.sm-art-wrap').innerHTML=`<div class="yt" style="aspect-ratio:16/9;width:100%;border-radius:12px;overflow:hidden"><iframe src="https://www.youtube.com/embed/${esc(videoId)}?autoplay=1&rel=0" allow="autoplay;encrypted-media" allowfullscreen style="width:100%;height:100%;border:0"></iframe></div>`;
-    toast('Using YouTube player (direct audio blocked)');
-  }else{
-    toast('No playable stream');
-  }
+    toast('Using YouTube player');
+  }else toast('No playable stream');
 
   toggle.onclick=()=>{
     if(!audio.src) return;
     if(audio.paused){audio.play();toggle.textContent='⏸'}
     else{audio.pause();toggle.textContent='▶'}
   };
+  if(vol) vol.oninput=()=>{audio.volume=(+vol.value)/100};
   audio.addEventListener('timeupdate',()=>{
     if(seeking||!audio.duration) return;
     seek.value=Math.floor((audio.currentTime/audio.duration)*1000);
@@ -2951,13 +3045,18 @@ async function musicPlayPage(rawId){
     document.getElementById('sm-dur').textContent=fmtTime(audio.duration);
     renderSyncLyrics(audio.currentTime);
   });
-  audio.addEventListener('ended',()=>{toggle.textContent='▶'});
+  audio.addEventListener('ended',()=>{
+    if(MSTATE.loop==='one'){audio.currentTime=0;audio.play();return}
+    if(MSTATE.loop==='all'||(MSTATE.queue&&MSTATE.queue.length>1)){musicNext();return}
+    toggle.textContent='▶';
+  });
   seek.addEventListener('input',()=>{seeking=true});
   seek.addEventListener('change',()=>{
     if(audio.duration) audio.currentTime=(seek.value/1000)*audio.duration;
     seeking=false;
   });
 
+  // lyrics
   try{
     const L=await api('/music/lyrics?title='+encodeURIComponent(title)+'&artist='+encodeURIComponent(artist||''));
     const el=document.getElementById('mp-lyrics');
@@ -2966,20 +3065,36 @@ async function musicPlayPage(rawId){
       renderSyncLyrics(0);
     }else if(L.found&&(L.lyrics||L.synced)){
       el.innerHTML='<pre style="white-space:pre-wrap;font:inherit;color:inherit;margin:0">'+esc(L.lyrics||L.synced)+'</pre>';
-    }else{
-      el.textContent='No lyrics found';
-    }
+    }else el.textContent='No lyrics found';
     if(L.title) document.getElementById('mp-title').textContent=L.title;
     if(L.artist) document.getElementById('mp-artist').textContent=L.artist;
   }catch(e){
     const el=document.getElementById('mp-lyrics');
     if(el) el.textContent='Lyrics unavailable';
   }
+
+  // recommended
+  try{
+    const rec=await api('/music/related?q='+encodeURIComponent((title+' '+(artist||'')).trim())+'&limit=8');
+    const recEl=document.getElementById('sm-rec');
+    if(recEl){
+      const items=(rec.items||[]).filter(x=>(x.id||'')!==id);
+      if(items.length){
+        // merge into queue for next
+        const have=new Set((MSTATE.queue||[]).map(x=>x.id));
+        items.forEach(it=>{if(it.id&&!have.has(it.id)){MSTATE.queue.push(it);have.add(it.id)}});
+        recEl.innerHTML=`<h2>Recommended</h2><div class="m-grid">${items.map(musicCard).join('')}</div>`;
+      }else recEl.innerHTML='<h2>Recommended</h2><p class="empty">No suggestions</p>';
+    }
+  }catch(e){
+    const recEl=document.getElementById('sm-rec');
+    if(recEl) recEl.innerHTML='';
+  }
 }
 function playMusic(vid){location.hash='#/music/play/'+encodeURIComponent(vid)}
 function closeMusic(){
   const a=document.getElementById('sm-audio');
-  if(a){try{a.pause()}catch(e){}}
+  if(a){try{a.pause();a.removeAttribute('src');a.load()}catch(e){}}
   const np=document.getElementById('nowplayer');
   if(np) np.innerHTML='';
   const bar=document.getElementById('nowbar');
