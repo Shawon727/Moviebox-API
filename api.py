@@ -1860,6 +1860,7 @@ async def api_season(item_id: str, season: int):
 
 
 
+
 @app.get("/api/play", tags=["Playback"])
 async def api_play(
     subject_id: str = Query(None, description="Legacy MovieBox id — ignored on web path"),
@@ -1868,14 +1869,14 @@ async def api_play(
     se: int = 0,
     ep: int = 0,
     q: str = Query("", description="Title for 4KHDHub match / TMDB lookup"),
+    fast: bool = Query(True, description="Skip slow 4K resolve (embeds only) — set false for hub list"),
 ):
-    """Web playback: streambert-style embeds + 4KHDHub/HubCloud list. MovieBox is NOT used here — use /mb/stream."""
+    """Web playback: embeds immediately; optional 4KHDHub when fast=false."""
     sources = []
     errors = {}
     media = "tv" if media in ("tv", "series", "show") else "movie"
     title = (q or "").strip()
     tid = (tmdb_id or "").strip() or None
-    # subject_id from old UI may actually be tmdb id when provider=tmdb
     if not tid and subject_id and str(subject_id).isdigit() and len(str(subject_id)) < 12:
         tid = str(subject_id)
 
@@ -1886,8 +1887,11 @@ async def api_play(
             title = title or det.get("title") or det.get("name") or ""
             meta = {"tmdb": str(det["id"]), "imdb": (det.get("external_ids") or {}).get("imdb_id"), "name": title}
             if not meta.get("imdb"):
-                ext = await _tmdb_get(f"/{media}/{tid}/external_ids")
-                meta["imdb"] = ext.get("imdb_id")
+                try:
+                    ext = await _tmdb_get(f"/{media}/{tid}/external_ids")
+                    meta["imdb"] = ext.get("imdb_id")
+                except Exception:
+                    pass
     if not meta and title:
         meta = await _tmdb_search_id(title, media)
         if meta and meta.get("tmdb"):
@@ -1905,103 +1909,26 @@ async def api_play(
     else:
         errors["embed"] = "no TMDB match"
 
-    # 4KHDHub / HubCloud direct mirrors (list under player)
     hub_links: List[dict] = []
-    clean = re.sub(r"\[[^\]]*\]", " ", title or "")
-    clean = re.sub(r"\([^)]*\)", " ", clean)
-    clean = re.sub(r"\s+", " ", clean).strip()
-    if clean:
+    if not fast and title:
         try:
-            html = await fk_fetch(f"?s={clean}")
-            hits = fk_parse_search(html)
-            def tscore(name: str) -> int:
-                n = (name or "").lower(); c = clean.lower()
-                if n == c or n.startswith(c): return 0
-                if c.split()[0] in n: return 1
-                if c in n: return 2
-                return 9
-            hits = sorted(hits, key=lambda x: tscore(x.get("name") or ""))
-            if hits and tscore(hits[0].get("name") or "") <= 2:
-                path_id = hits[0].get("id")
-                if path_id:
-                    page = await fk_fetch(path_id)
-                    releases = fk_parse_releases(page, se_use if media == "tv" else 0, ep_use if media == "tv" else 0)
-                    for rel in releases[:4]:
-                        if len(hub_links) >= 4:
-                            break
-                        for mir in rel.get("mirrors") or []:
-                            if len(hub_links) >= 4:
-                                break
-                            murl = mir.get("url") or ""
-                            # HubCloud often masked behind greenmotors / short redirects
-                            if not any(x in murl for x in ("hubcloud.", "hubdrive.", "greenmotors.", "gamerxyt.", "/drive/")):
-                                if not mir.get("needs_resolve"):
-                                    continue
-                            try:
-                                if "hubcloud." in murl or "/drive/" in murl:
-                                    links = await resolve_any(murl)
-                                elif "hubdrive." in murl:
-                                    links = await resolve_any(murl)
-                                else:
-                                    # follow redirect page to find hubcloud
-                                    links = await _resolve_masked_hub(murl)
-                            except Exception:
-                                continue
-                            for L in links:
-                                u = L.get("url") or ""
-                                if not u or not _is_playable_direct(u):
-                                    continue
-                                hdrs = L.get("headers") or {"User-Agent": FK_UA, "Referer": murl}
-                                # Pixeldrain → GameDrive CDN, verify live (skip dead IDs)
-                                if "pixeldrain." in u or "pixeldra.in" in u or "pixeldrain.eu.cc" in u:
-                                    bypass = _pixeldrain_api(u) or u
-                                    ok = await preflight_url(bypass, hdrs)
-                                    if not ok:
-                                        continue
-                                    u = ok  # final cdnXX.pixeldrain.eu.cc/api/file/ID
-                                else:
-                                    ok = await preflight_url(u, hdrs)
-                                    if not ok or not _is_playable_direct(ok):
-                                        continue
-                                    u = ok
-                                low = u.lower()
-                                fmt = "MP4" if ".mp4" in low else ("MKV" if ".mkv" in low else "FILE")
-                                hub_links.append({
-                                    "label": f"{rel.get('quality') or '?'} · {(L.get('label') or 'CDN')[:40]} · {fmt}",
-                                    "filename": (rel.get("filename") or "")[:120],
-                                    "url": u,
-                                    "play_url": u,
-                                    "type": "direct",
-                                    "format": fmt,
-                                    "provider": "4khdhub",
-                                    "headers": hdrs,
-                                })
+            hub_links = await asyncio.wait_for(
+                collect_4k_mirrors(title, se_use if media == "tv" else 0, ep_use if media == "tv" else 0, limit=6),
+                timeout=12.0,
+            )
         except Exception as e:
             errors["4khdhub"] = str(e)
-
-    def _hub_rank(s):
-        u = (s.get("url") or "").lower()
-        lab = (s.get("label") or "").lower()
-        fmt = (s.get("format") or "").lower()
-        if "cdn.pixeldrain.eu.cc" in u: return 0
-        if "pixeldrain" in u or "pixeldrain" in lab: return 1
-        if ".mp4" in u or fmt == "mp4": return 1
-        if "workers.dev" in u: return 2
-        if ".mkv" in u or fmt == "mkv": return 4
-        return 3
-    hub_links.sort(key=_hub_rank)
 
     hub_src = [{
         "provider": "4khdhub",
         "label": h.get("label") or "Hub",
         "url": h["url"],
-        "play_url": h["url"],
+        "play_url": h.get("play_url") or h["url"],
         "format": h.get("format") or "FILE",
         "type": "direct",
         "headers": h.get("headers") or {},
-    } for h in hub_links]
+    } for h in hub_links if h.get("url")]
 
-    # Web order: embeds first (reliable A/V in browser), then hub files
     uniq = []
     seen = set()
     for s in sources + hub_src:
@@ -2014,24 +1941,14 @@ async def api_play(
     downloads = []
     for h in hub_links:
         u = h.get("url") or ""
-        downloads.append({
-            "label": h.get("label") or "Download",
-            "url": u,
-            "format": h.get("format") or "FILE",
-            "quality": h.get("quality") or "",
-            "filename": h.get("filename") or "",
-        })
-    # also expose embed-less direct sources as downloads
-    for s in uniq:
-        if s.get("type") == "direct" and s.get("url"):
-            if not any(d["url"] == s["url"] for d in downloads):
-                downloads.append({
-                    "label": s.get("label") or "File",
-                    "url": s["url"],
-                    "format": s.get("format") or "FILE",
-                    "quality": "",
-                    "filename": "",
-                })
+        if u:
+            downloads.append({
+                "label": h.get("label") or "Download",
+                "url": u,
+                "format": h.get("format") or "FILE",
+                "quality": h.get("quality") or "",
+                "filename": h.get("filename") or "",
+            })
 
     return {
         "tmdb_id": tid,
@@ -2044,14 +1961,14 @@ async def api_play(
         "hub_links": hub_links,
         "downloads": downloads,
         "errors": errors or None,
-        "strategy": "videasy/vidsrc/vidking → 4khdhub + pixeldrain-bypass (cdn.pixeldrain.eu.cc)",
-        "note": "Pixeldrain via GameDrive CDN for direct play/download. MovieBox API: /mb/*",
+        "strategy": "embeds-first (fast=true) · 4k optional",
+        "note": None,
     }
 
 
 
 # ═══════════════════════════════════════════════════════════
-# MUSIC — JioSaavn (vivi-music style) + YT Music + synced lyrics
+# MUSIC helpers — JioSaavn + YT Music (vivi-music style)
 # ═══════════════════════════════════════════════════════════
 
 YT_MUSIC_KEY = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30"
@@ -2135,11 +2052,10 @@ async def _saavn_get(params: dict) -> Any:
         r = await client.get("https://www.jiosaavn.com/api.php", params=q)
         if r.status_code != 200:
             return {}
-        text = r.text
         try:
             return r.json()
         except Exception:
-            m = re.search(r"(\{.*\}|\[.*\])", text, re.S)
+            m = re.search(r"(\{.*\}|\[.*\])", r.text, re.S)
             if m:
                 try:
                     return json.loads(m.group(1))
@@ -2156,16 +2072,10 @@ def _saavn_card(song: dict) -> Optional[dict]:
     if not sid or not title:
         return None
     mi = song.get("more_info") if isinstance(song.get("more_info"), dict) else {}
-    artists = (
-        song.get("primary_artists")
-        or mi.get("music")
-        or song.get("subtitle")
-        or ""
-    )
+    artists = song.get("primary_artists") or mi.get("music") or song.get("subtitle") or song.get("singers") or ""
     if isinstance(artists, list):
         artists = ", ".join(str(a) for a in artists)
     image = song.get("image") or ""
-    # prefer higher res
     image = image.replace("-50x50", "-500x500").replace("-150x150", "-500x500")
     enc = mi.get("encrypted_media_url") or song.get("encrypted_media_url") or ""
     dur = mi.get("duration") or song.get("duration")
@@ -2215,7 +2125,6 @@ async def _saavn_auth_url(encrypted: str, bitrate: int = 320) -> Optional[str]:
 
 
 async def _saavn_stream_by_id(sid: str) -> Optional[dict]:
-    # api_version 4 returns {songs:[...]} ; without version returns {pid: song}
     data = await _saavn_get({"__call": "song.getDetails", "cc": "in", "pids": sid})
     song = None
     if isinstance(data, dict):
@@ -2241,7 +2150,6 @@ async def _saavn_stream_by_id(sid: str) -> Optional[dict]:
         return None
     card = _saavn_card(song)
     if not card:
-        # minimal card
         card = {
             "id": f"saavn:{sid}",
             "saavn_id": sid,
@@ -2258,7 +2166,7 @@ async def _saavn_stream_by_id(sid: str) -> Optional[dict]:
         or ""
     )
     if not enc:
-        return card  # metadata only
+        return card
     for br in (320, 160, 96):
         audio = await _saavn_auth_url(enc, br)
         if audio:
@@ -2288,11 +2196,7 @@ async def _saavn_match(title: str, artist: str = "") -> Optional[dict]:
             s += 3
         return s
     hits = sorted(hits, key=score, reverse=True)
-    best = hits[0]
-    if score(best) < 3 and len(tlow) > 3:
-        # still try first result for popular songs
-        pass
-    return await _saavn_stream_by_id(best["saavn_id"])
+    return await _saavn_stream_by_id(hits[0]["saavn_id"])
 
 
 async def _ytdlp_audio(video_id: str) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[str]]:
@@ -2302,14 +2206,7 @@ async def _ytdlp_audio(video_id: str) -> Tuple[Optional[str], Optional[str], Opt
         except ImportError:
             return None, None, None, "yt-dlp not installed"
         url = f"https://www.youtube.com/watch?v={video_id}"
-        # try several player clients (vivi/NewPipe style fallbacks)
-        clients = [
-            "android,web",
-            "android_music,android",
-            "ios,web",
-            "tv_embedded",
-            "web",
-        ]
+        clients = ["android,web", "android_music,android", "ios,web", "tv_embedded", "web"]
         last_err = None
         for client in clients:
             opts = {
@@ -2328,9 +2225,7 @@ async def _ytdlp_audio(video_id: str) -> Tuple[Optional[str], Optional[str], Opt
                 formats = info.get("formats") or []
                 audio_fmts = [
                     f for f in formats
-                    if f.get("url")
-                    and f.get("acodec") not in (None, "none")
-                    and f.get("vcodec") in (None, "none")
+                    if f.get("url") and f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
                 ]
                 if not audio_fmts and info.get("url"):
                     return info.get("url"), info.get("ext"), info.get("duration"), None
@@ -2349,6 +2244,7 @@ async def _ytdlp_audio(video_id: str) -> Tuple[Optional[str], Optional[str], Opt
                 continue
         return None, None, None, last_err or "all clients failed"
     return await asyncio.to_thread(_extract)
+
 
 
 @app.get("/music/search", tags=["Music"])
@@ -2809,6 +2705,28 @@ img{display:block;max-width:100%}
 .sm-art{border-radius:18px}
 .sm-btn.sm-play{background:#00c8e0;box-shadow:0 8px 28px rgba(0,200,224,.35)}
 .m-lyrics{border-radius:16px;background:linear-gradient(180deg,#1a1a22,#121218)}
+
+/* Player responsive */
+.player-shell{width:100%;max-width:1100px;margin:0 auto}
+.player-wrap{aspect-ratio:16/9;max-height:min(72vh,620px);width:100%}
+@media (max-width:860px){
+  .player-wrap{max-height:56vw;border-radius:10px}
+  .player-shell{border-radius:10px}
+  .bar{gap:6px;font-size:.8rem}
+  .src,.ep{padding:8px 10px;font-size:.8rem}
+  .content{padding-bottom:88px}
+  .top{padding:0 10px;gap:8px}
+  .search{max-width:none;font-size:.9rem;padding:9px 12px}
+  .btn{padding:9px 12px;font-size:.85rem}
+  .m-hero h1{font-size:1.35rem}
+  .sm-player{padding-bottom:100px}
+  .now-bar{padding:8px 10px}
+}
+@media (min-width:861px){
+  .content{padding:22px 28px 48px}
+  .side{padding:20px 14px}
+}
+.player-wrap iframe{width:100%;height:100%;border:0;display:block}
 </style></head>
 <body>
 <div class="app">
@@ -3175,55 +3093,92 @@ function renderP(){
 }
 window.__nx=
 ()=>{if(PS.idx<PS.sources.length-1){PS.idx++;toast('Next source…');renderP()}else toast('All sources failed')};
+
 async function watch(media,id,se,ep){
   setNav('');PS={sources:[],idx:0,se:se||1,ep:ep||1};
   root.innerHTML=`<div class="player-shell"><div class="player-wrap"><div id="frame" class="empty">Loading stream…</div></div><div id="extpanel"></div></div>
-    <div class="bar"><span id="st">…</span>
+    <div class="bar"><span id="st">Fetching sources…</span>
     <select id="qsel" class="se-select" style="display:none"></select>
     <button class="src" type="button" onclick="window.__nx()">Next source ↻</button>
     <a class="src" href="#/title/${media}/${id}">Details</a></div>
     <div id="srcs"></div><div id="hublist"></div><div id="eps"></div>`;
   try{
-    let url=`/api/play?tmdb_id=${encodeURIComponent(id)}&media=${media}`;
+    let url=`/api/play?tmdb_id=${encodeURIComponent(id)}&media=${media}&fast=1`;
     if(media==='tv')url+=`&se=${PS.se}&ep=${PS.ep}`;
-    const d=await api(url);
+    const ctrl=new AbortController();
+    const to=setTimeout(()=>ctrl.abort(),25000);
+    let d;
+    try{
+      const r=await fetch(url,{signal:ctrl.signal});
+      clearTimeout(to);
+      if(!r.ok) throw new Error('Play API '+r.status);
+      d=await r.json();
+    }catch(e){
+      clearTimeout(to);
+      throw e;
+    }
     PS.sources=d.sources||[];
+    if(!PS.sources.length){
+      document.getElementById('frame').innerHTML=`<div class="empty err">No sources found${d.errors?(' · '+esc(JSON.stringify(d.errors))):''}</div>`;
+      return;
+    }
     document.getElementById('srcs').innerHTML=
-      (PS.sources.length?('<div style="font-size:.75rem;color:var(--mute);margin:4px 0 6px">Sources</div>'):'')+
-      PS.sources.map((s,i)=>`<button type="button" class="src ${i===0?'on':''}" data-i="${i}" onclick="PS.idx=${i};renderP()">${esc(s.label)}</button>`).join('')
-      ||'<span class="err">No streams</span>';
-    const hubs=PS.sources.map((s,i)=>({s,i})).filter(x=>x.s.provider==='4khdhub');
+      '<div style="font-size:.75rem;color:var(--mute);margin:4px 0 6px">Sources</div>'+
+      PS.sources.map((s,i)=>`<button type="button" class="src ${i===0?'on':''}" data-i="${i}" onclick="PS.idx=${i};renderP()">${esc(s.label)}</button>`).join('');
     const hubEl=document.getElementById('hublist');
     if(hubEl){
-      let html='';
-      if(hubs.length){
-        html+=`<div class="hubbox"><h3>4K / Hub / Pixeldrain — Play</h3>${hubs.map(({s,i})=>`<button type="button" class="src" onclick="PS.idx=${i};renderP()">▶ ${esc(s.label)}</button>`).join('')}</div>`;
-      }
-      const dls=d.downloads||hubs.map(x=>x.s);
-      if(dls.length){
-        html+=`<div class="dlbox"><h3>Download</h3><div class="dl-grid">${dls.map(s=>{
-          const u=s.url||s.play_url||'';
-          const lab=s.label||'File';
-          const fmt=s.format||'';
-          return `<a class="dl-card" href="${esc(u)}" target="_blank" rel="noopener" download>
-            <div class="dl-ico">⬇</div>
-            <div class="dl-meta"><div class="dl-title">${esc(lab)}</div><div class="dl-sub">${esc(fmt)}${s.filename?(' · '+esc(String(s.filename).slice(0,40))):''}</div></div>
-          </a>`;
-        }).join('')}</div></div>`;
-      }
-      hubEl.innerHTML=html;
+      hubEl.innerHTML=`<div class="hubbox"><button type="button" class="src" onclick="loadHubs('${esc(media)}','${esc(id)}',${PS.se},${PS.ep})">Load 4K / Download mirrors…</button></div>`;
     }
-    if(d.note) toast(d.note,3500);
     renderP();
-  }catch(e){document.getElementById('frame').innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
+  }catch(e){
+    const msg=e.name==='AbortError'?'Timed out — try again':(e.message||String(e));
+    const fr=document.getElementById('frame');
+    if(fr) fr.innerHTML=`<div class="empty err">${esc(msg)}</div>`;
+    toast(msg);
+  }
   if(media==='tv'){
     try{
       const sd=await api(`/api/tv/${id}/season/${PS.se}`);
       const epsList=(sd.episodes||[]).slice().sort((a,b)=>(a.episode||0)-(b.episode||0));
-      document.getElementById('eps').innerHTML=`<div style="margin-top:12px"><div style="font-size:.8rem;color:var(--mute);margin-bottom:6px">Episodes · S${PS.se}</div><div style="display:flex;flex-wrap:wrap;gap:6px">${epsList.map(e=>`<button type="button" class="ep ${e.episode==PS.ep?'on':''}" onclick="location.hash='#/watch/tv/${id}?se=${PS.se}&ep=${e.episode}'">E${e.episode}</button>`).join('')}</div></div>`;
-    }catch{}
+      const epEl=document.getElementById('eps');
+      if(epEl) epEl.innerHTML=`<div style="margin-top:12px"><div style="font-size:.8rem;color:var(--mute);margin-bottom:6px">Episodes · S${PS.se}</div><div style="display:flex;flex-wrap:wrap;gap:6px">${epsList.map(e=>`<button type="button" class="ep ${e.episode==PS.ep?'on':''}" onclick="location.hash='#/watch/tv/${id}?se=${PS.se}&ep=${e.episode}'">E${e.episode}</button>`).join('')}</div></div>`;
+    }catch(e){}
   }
 }
+async function loadHubs(media,id,se,ep){
+  const hubEl=document.getElementById('hublist');
+  if(hubEl) hubEl.innerHTML='<div class="empty">Loading 4K mirrors…</div>';
+  try{
+    let url=`/api/play?tmdb_id=${encodeURIComponent(id)}&media=${media}&fast=0`;
+    if(media==='tv')url+=`&se=${se}&ep=${ep}`;
+    const d=await api(url);
+    const hubs=(d.sources||[]).map((s,i)=>({s,i})).filter(x=>x.s.provider==='4khdhub');
+    // merge new hub sources
+    const base=PS.sources.filter(s=>s.provider!=='4khdhub');
+    const hubOnly=(d.sources||[]).filter(s=>s.provider==='4khdhub');
+    PS.sources=base.concat(hubOnly);
+    // refresh source buttons
+    const srcs=document.getElementById('srcs');
+    if(srcs) srcs.innerHTML='<div style="font-size:.75rem;color:var(--mute);margin:4px 0 6px">Sources</div>'+PS.sources.map((s,i)=>`<button type="button" class="src" data-i="${i}" onclick="PS.idx=${i};renderP()">${esc(s.label)}</button>`).join('');
+    let html='';
+    if(hubOnly.length){
+      html+=`<div class="hubbox"><h3>4K / Hub</h3>${hubOnly.map((s)=>{
+        const i=PS.sources.indexOf(s);
+        return `<button type="button" class="src" onclick="PS.idx=${i};renderP()">▶ ${esc(s.label)}</button>`;
+      }).join('')}</div>`;
+    }
+    const dls=d.downloads||[];
+    if(dls.length){
+      html+=`<div class="dlbox"><h3>Download</h3><div class="dl-grid">${dls.map(s=>{
+        const u=s.url||'';
+        return `<a class="dl-card" href="${esc(u)}" target="_blank" rel="noopener" download><div class="dl-ico">⬇</div><div class="dl-meta"><div class="dl-title">${esc(s.label||'File')}</div><div class="dl-sub">${esc(s.format||'')}</div></div></a>`;
+      }).join('')}</div></div>`;
+    }
+    if(!html) html='<div class="empty">No 4K mirrors</div>';
+    if(hubEl) hubEl.innerHTML=html;
+  }catch(e){if(hubEl) hubEl.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
+}
+
 async function apiDocs(){
   setNav('api');
   const rows=[
