@@ -2208,6 +2208,51 @@ async def music_play(video_id: str):
 
 
 
+
+
+@app.get("/music/lyrics", tags=["Music"])
+async def music_lyrics(
+    title: str = Query(..., min_length=1),
+    artist: str = Query("", description="Artist name optional"),
+):
+    """Fetch lyrics from LRCLIB (used by SimpMusic)."""
+    params = {"track_name": title[:120], "artist_name": (artist or "")[:80]}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get("https://lrclib.net/api/search", params={"q": f"{artist} {title}".strip()})
+            if r.status_code != 200:
+                return {"found": False, "lyrics": None, "synced": None, "source": "lrclib"}
+            items = r.json() if isinstance(r.json(), list) else []
+            best = None
+            tlow = title.lower()
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                if it.get("plainLyrics") or it.get("syncedLyrics"):
+                    tn = (it.get("trackName") or "").lower()
+                    if tlow in tn or tn in tlow or not best:
+                        best = it
+                        if tlow == tn:
+                            break
+            if not best and items:
+                best = items[0] if isinstance(items[0], dict) else None
+            if not best:
+                return {"found": False, "lyrics": None, "synced": None, "source": "lrclib"}
+            return {
+                "found": bool(best.get("plainLyrics") or best.get("syncedLyrics")),
+                "title": best.get("trackName"),
+                "artist": best.get("artistName"),
+                "album": best.get("albumName"),
+                "lyrics": best.get("plainLyrics"),
+                "synced": best.get("syncedLyrics"),
+                "duration": best.get("duration"),
+                "source": "lrclib",
+            }
+    except Exception as e:
+        return {"found": False, "lyrics": None, "error": str(e), "source": "lrclib"}
+
+
+
 SPA_HTML = r"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
@@ -2364,6 +2409,34 @@ img{display:block;max-width:100%}
 .m-chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px}
 .chip{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:999px;padding:7px 14px;font-size:.8rem;cursor:pointer}
 .chip:hover{border-color:var(--a);color:var(--a)}
+
+/* Full music player */
+.m-player-page{display:grid;grid-template-columns:1fr 1fr;gap:20px;padding-bottom:120px}
+@media (max-width:900px){.m-player-page{grid-template-columns:1fr}}
+.m-stage{background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden}
+.m-stage .yt{aspect-ratio:16/9;background:#000}
+.m-stage .yt iframe{width:100%;height:100%;border:0}
+.m-info{padding:16px 18px}
+.m-info h1{font-size:1.25rem;margin-bottom:6px}
+.m-info .ar{color:var(--mute);margin-bottom:14px}
+.m-actions{display:flex;flex-wrap:wrap;gap:8px}
+.m-lyrics{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px 18px;max-height:70vh;overflow:auto}
+.m-lyrics h3{font-size:.85rem;color:var(--mute);text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px}
+.m-lyrics pre{white-space:pre-wrap;font-family:Inter,system-ui,sans-serif;font-size:.92rem;line-height:1.65;color:#d4d4dc}
+.now-bar{position:fixed;left:0;right:0;bottom:0;z-index:50;background:linear-gradient(180deg,rgba(16,16,20,.96),#0a0a0e);border-top:1px solid var(--line);backdrop-filter:blur(16px);padding:10px 14px;display:none;align-items:center;gap:12px}
+.now-bar.on{display:flex}
+.now-bar img{width:48px;height:48px;border-radius:8px;object-fit:cover;cursor:pointer}
+.now-meta{flex:1;min-width:0;cursor:pointer}
+.now-meta .t{font-weight:600;font-size:.88rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.now-meta .a{font-size:.72rem;color:var(--mute)}
+.now-actions{display:flex;gap:6px;align-items:center;flex-shrink:0}
+.now-actions .src{padding:8px 10px;font-size:.8rem}
+.top-nav-music{display:none}
+@media (max-width:860px){
+  .top-nav-music{display:inline-flex}
+  .side{position:fixed;left:0;top:0;transform:translateX(-105%);transition:transform .2s;z-index:30;height:100vh;box-shadow:8px 0 30px rgba(0,0,0,.5)}
+  .side.open{transform:none}
+}
 </style></head>
 <body>
 <div class="app">
@@ -2382,7 +2455,8 @@ img{display:block;max-width:100%}
   <div class="main">
     <div class="top">
       <button class="menu-btn" type="button" onclick="document.getElementById('side').classList.toggle('open')">☰</button>
-      <input class="search" id="q" placeholder="Search movies & series…" onkeydown="if(event.key==='Enter')goSearch()"/>
+      <button class="btn ghost top-nav-music" type="button" onclick="location.hash='#/music'">♪ Music</button>
+      <input class="search" id="q" placeholder="Search movies, series, music…" onkeydown="if(event.key==='Enter')goSearch()"/>
       <button class="btn ghost" type="button" onclick="goSearch()">Search</button>
     </div>
     <div class="content" id="root"><div class="empty">Loading…</div></div>
@@ -2402,25 +2476,32 @@ function card(it){
 }
 function row(title,items){if(!items||!items.length)return'';return `<section class="sec"><h2>${esc(title)}</h2><div class="row">${items.map(card).join('')}</div></section>`}
 
+
+let MSTATE={vid:'',title:'',artist:'',thumb:''};
+
 async function musicHome(){
   setNav('music');root.innerHTML='<div class="empty">Loading music…</div>';
   try{
     const d=await api('/music/home');
-    const chips=['Arijit Singh','Taylor Swift','Queen','Lo-fi','BTS','Ed Sheeran','Bollywood','Hip Hop'];
+    const chips=['Arijit Singh','Taylor Swift','Queen','Lo-fi','BTS','Ed Sheeran','Bollywood','Hip Hop','Nightcore','Rahman'];
     let h=`<div class="music-layout">
-      <div class="m-hero"><h1>Music</h1><p>YouTube Music · search & play — inspired by SimpMusic</p></div>
+      <div class="m-hero"><h1>♪ Music</h1><p>YouTube Music catalog · lyrics · play — SimpMusic-style</p></div>
       <div class="m-search"><input id="mq" placeholder="Search songs, artists, albums…" onkeydown="if(event.key==='Enter')musicSearch(this.value)"/><button class="btn" type="button" onclick="musicSearch(document.getElementById('mq').value)">Search</button></div>
       <div class="m-chips">${chips.map(c=>`<button type="button" class="chip" onclick="musicSearch('${c}')">${c}</button>`).join('')}</div>`;
     for(const sec of (d.sections||[])){
       h+=`<section class="sec"><h2>${esc(sec.title)}</h2><div class="m-grid">${(sec.items||[]).map(musicCard).join('')||'<p class="empty">Empty</p>'}</div></section>`;
     }
-    if(!(d.sections||[]).length) h+=`<p class="empty">No sections — try search</p>`;
+    if(!(d.sections||[]).length) h+=`<p class="empty">No sections — try search above</p>`;
     h+='</div>';
     root.innerHTML=h;
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
 function musicCard(s){
-  return `<div class="m-card" onclick="playMusic('${esc(s.video_id||s.id)}','${esc(s.title)}','${esc(s.artist||'')}','${esc(s.thumb||'')}')">
+  const vid=s.video_id||s.id||'';
+  const title=(s.title||'Song').replace(/'/g,"\\'");
+  const artist=(s.artist||'').replace(/'/g,"\\'");
+  const thumb=(s.thumb||'').replace(/'/g,"\\'");
+  return `<div class="m-card" role="button" tabindex="0" data-vid="${esc(vid)}" onclick="location.hash='#/music/play/${esc(vid)}'">
     <img src="${esc(s.thumb||'')}" alt="" loading="lazy"/>
     <div class="mi"><div class="mt">${esc(s.title)}</div><div class="ma">${esc(s.artist||'YouTube Music')}</div></div>
   </div>`;
@@ -2434,22 +2515,68 @@ async function musicSearch(q){
       <section class="sec"><h2>Results for “${esc(q)}”</h2><div class="m-grid">${(d.items||[]).map(musicCard).join('')||'<p class="empty">No results</p>'}</div></section></div>`;
   }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
 }
-async function playMusic(vid, title, artist, thumb){
-  const bar=document.getElementById('nowbar');
-  document.getElementById('nowtitle').textContent=title||vid;
-  document.getElementById('nowartist').textContent=artist||'YouTube Music';
-  document.getElementById('nowthumb').src=thumb||('https://i.ytimg.com/vi/'+vid+'/hqdefault.jpg');
-  document.getElementById('nowplayer').innerHTML=`<iframe src="https://www.youtube.com/embed/${esc(vid)}?autoplay=1&rel=0" allow="autoplay;encrypted-media" allowfullscreen></iframe>`;
-  bar.classList.add('on');
+async function musicPlayPage(vid){
+  setNav('music');
+  root.innerHTML='<div class="empty">Loading player…</div>';
+  let title=vid, artist='', thumb='https://i.ytimg.com/vi/'+vid+'/hqdefault.jpg';
   try{
     const d=await api('/music/play/'+vid);
-    if(d.title) document.getElementById('nowtitle').textContent=d.title;
-    if(d.artist) document.getElementById('nowartist').textContent=d.artist;
+    title=d.title||title; artist=d.artist||''; thumb=d.thumb||thumb;
   }catch(e){}
+  MSTATE={vid,title,artist,thumb};
+  const yt=`https://www.youtube.com/embed/${esc(vid)}?autoplay=1&rel=0&modestbranding=1`;
+  const watch=`https://music.youtube.com/watch?v=${esc(vid)}`;
+  const ytw=`https://www.youtube.com/watch?v=${esc(vid)}`;
+  root.innerHTML=`<div class="m-player-page">
+    <div class="m-stage">
+      <div class="yt"><iframe src="${yt}" allow="autoplay;encrypted-media;picture-in-picture;fullscreen" allowfullscreen></iframe></div>
+      <div class="m-info">
+        <h1 id="mp-title">${esc(title)}</h1>
+        <div class="ar" id="mp-artist">${esc(artist||'YouTube Music')}</div>
+        <div class="m-actions">
+          <a class="btn" href="${watch}" target="_blank" rel="noopener">Open in YT Music</a>
+          <a class="btn ghost" href="${ytw}" target="_blank" rel="noopener">⬇ Download / Save</a>
+          <button class="btn ghost" type="button" onclick="navigator.clipboard.writeText('${ytw}').then(()=>toast('Link copied'))">Copy link</button>
+          <button class="btn ghost" type="button" onclick="location.hash='#/music'">← Library</button>
+        </div>
+      </div>
+    </div>
+    <div class="m-lyrics"><h3>Lyrics</h3><pre id="mp-lyrics">Loading lyrics…</pre></div>
+  </div>`;
+  // mini bar
+  const bar=document.getElementById('nowbar');
+  if(bar){
+    document.getElementById('nowtitle').textContent=title;
+    document.getElementById('nowartist').textContent=artist||'YouTube Music';
+    document.getElementById('nowthumb').src=thumb;
+    document.getElementById('nowplayer').innerHTML='';
+    bar.classList.add('on');
+  }
+  // lyrics
+  try{
+    const L=await api('/music/lyrics?title='+encodeURIComponent(title)+'&artist='+encodeURIComponent(artist||''));
+    const el=document.getElementById('mp-lyrics');
+    if(L.found && (L.lyrics||L.synced)){
+      el.textContent=L.lyrics||L.synced;
+      if(L.title) document.getElementById('mp-title').textContent=L.title;
+      if(L.artist) document.getElementById('mp-artist').textContent=L.artist;
+    }else{
+      el.textContent='No lyrics found for this track.';
+    }
+  }catch(e){
+    const el=document.getElementById('mp-lyrics');
+    if(el) el.textContent='Lyrics unavailable.';
+  }
+}
+function playMusic(vid, title, artist, thumb){
+  location.hash='#/music/play/'+vid;
 }
 function closeMusic(){
-  document.getElementById('nowplayer').innerHTML='';
-  document.getElementById('nowbar').classList.remove('on');
+  const np=document.getElementById('nowplayer');
+  if(np) np.innerHTML='';
+  const bar=document.getElementById('nowbar');
+  if(bar) bar.classList.remove('on');
+  if(location.hash.indexOf('#/music/play')===0) location.hash='#/music';
 }
 
 async function home(){
@@ -2703,6 +2830,7 @@ async function router(){
   try{
     if(!p.length) return home();
     if(p[0]==='movies') return grid('movies');
+    if(p[0]==='music'&&p[1]==='play'&&p[2]) return musicPlayPage(p[2]);
     if(p[0]==='music') return musicHome();
     if(p[0]==='series') return grid('series');
     if(p[0]==='search'&&p[1]) return search(decodeURIComponent(p[1]));
@@ -2716,10 +2844,13 @@ window.addEventListener('hashchange',router);
 router();
 </script>
 <div id="nowbar" class="now-bar">
-  <img id="nowthumb" alt=""/>
-  <div class="now-meta"><div class="t" id="nowtitle">—</div><div class="a" id="nowartist"></div></div>
+  <img id="nowthumb" alt="" onclick="if(MSTATE.vid)location.hash='#/music/play/'+MSTATE.vid"/>
+  <div class="now-meta" onclick="if(MSTATE.vid)location.hash='#/music/play/'+MSTATE.vid"><div class="t" id="nowtitle">—</div><div class="a" id="nowartist"></div></div>
   <div class="now-player" id="nowplayer"></div>
-  <div class="now-actions"><button class="src" type="button" onclick="closeMusic()">✕</button></div>
+  <div class="now-actions">
+    <button class="src" type="button" onclick="if(MSTATE.vid)location.hash='#/music/play/'+MSTATE.vid">Player</button>
+    <button class="src" type="button" onclick="closeMusic()">✕</button>
+  </div>
 </div>
 <div id="toast"></div>
 </body></html>
