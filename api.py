@@ -2849,8 +2849,6 @@ function card(it){
 function row(title,items){if(!items||!items.length)return'';return `<section class="sec"><h2>${esc(title)}</h2><div class="row">${items.map(card).join('')}</div></section>`}
 
 
-let MSTATE={vid:'',title:'',artist:'',thumb:''};
-
 
 let MSTATE={id:'',vid:'',title:'',artist:'',thumb:'',audioUrl:null,lines:[]};
 
