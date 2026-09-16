@@ -2399,13 +2399,14 @@ async def music_play(item_id: str):
     else:
         raise HTTPException(400, "Invalid id — use saavn:ID or YouTube videoId")
 
+    play_url = _music_proxy_url(audio_url) if audio_url else None
     if audio_url:
         sources.append({
             "type": "audio",
             "provider": "jiosaavn" if saavn_id else "ytmusic-direct",
             "label": f"Audio ({audio_format or 'mp4'})",
             "url": audio_url,
-            "play_url": audio_url,
+            "play_url": play_url or audio_url,
             "format": (audio_format or "mp4").upper(),
         })
     if video_id:
@@ -2427,6 +2428,7 @@ async def music_play(item_id: str):
         "thumb": thumb,
         "duration": duration,
         "audio_url": audio_url,
+        "play_url": play_url or audio_url,
         "audio_format": audio_format,
         "sources": sources,
         "watch_url": f"https://music.youtube.com/watch?v={video_id}" if video_id else None,
@@ -2487,6 +2489,65 @@ async def music_lyrics(
     except Exception as e:
         return {"found": False, "lyrics": None, "synced": None, "lines": [], "error": str(e), "source": "lrclib"}
 
+
+
+
+
+
+@app.api_route("/music/stream/{token}", methods=["GET", "HEAD"], tags=["Music"])
+async def music_stream_proxy(token: str, request: Request):
+    """Proxy Saavn/YT audio so browser can play (Range + CORS)."""
+    try:
+        meta = _b64url_decode(token)
+    except Exception:
+        raise HTTPException(400, "bad token")
+    url = meta.get("u") or ""
+    if not url.startswith("https://"):
+        raise HTTPException(400, "bad url")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Referer": "https://www.jiosaavn.com/",
+        "Origin": "https://www.jiosaavn.com",
+    }
+    range_h = request.headers.get("range") if request else None
+    if range_h:
+        headers["Range"] = range_h
+    async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+        try:
+            if request.method == "HEAD":
+                upstream = await client.head(url, headers=headers)
+            else:
+                upstream = await client.get(url, headers=headers)
+        except Exception as e:
+            raise HTTPException(502, f"stream proxy: {e}")
+        if upstream.status_code >= 400:
+            raise HTTPException(upstream.status_code, f"upstream {upstream.status_code}")
+        out_headers = {
+            "cache-control": "no-store",
+            "access-control-allow-origin": "*",
+            "access-control-expose-headers": "Content-Length, Content-Range, Accept-Ranges",
+            "accept-ranges": upstream.headers.get("accept-ranges") or "bytes",
+        }
+        for k in ("content-type", "content-length", "content-range"):
+            if k in upstream.headers:
+                out_headers[k] = upstream.headers[k]
+        media = (upstream.headers.get("content-type") or "audio/mp4").split(";")[0]
+        if request.method == "HEAD":
+            return Response(status_code=upstream.status_code, headers=out_headers, media_type=media)
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            media_type=media,
+            headers=out_headers,
+        )
+
+
+def _music_proxy_url(audio_url: str) -> str:
+    if not audio_url:
+        return ""
+    tok = _b64url_encode({"u": audio_url})
+    return f"/music/stream/{tok}"
 
 
 
@@ -2823,8 +2884,8 @@ async function musicPlayPage(rawId){
   try{
     const d=await api('/music/play/'+encodeURIComponent(id));
     title=d.title||title; artist=d.artist||''; thumb=d.thumb||'';
-    audioUrl=d.audio_url||null; duration=d.duration||null; videoId=d.video_id||null;
-    if(!audioUrl&&d.sources){const a=(d.sources||[]).find(s=>s.type==='audio');if(a)audioUrl=a.url||a.play_url}
+    audioUrl=d.play_url||d.audio_url||null; duration=d.duration||null; videoId=d.video_id||null;
+    if(!audioUrl&&d.sources){const a=(d.sources||[]).find(s=>s.type==='audio');if(a)audioUrl=a.play_url||a.url}
   }catch(e){toast('Stream failed: '+e.message)}
   MSTATE={id,vid:videoId,title,artist,thumb,audioUrl,lines:[]};
 
