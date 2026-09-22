@@ -41,7 +41,7 @@ app = FastAPI(
         "**Catalog** `/api/*` · **Play** embeds · **Music** · **Downloader** (yt-dlp + ffmpeg merge)\n"
         "**MovieBox** `/mb/*` · **4KHDHub** `/fk/*` · **Tools** `/tools/*`"
     ),
-    version="5.30.0",
+    version="5.30.1",
     docs_url=None,
     redoc_url=None,
 )
@@ -191,7 +191,7 @@ def _ha_pick_episode(eps: list, season: int, episode: int) -> Optional[dict]:
 
 @app.get("/health", tags=["Meta"])
 async def health():
-    return {"ok": True, "version": "5.30.0", "creator": "shawon", "providers": ["hindianime", "ytmusic", "deezer", "jiosaavn", "tmdb"]}
+    return {"ok": True, "version": "5.33.0", "creator": "shawon", "providers": ["hindianime", "ytmusic", "deezer", "jiosaavn", "tmdb"]}
 
 @app.get("/anime/status", tags=["Anime"])
 async def anime_status():
@@ -6679,15 +6679,17 @@ def _dash_from_sign_cookie(cookie: str) -> Optional[str]:
     """Extract DASH MPD URL from MovieBox signCookie (Edge-Cache-Cookie urlprefix=b64)."""
     if not cookie:
         return None
-    # direct mpd in cookie
+    # direct mpd in cookie text
     m = re.search(r"(https?://\S+?\.mpd\S*)", cookie)
     if m:
         return m.group(1).rstrip(";',\"")
-    # base64 urlprefix (MovieBox-TUI / app)
-    m = re.search(r"urlprefix=([A-Za-z0-9+/=]+)", cookie)
+    # base64 urlprefix (MovieBox app / TUI)
+    m = re.search(r"urlprefix=([A-Za-z0-9+/=_-]+)", cookie)
     if m:
         try:
-            prefix = base64.b64decode(m.group(1)).decode("utf-8", errors="ignore")
+            raw = m.group(1).replace("-", "+").replace("_", "/")
+            pad = "=" * ((4 - len(raw) % 4) % 4)
+            prefix = base64.b64decode(raw + pad).decode("utf-8", errors="ignore")
             if prefix.startswith("http"):
                 if not prefix.endswith("/"):
                     prefix += "/"
@@ -6695,6 +6697,68 @@ def _dash_from_sign_cookie(cookie: str) -> Optional[str]:
         except Exception:
             pass
     return None
+
+
+def _mb_stream_headers(cookie: str) -> dict:
+    h = {
+        "User-Agent": globals().get("_mb_ua") or "com.community.oneroom/50020119",
+        "Referer": globals().get("STREAM_REFERER") or "https://sportslive.wine",
+    }
+    if cookie:
+        h["Cookie"] = "; ".join(p.strip() for p in cookie.strip(";").split(";") if p.strip())
+    return h
+
+
+def _mb_extract_streams_from_play(data: dict) -> List[dict]:
+    """Parse play-info payload into list of playable CDN streams (DASH preferred)."""
+    out: List[dict] = []
+    if not isinstance(data, dict):
+        return out
+    raw = data.get("streams") or data.get("streamList") or data.get("list") or []
+    if isinstance(data.get("data"), dict):
+        d2 = data["data"]
+        raw = raw or d2.get("streams") or d2.get("streamList") or []
+    if not isinstance(raw, list):
+        return out
+    seen = set()
+    ua = globals().get("_mb_ua") or "com.community.oneroom/50020119"
+    for st in raw:
+        if not isinstance(st, dict):
+            continue
+        cookie = st.get("signCookie") or st.get("sign_cookie") or st.get("cookie") or ""
+        raw_url = st.get("url") or st.get("playUrl") or st.get("play_url") or ""
+        dash = _dash_from_sign_cookie(cookie) if cookie else None
+        playable = dash
+        if not playable and raw_url and not _is_dummy_url(raw_url):
+            playable = raw_url
+        if not playable:
+            continue
+        key = playable.split("?")[0]
+        if key in seen:
+            continue
+        seen.add(key)
+        headers = _mb_stream_headers(cookie)
+        if cookie and ".mpd" in playable:
+            try:
+                _mb_proxy_remember(playable, headers.get("Cookie") or "", headers.get("Referer") or STREAM_REFERER)
+            except Exception:
+                pass
+        fmt = "DASH" if ".mpd" in playable else ("HLS" if ".m3u8" in playable else "MP4")
+        out.append({
+            "id": st.get("id"),
+            "url": playable,
+            "cdn_url": playable,
+            "format": fmt,
+            "resolution": st.get("resolutions") or st.get("resolution") or data.get("displayResolutions"),
+            "size": st.get("size"),
+            "duration": st.get("duration"),
+            "codec": st.get("codecName") or st.get("codec") or "hevc",
+            "sign_cookie": cookie,
+            "headers": headers,
+            "upstream_url": None if _is_dummy_url(raw_url) else raw_url,
+        })
+    return out
+
 
 
 def _is_dummy_url(url: str) -> bool:
@@ -6713,37 +6777,22 @@ def _mb_proxy_remember(mpd_url: str, cookie: str, referer: str):
 
 
 def _parse_mb_play_info(data: dict, ua: str) -> List[dict]:
+    streams = _mb_extract_streams_from_play(data if isinstance(data, dict) else {})
+    # normalize keys for older callers
     out = []
-    raw = data.get("streams") or data.get("streamList") or data.get("list") or []
-    if isinstance(data.get("data"), dict):
-        raw = raw or data["data"].get("streams") or data["data"].get("streamList") or []
-    if not isinstance(raw, list):
-        return out
-    for st in raw:
-        if not isinstance(st, dict):
-            continue
-        cookie = st.get("signCookie") or st.get("sign_cookie") or st.get("cookie") or ""
-        raw_url = st.get("url") or st.get("playUrl") or ""
-        dash = _dash_from_sign_cookie(cookie)
-        playable = dash or (None if _is_dummy_url(raw_url) else raw_url)
-        if not playable:
-            continue
-        headers = {"User-Agent": ua, "Referer": STREAM_REFERER}
-        if cookie:
-            headers["Cookie"] = "; ".join(p.strip() for p in cookie.strip(";").split(";") if p.strip())
-            if ".mpd" in playable:
-                _mb_proxy_remember(playable, headers["Cookie"], STREAM_REFERER)
+    for s in streams:
         out.append({
-            "id": st.get("id"),
-            "url": playable,
-            "format": "DASH" if ".mpd" in playable else ("HLS" if ".m3u8" in playable else "MP4"),
-            "resolution": st.get("resolutions") or st.get("resolution"),
-            "size": st.get("size"),
-            "duration": st.get("duration"),
-            "codec": st.get("codecName") or st.get("codec") or "hevc",
-            "headers": headers,
+            "id": s.get("id"),
+            "url": s.get("url"),
+            "format": s.get("format"),
+            "resolution": s.get("resolution"),
+            "size": s.get("size"),
+            "duration": s.get("duration"),
+            "codec": s.get("codec"),
+            "headers": s.get("headers") or {"User-Agent": ua, "Referer": STREAM_REFERER},
         })
     return out
+
 
 
 async def mb_search(q: str, page: int = 1) -> dict:
@@ -6800,24 +6849,74 @@ async def mb_search(q: str, page: int = 1) -> dict:
 
 
 async def mb_stream(subject_id: str, season: int = 0, episode: int = 0) -> dict:
-    if season == 0 and episode == 0:
-        path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}"
-    else:
-        path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}&se={season}&ep={episode}"
+    """Play-info → real DASH CDN. Tries v2 then v1; merges resource metadata."""
+    paths = []
+    if season or episode:
+        paths.append(f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}&se={season}&ep={episode}")
+        paths.append(f"/wefeed-mobile-bff/subject-api/play-info?subjectId={subject_id}&se={season}&ep={episode}")
+    paths.append(f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}")
+    paths.append(f"/wefeed-mobile-bff/subject-api/play-info?subjectId={subject_id}")
+
+    data: dict = {}
+    last_err = None
+    for path in paths:
+        try:
+            data = await mb_request("GET", path)
+            if isinstance(data, dict) and (data.get("streams") or data.get("streamList")):
+                break
+        except Exception as e:
+            last_err = str(e)
+            continue
+    if not isinstance(data, dict):
+        data = {}
+
+    streams = _mb_extract_streams_from_play(data)
+    if not streams:
+        # fallback: older parser
+        streams = _parse_mb_play_info(data, _mb_ua)
+        for s in streams:
+            s.setdefault("cdn_url", s.get("url"))
+            s.setdefault("headers", s.get("headers") or {})
+
+    # attach resource list (qualities / episode map) when possible
+    resources = []
     try:
-        data = await mb_request("GET", path)
-    except HTTPException:
-        data = await mb_request("GET", path.replace("/play-info/v2", "/play-info"))
-    streams = _parse_mb_play_info(data if isinstance(data, dict) else {}, _mb_ua)
+        if season or episode:
+            rpath = f"/wefeed-mobile-bff/subject-api/resource?subjectId={subject_id}&se={season}&ep={episode}&page=1&perPage=30"
+        else:
+            rpath = f"/wefeed-mobile-bff/subject-api/resource?subjectId={subject_id}&page=1&perPage=30"
+        rdata = await mb_request("GET", rpath)
+        if isinstance(rdata, dict):
+            for it in rdata.get("list") or []:
+                if not isinstance(it, dict):
+                    continue
+                resources.append({
+                    "resource_id": it.get("resourceId"),
+                    "title": it.get("title"),
+                    "se": it.get("se"),
+                    "ep": it.get("ep"),
+                    "resolution": it.get("resolution"),
+                    "codec": it.get("codecName"),
+                    "size": it.get("size"),
+                    "duration": it.get("duration"),
+                })
+    except Exception:
+        pass
+
     return {
         "ok": bool(streams),
         "subject_id": subject_id,
         "season": season,
         "episode": episode,
-        "title": (data or {}).get("title") if isinstance(data, dict) else None,
+        "title": data.get("title") if isinstance(data, dict) else None,
+        "display_resolutions": data.get("displayResolutions") if isinstance(data, dict) else None,
         "streams": streams,
+        "resources": resources,
+        "count": len(streams),
+        "error": last_err if not streams else None,
         "provider": "moviebox",
     }
+
 
 
 @app.get("/mb/search", tags=["MovieBox"])
@@ -6991,6 +7090,113 @@ async def _h5_post(path: str, body: dict) -> Any:
             # search may need token — fall back to mobile
             raise HTTPException(502, f"H5 error: {j.get('message') or j.get('reason') or j}")
         return j.get("data") if isinstance(j, dict) and "data" in j else j
+
+
+
+@app.get("/mb/movies", tags=["MovieBox"])
+@app.get("/moviebox/movies", tags=["MovieBox"])
+async def mb_movies(
+    page: int = Query(1, ge=1),
+    tabId: str = Query("0", description="operating tab"),
+):
+    """MovieBox movies shelf from tab-operating + search-style filter."""
+    items = []
+    try:
+        data = await mb_request(
+            "GET",
+            f"/wefeed-mobile-bff/tab-operating?page={page}&tabId={tabId}&version=",
+        )
+        # flatten subjects that look like movies
+        blocks = []
+        if isinstance(data, dict):
+            blocks = data.get("operatingList") or data.get("list") or data.get("items") or []
+            if not blocks and isinstance(data.get("data"), dict):
+                blocks = data["data"].get("operatingList") or []
+        for b in blocks or []:
+            if not isinstance(b, dict):
+                continue
+            for s in b.get("subjects") or b.get("subjectList") or b.get("items") or []:
+                if not isinstance(s, dict):
+                    continue
+                st = s.get("subjectType") or s.get("stype") or 1
+                if str(st) in ("2", "tv", "series"):
+                    continue
+                items.append({
+                    "subject_id": str(s.get("subjectId") or s.get("id") or ""),
+                    "title": s.get("title") or s.get("name"),
+                    "type": "movie",
+                    "poster": (s.get("cover") or {}).get("url") if isinstance(s.get("cover"), dict) else s.get("cover") or s.get("poster"),
+                    "rating": s.get("imdbRatingValue") or s.get("score"),
+                    "year": s.get("releaseDate") or s.get("year"),
+                    "provider": "moviebox",
+                })
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120], "items": [], "provider": "moviebox"}
+    # also H5 filter movies if available
+    try:
+        if not items:
+            h5 = await _h5_post("/wefeed-h5api-bff/subject/filter", {"page": page, "perPage": 30})
+            for x in (h5.get("items") if isinstance(h5, dict) else []) or []:
+                if not isinstance(x, dict):
+                    continue
+                if str(x.get("subjectType")) == "2":
+                    continue
+                items.append(_mbn_card(x))
+    except Exception:
+        pass
+    return {"ok": True, "page": page, "count": len(items), "items": items, "provider": "moviebox"}
+
+
+@app.get("/mb/series", tags=["MovieBox"])
+@app.get("/moviebox/series", tags=["MovieBox"])
+async def mb_series(
+    page: int = Query(1, ge=1),
+    tabId: str = Query("0"),
+):
+    """MovieBox TV/series shelf."""
+    items = []
+    try:
+        data = await mb_request(
+            "GET",
+            f"/wefeed-mobile-bff/tab-operating?page={page}&tabId={tabId}&version=",
+        )
+        blocks = []
+        if isinstance(data, dict):
+            blocks = data.get("operatingList") or data.get("list") or data.get("items") or []
+            if not blocks and isinstance(data.get("data"), dict):
+                blocks = data["data"].get("operatingList") or []
+        for b in blocks or []:
+            if not isinstance(b, dict):
+                continue
+            for s in b.get("subjects") or b.get("subjectList") or b.get("items") or []:
+                if not isinstance(s, dict):
+                    continue
+                st = s.get("subjectType") or s.get("stype") or 1
+                if str(st) not in ("2", "tv", "series"):
+                    continue
+                items.append({
+                    "subject_id": str(s.get("subjectId") or s.get("id") or ""),
+                    "title": s.get("title") or s.get("name"),
+                    "type": "series",
+                    "poster": (s.get("cover") or {}).get("url") if isinstance(s.get("cover"), dict) else s.get("cover") or s.get("poster"),
+                    "rating": s.get("imdbRatingValue") or s.get("score"),
+                    "year": s.get("releaseDate") or s.get("year"),
+                    "provider": "moviebox",
+                })
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120], "items": [], "provider": "moviebox"}
+    try:
+        if not items:
+            h5 = await _h5_post("/wefeed-h5api-bff/subject/filter", {"page": page, "perPage": 30})
+            for x in (h5.get("items") if isinstance(h5, dict) else []) or []:
+                if not isinstance(x, dict):
+                    continue
+                if str(x.get("subjectType")) != "2":
+                    continue
+                items.append(_mbn_card(x))
+    except Exception:
+        pass
+    return {"ok": True, "page": page, "count": len(items), "items": items, "provider": "moviebox"}
 
 
 @app.get("/mbn/home", tags=["MovieBox New"])
@@ -7216,19 +7422,21 @@ async def mbn_stream(
     ep: Optional[int] = Query(None),
 ):
     """
-    Real CDN stream (not web embed).
-    Uses mobile play-info/v2 → decodes signCookie urlprefix → DASH index.mpd
-    Returns Cookie + Referer headers required by CDN.
+    Real CDN stream for movie/series (not web embed).
+    Mobile play-info/v2 → signCookie → DASH index.mpd + Cookie headers.
     """
     s = se if se is not None else season
     e = ep if ep is not None else episode
-    st = await mb_stream(subjectId, s, e)
+    st = await mb_stream(subjectId, int(s or 0), int(e or 0))
     streams = []
     for item in st.get("streams") or []:
-        url = item.get("url")
-        if not url or _is_dummy_url(url):
+        url = item.get("url") or item.get("cdn_url")
+        if not url:
             continue
-        headers = item.get("headers") or {}
+        if _is_dummy_url(url) and not item.get("sign_cookie"):
+            continue
+        # if only dummy mp4 but we have dash from cookie, prefer already-resolved url
+        headers = item.get("headers") or _mb_stream_headers(item.get("sign_cookie") or "")
         streams.append({
             "format": item.get("format") or ("DASH" if ".mpd" in url else "MP4"),
             "url": url,
@@ -7237,25 +7445,26 @@ async def mbn_stream(
             "codec": item.get("codec") or "hevc",
             "size": item.get("size"),
             "duration": item.get("duration"),
-            "headers": {
-                "User-Agent": headers.get("User-Agent") or _mb_ua,
-                "Referer": headers.get("Referer") or STREAM_REFERER,
-                "Cookie": headers.get("Cookie") or "",
-            },
-            "play_hint": "Use VLC/mpv with Cookie+Referer headers. MPD contains 1080/720/480 tracks.",
+            "headers": headers,
+            "sign_cookie": item.get("sign_cookie") or headers.get("Cookie"),
+            "play_hint": "VLC/mpv: open cdn_url with headers Cookie + Referer. MPD has multi-quality.",
         })
     return {
         "ok": bool(streams),
         "subject_id": subjectId,
-        "season": s,
-        "episode": e,
+        "season": int(s or 0),
+        "episode": int(e or 0),
         "title": st.get("title"),
+        "display_resolutions": st.get("display_resolutions"),
         "streams": streams,
+        "resources": st.get("resources") or [],
         "count": len(streams),
+        "error": st.get("error"),
         "provider": "moviebox-new",
         "source": "mobile-play-info-cdn",
-        "note": "Real hakunaymatata/sbcdn DASH — not web subject/play empty free tier.",
+        "note": "Real hakunaymatata/sbcdn DASH — Cookie required. Use season+episode for series.",
     }
+
 
 
 @app.get("/mbn/captions", tags=["MovieBox New"])
@@ -7283,6 +7492,687 @@ async def mbn_tabs():
 async def mbn_country():
     data = await _h5_get("/wefeed-h5api-bff/country-code")
     return {"ok": True, "data": data, "provider": "moviebox-new"}
+
+
+
+# =============================================================================
+# CineStream (cinestream.watch) — ToonStream catalog + multi-source streams
+# Base: https://cinestream.watch/api/v1
+# =============================================================================
+
+CS_BASE = "https://cinestream.watch"
+CS_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Referer": "https://cinestream.watch/",
+    "Origin": "https://cinestream.watch",
+}
+CS_PLAYER = "https://gemma416okl.com/play/"
+
+
+async def _cs_get(path: str, params: Optional[dict] = None) -> Any:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        r = await client.get(CS_BASE.rstrip("/") + path, params=params or {}, headers=CS_HEADERS)
+        if r.status_code >= 400:
+            raise HTTPException(502, f"CineStream {path} HTTP {r.status_code}: {r.text[:100]}")
+        try:
+            return r.json()
+        except Exception:
+            return {"raw": r.text[:500]}
+
+
+def _cs_card(x: dict) -> dict:
+    if not isinstance(x, dict):
+        return {}
+    return {
+        "id": x.get("id") or x.get("_id"),
+        "title": x.get("title") or x.get("name"),
+        "poster": x.get("poster") or x.get("posterPath"),
+        "banner": x.get("banner"),
+        "rating": x.get("rating") or x.get("vote_average"),
+        "year": x.get("release_year") or x.get("year"),
+        "type": x.get("type") or "tv",
+        "genres": x.get("genres") or [],
+        "language": x.get("language"),
+        "description": x.get("description") or x.get("overview"),
+        "slug": x.get("slug"),
+        "episode_count": x.get("episodeCount"),
+        "season_count": x.get("seasonCount"),
+        "status": x.get("status"),
+        "watch_page_url": x.get("watch_page_url"),
+        "provider": "cinestream",
+    }
+
+
+@app.get("/cs/home", tags=["CineStream"])
+@app.get("/cinestream/home", tags=["CineStream"])
+async def cs_home():
+    """Trending + popular + top_rated shelves."""
+    out = {}
+    for filt in ("trending", "popular", "top_rated", "fresh-drop", "upcoming"):
+        try:
+            data = await _cs_get("/api/v1/anime", {"filter": filt, "page": 1})
+            items = data.get("results") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            out[filt] = [_cs_card(x) for x in (items or []) if isinstance(x, dict)]
+        except Exception as e:
+            out[filt] = []
+            out[f"{filt}_error"] = str(e)[:80]
+    return {"ok": True, "shelves": out, "provider": "cinestream"}
+
+
+@app.get("/cs/anime", tags=["CineStream"])
+@app.get("/cinestream/anime", tags=["CineStream"])
+@app.get("/cs/browse", tags=["CineStream"])
+async def cs_browse(
+    filter: str = Query("trending", description="trending|popular|top_rated|fresh-drop|upcoming|anime-movies|cartoon-series|cartoon-movies"),
+    page: int = Query(1, ge=1),
+    genre: str = Query(""),
+    type: str = Query("", description="movie|tv|empty for anime"),
+):
+    data = await _cs_get(
+        "/api/v1/anime",
+        {"filter": filter, "page": page, "genre": genre, "type": type},
+    )
+    items = data.get("results") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+    cards = [_cs_card(x) for x in (items or []) if isinstance(x, dict)]
+    return {
+        "ok": True,
+        "filter": filter,
+        "page": page,
+        "type": type,
+        "count": len(cards),
+        "items": cards,
+        "pager": data.get("pager") if isinstance(data, dict) else None,
+        "provider": "cinestream",
+    }
+
+
+@app.get("/cs/search", tags=["CineStream"])
+@app.get("/cinestream/search", tags=["CineStream"])
+async def cs_search(q: str = Query(..., min_length=1)):
+    data = await _cs_get("/api/v1/search", {"q": q})
+    items = data if isinstance(data, list) else (data.get("results") if isinstance(data, dict) else [])
+    return {
+        "ok": True,
+        "query": q,
+        "count": len(items or []),
+        "items": [_cs_card(x) for x in (items or []) if isinstance(x, dict)],
+        "provider": "cinestream",
+    }
+
+
+@app.get("/cs/genres", tags=["CineStream"])
+@app.get("/cinestream/genres", tags=["CineStream"])
+async def cs_genres():
+    data = await _cs_get("/api/v1/genres")
+    items = data if isinstance(data, list) else []
+    return {"ok": True, "genres": items, "count": len(items), "provider": "cinestream"}
+
+
+@app.get("/cs/hindi-dubbed", tags=["CineStream"])
+async def cs_hindi_dubbed():
+    data = await _cs_get("/api/v1/hindi-dubbed")
+    items = data if isinstance(data, list) else []
+    return {"ok": True, "items": [_cs_card(x) for x in items if isinstance(x, dict)], "count": len(items), "provider": "cinestream"}
+
+
+@app.get("/cs/detail", tags=["CineStream"])
+@app.get("/cs/details", tags=["CineStream"])
+@app.get("/cinestream/detail", tags=["CineStream"])
+async def cs_detail(id: str = Query(..., description="e.g. toon_jojos-bizarre-adventure")):
+    data = await _cs_get("/api/v1/anime/details", {"id": id})
+    if not isinstance(data, dict):
+        raise HTTPException(502, "invalid detail response")
+    card = _cs_card(data)
+    card.update({
+        "description": data.get("description"),
+        "banner": data.get("banner"),
+        "related": [_cs_card(x) for x in (data.get("related") or []) if isinstance(x, dict)],
+        "recommendations": [_cs_card(x) for x in (data.get("recommendations") or []) if isinstance(x, dict)],
+        "trailer": data.get("trailer"),
+        "tags": data.get("tags"),
+        "raw": data,
+    })
+    return {"ok": True, **card, "provider": "cinestream"}
+
+
+@app.get("/cs/episodes", tags=["CineStream"])
+@app.get("/cinestream/episodes", tags=["CineStream"])
+async def cs_episodes(
+    animeId: str = Query(..., description="toon_... id"),
+    season: Optional[int] = Query(None),
+):
+    data = await _cs_get("/api/v1/episodes", {"animeId": animeId})
+    eps = data if isinstance(data, list) else []
+    if season is not None:
+        eps = [e for e in eps if isinstance(e, dict) and int(e.get("season") or 0) == int(season)]
+    out = []
+    for e in eps:
+        if not isinstance(e, dict):
+            continue
+        out.append({
+            "id": e.get("id"),
+            "anime_id": e.get("animeId"),
+            "season": e.get("season"),
+            "episode": e.get("episode"),
+            "title": e.get("title"),
+            "thumbnail": e.get("thumbnail"),
+            "url": e.get("url"),
+            "sources_count": len(e.get("sources") or []),
+            "provider": "cinestream",
+        })
+    return {"ok": True, "anime_id": animeId, "season": season, "count": len(out), "episodes": out, "provider": "cinestream"}
+
+
+@app.get("/cs/stream", tags=["CineStream"])
+@app.get("/cs/play", tags=["CineStream"])
+@app.get("/cinestream/stream", tags=["CineStream"])
+async def cs_stream(
+    animeId: str = Query(...),
+    season: int = Query(1, ge=0),
+    episode: int = Query(1, ge=0),
+):
+    """
+    Multi-source stream list for an episode (from CineStream/ToonStream catalog).
+    Returns iframe hosts + any direct-looking CDN URLs found in sources.
+    """
+    data = await _cs_get("/api/v1/episodes", {"animeId": animeId})
+    eps = data if isinstance(data, list) else []
+    pick = None
+    for e in eps:
+        if not isinstance(e, dict):
+            continue
+        try:
+            es, ee = int(e.get("season") or 0), int(e.get("episode") or 0)
+        except Exception:
+            continue
+        if es == int(season) and ee == int(episode):
+            pick = e
+            break
+    if not pick:
+        for e in eps:
+            if not isinstance(e, dict):
+                continue
+            try:
+                if int(e.get("episode") or 0) == int(episode):
+                    pick = e
+                    break
+            except Exception:
+                continue
+    if not pick and eps:
+        for e in eps:
+            if isinstance(e, dict):
+                pick = e
+                break
+    if not pick:
+        raise HTTPException(404, "episode not found")
+
+    sources = []
+    for s in pick.get("sources") or []:
+        if not isinstance(s, dict):
+            continue
+        url = s.get("url") or ""
+        if not url:
+            continue
+        stype = s.get("type") or "iframe"
+        label = s.get("label") or "source"
+        # classify
+        kind = "iframe"
+        if ".m3u8" in url:
+            kind = "hls"
+            stype = "hls"
+        elif ".mp4" in url and "embed" not in url:
+            kind = "mp4"
+            stype = "mp4"
+        elif "as-cdn" in url or "/video/" in url:
+            kind = "cdn"
+        sources.append({
+            "label": label,
+            "type": stype,
+            "kind": kind,
+            "url": url,
+            "play_url": url,
+        })
+
+    # optional gemma player link
+    player = f"{CS_PLAYER}{animeId}/{season}/{episode}"
+    sources.append({
+        "label": "Gemma Player",
+        "type": "iframe",
+        "kind": "player",
+        "url": player,
+        "play_url": player,
+    })
+
+    return {
+        "ok": bool(sources),
+        "anime_id": animeId,
+        "season": season,
+        "episode": episode,
+        "title": pick.get("title"),
+        "thumbnail": pick.get("thumbnail"),
+        "episode_url": pick.get("url"),
+        "sources": sources,
+        "count": len(sources),
+        "cdn_sources": [s for s in sources if s.get("kind") in ("hls", "mp4", "cdn")],
+        "provider": "cinestream",
+        "note": "Prefer kind=cdn/hls/mp4 when available; iframe hosts need embed player.",
+    }
+
+
+@app.get("/cs/resolve-netmirror", tags=["CineStream"])
+async def cs_resolve_netmirror(
+    id: str = Query(...),
+    dp: str = Query(""),
+    title: str = Query(""),
+    se: int = Query(0),
+    ep: int = Query(0),
+):
+    data = await _cs_get(
+        "/api/v1/resolve-netmirror",
+        {"id": id, "dp": dp, "title": title, "se": se, "ep": ep},
+    )
+    return {"ok": True, "data": data, "provider": "cinestream"}
+
+
+@app.get("/cs/admin-store", tags=["CineStream"])
+async def cs_admin_store():
+    data = await _cs_get("/api/v1/admin-store")
+    return {"ok": True, "data": data, "provider": "cinestream"}
+
+
+@app.get("/cs/broken-videos", tags=["CineStream"])
+async def cs_broken_videos():
+    data = await _cs_get("/api/v1/broken-videos")
+    return {"ok": True, "items": data if isinstance(data, list) else data, "provider": "cinestream"}
+
+
+@app.get("/cs/hidden-items", tags=["CineStream"])
+async def cs_hidden_items():
+    data = await _cs_get("/api/v1/hidden-items")
+    return {"ok": True, "items": data if isinstance(data, list) else data, "provider": "cinestream"}
+
+
+@app.get("/cs/missing-catalog", tags=["CineStream"])
+async def cs_missing_catalog():
+    data = await _cs_get("/api/v1/missing-catalog")
+    return {"ok": True, "items": data if isinstance(data, list) else data, "provider": "cinestream"}
+
+
+
+# =============================================================================
+# PirateBot (theogpiratebot.online) — multi-tier CF edge + TMDB + stream servers
+# Edge API: https://theogpiratebot-tmdb-proxy.gleamcasteheavan.workers.dev
+# Routes: /tmdb/*, /api/tmdb/*, /api/toon-stream, /api/downloads, /api/stream-check,
+#         /api/anime-metadata, /api/anime-episodes, /api/anime-schedule, /api/anime-trending
+# =============================================================================
+
+PB_WORKERS = [
+    "https://theogpiratebot-tmdb-proxy.gleamcasteheavan.workers.dev",
+    "https://sexy.dryfruits.workers.dev",
+    "https://damp-bird-e8d5.moviehub4u1209.workers.dev",
+    "https://soft.niggasoup45.workers.dev",
+    "https://juicypuhh.request-moviehub4u.workers.dev",
+    "https://loudwolf.contact-theogpiratebot.workers.dev",
+    "https://froxyproxy.gleamcasteheavan-960.workers.dev",
+]
+PB_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Referer": "https://theogpiratebot.online/",
+    "Origin": "https://theogpiratebot.online",
+}
+
+# Stream server templates from serverRegistry (theogpiratebot)
+PB_SERVERS_MOVIE = [
+    ("vidstuck", "https://vidstuck.xyz/embed/movie/{id}?branding=TheOGPirateBot&server=centaurus&overlay=true&color=ffffff"),
+    ("vidfast", "https://vidfast.vc/movie/{id}?autoPlay=true"),
+    ("roxy", "https://zxcstream.xyz/player/movie/{id}?dubLang=en&server=0"),
+    ("bingr", "https://bingr.one/watch/movie/{id}"),
+    ("nxsha", "https://nxsha.space/embed/movie/{id}?lang=hi&disable_app_ad=true"),
+]
+PB_SERVERS_TV = [
+    ("vidstuck", "https://vidstuck.xyz/embed/tv/{id}/{s}/{e}?branding=TheOGPirateBot&server=centaurus&overlay=true&color=ffffff"),
+    ("vidfast", "https://vidfast.vc/tv/{id}/{s}/{e}?autoPlay=true"),
+    ("roxy", "https://zxcstream.xyz/player/tv/{id}/{s}/{e}?dubLang=en&server=0"),
+    ("bingr", "https://bingr.one/watch/tv/{id}/{s}/{e}"),
+    ("nxsha", "https://nxsha.space/embed/tv/{id}/{s}/{e}?lang=hi&disable_app_ad=true"),
+]
+PB_ANIME_SERVERS = [
+    ("megaplay_sub", "https://megaplay.buzz/stream/ani/{id}/{ep}/sub?autoplay=true"),
+    ("megaplay_dub", "https://megaplay.buzz/stream/ani/{id}/{ep}/dub?autoplay=true"),
+    ("zoko_sub", "https://zokoanime.video/stream/ani/{id}/{ep}/sub"),
+    ("zoko_dub", "https://zokoanime.video/stream/ani/{id}/{ep}/dub"),
+    ("4animo_sub", "https://cdn.4animo.xyz/embed/hd-3/ani/{id}/{ep}/sub?k=1&autoplay=1"),
+    ("4animo_dub", "https://cdn.4animo.xyz/embed/hd-3/ani/{id}/{ep}/dub?k=1&autoplay=1"),
+]
+
+
+async def _pb_get(path: str, params: Optional[dict] = None) -> Any:
+    """Fetch from PirateBot CF workers with tier failover."""
+    last_err = None
+    async with httpx.AsyncClient(timeout=28.0, follow_redirects=True) as client:
+        for base in PB_WORKERS:
+            url = base.rstrip("/") + path
+            try:
+                r = await client.get(url, params=params or {}, headers=PB_HEADERS)
+                if r.status_code in (429, 500, 502, 503, 504, 520, 521, 522, 523, 524):
+                    last_err = f"{base} HTTP {r.status_code}"
+                    continue
+                try:
+                    return r.json()
+                except Exception:
+                    return {"raw": r.text[:500], "status": r.status_code, "worker": base}
+            except Exception as e:
+                last_err = f"{base}: {type(e).__name__}"
+                continue
+    raise HTTPException(502, f"PirateBot edge failed: {last_err}")
+
+
+def _pb_card(x: dict, media: str = "movie") -> dict:
+    if not isinstance(x, dict):
+        return {}
+    mid = x.get("id")
+    title = x.get("title") or x.get("name")
+    poster = x.get("poster_path") or x.get("poster")
+    if poster and isinstance(poster, str) and poster.startswith("/"):
+        poster = f"https://image.tmdb.org/t/p/w500{poster}"
+    backdrop = x.get("backdrop_path")
+    if backdrop and isinstance(backdrop, str) and backdrop.startswith("/"):
+        backdrop = f"https://image.tmdb.org/t/p/w1280{backdrop}"
+    return {
+        "id": mid,
+        "tmdb_id": mid,
+        "title": title,
+        "overview": x.get("overview"),
+        "poster": poster,
+        "backdrop": backdrop,
+        "rating": x.get("vote_average"),
+        "date": x.get("release_date") or x.get("first_air_date"),
+        "media_type": x.get("media_type") or media,
+        "provider": "piratebot",
+    }
+
+
+@app.get("/pb/health", tags=["PirateBot"])
+@app.get("/piratebot/health", tags=["PirateBot"])
+async def pb_health():
+    data = await _pb_get("/api/health")
+    return {"ok": True, "data": data, "workers": PB_WORKERS, "provider": "piratebot"}
+
+
+@app.get("/pb/site-access", tags=["PirateBot"])
+async def pb_site_access():
+    data = await _pb_get("/api/site-access")
+    return {"ok": True, "data": data, "provider": "piratebot"}
+
+
+@app.get("/pb/tmdb/{path:path}", tags=["PirateBot"])
+async def pb_tmdb_proxy(path: str, request: Request):
+    """Proxy any TMDB path via PirateBot CF edge (no API key needed)."""
+    params = dict(request.query_params)
+    data = await _pb_get(f"/tmdb/{path.lstrip('/')}", params)
+    return data if isinstance(data, dict) else {"data": data}
+
+
+@app.get("/pb/trending", tags=["PirateBot"])
+async def pb_trending(
+    media: str = Query("all", description="all|movie|tv"),
+    window: str = Query("week", description="day|week"),
+    page: int = Query(1, ge=1),
+):
+    path = f"/tmdb/trending/{media}/{window}"
+    data = await _pb_get(path, {"page": page})
+    results = data.get("results") if isinstance(data, dict) else []
+    return {
+        "ok": True,
+        "media": media,
+        "window": window,
+        "page": page,
+        "count": len(results or []),
+        "items": [_pb_card(x, x.get("media_type") or media) for x in (results or []) if isinstance(x, dict)],
+        "provider": "piratebot",
+    }
+
+
+@app.get("/pb/popular", tags=["PirateBot"])
+async def pb_popular(media: str = Query("movie"), page: int = Query(1, ge=1)):
+    media = "tv" if media in ("tv", "series") else "movie"
+    data = await _pb_get(f"/tmdb/{media}/popular", {"page": page})
+    results = data.get("results") if isinstance(data, dict) else []
+    return {
+        "ok": True,
+        "media": media,
+        "page": page,
+        "count": len(results or []),
+        "items": [_pb_card(x, media) for x in (results or []) if isinstance(x, dict)],
+        "provider": "piratebot",
+    }
+
+
+@app.get("/pb/top-rated", tags=["PirateBot"])
+async def pb_top_rated(media: str = Query("movie"), page: int = Query(1, ge=1)):
+    media = "tv" if media in ("tv", "series") else "movie"
+    data = await _pb_get(f"/tmdb/{media}/top_rated", {"page": page})
+    results = data.get("results") if isinstance(data, dict) else []
+    return {
+        "ok": True,
+        "media": media,
+        "items": [_pb_card(x, media) for x in (results or []) if isinstance(x, dict)],
+        "provider": "piratebot",
+    }
+
+
+@app.get("/pb/search", tags=["PirateBot"])
+async def pb_search(q: str = Query(..., min_length=1), page: int = Query(1, ge=1)):
+    data = await _pb_get("/tmdb/search/multi", {"query": q, "page": page})
+    results = data.get("results") if isinstance(data, dict) else []
+    return {
+        "ok": True,
+        "query": q,
+        "count": len(results or []),
+        "items": [_pb_card(x, x.get("media_type") or "movie") for x in (results or []) if isinstance(x, dict)],
+        "provider": "piratebot",
+    }
+
+
+@app.get("/pb/movie/{tmdb_id}", tags=["PirateBot"])
+async def pb_movie_detail(tmdb_id: int):
+    data = await _pb_get(f"/tmdb/movie/{tmdb_id}", {"append_to_response": "credits,videos,similar,recommendations,external_ids"})
+    card = _pb_card(data, "movie") if isinstance(data, dict) else {}
+    return {"ok": True, **card, "detail": data, "provider": "piratebot"}
+
+
+@app.get("/pb/tv/{tmdb_id}", tags=["PirateBot"])
+async def pb_tv_detail(tmdb_id: int):
+    data = await _pb_get(f"/tmdb/tv/{tmdb_id}", {"append_to_response": "credits,videos,similar,recommendations,external_ids,content_ratings"})
+    card = _pb_card(data, "tv") if isinstance(data, dict) else {}
+    return {"ok": True, **card, "detail": data, "provider": "piratebot"}
+
+
+@app.get("/pb/tv/{tmdb_id}/season/{season}", tags=["PirateBot"])
+async def pb_tv_season(tmdb_id: int, season: int):
+    data = await _pb_get(f"/tmdb/tv/{tmdb_id}/season/{season}")
+    return {"ok": True, "tmdb_id": tmdb_id, "season": season, "data": data, "provider": "piratebot"}
+
+
+@app.get("/pb/stream", tags=["PirateBot"])
+@app.get("/pb/play", tags=["PirateBot"])
+@app.get("/piratebot/stream", tags=["PirateBot"])
+async def pb_stream(
+    tmdb_id: int = Query(...),
+    type: str = Query("movie", description="movie|tv"),
+    season: int = Query(1, ge=0),
+    episode: int = Query(1, ge=0),
+    title: Optional[str] = Query(None),
+):
+    """
+    Multi-server stream list (embed + toon-stream resolver when available).
+    Same servers as theogpiratebot.online player.
+    """
+    is_tv = type.lower() in ("tv", "series", "show")
+    # resolve title if missing
+    if not title:
+        try:
+            path = f"/tmdb/tv/{tmdb_id}" if is_tv else f"/tmdb/movie/{tmdb_id}"
+            meta = await _pb_get(path)
+            if isinstance(meta, dict):
+                title = meta.get("name") or meta.get("title")
+        except Exception:
+            title = None
+
+    servers = []
+    templates = PB_SERVERS_TV if is_tv else PB_SERVERS_MOVIE
+    for key, tmpl in templates:
+        url = tmpl.format(id=tmdb_id, s=season, e=episode)
+        servers.append({
+            "key": key,
+            "label": key,
+            "type": "embed",
+            "url": url,
+            "play_url": url,
+        })
+
+    # toon-stream edge resolver
+    toon = None
+    try:
+        params = {
+            "type": "tv" if is_tv else "movie",
+            "id": str(tmdb_id),
+            "title": title or str(tmdb_id),
+        }
+        if is_tv:
+            params["season"] = str(season)
+            params["episode"] = str(episode)
+        toon = await _pb_get("/api/toon-stream", params)
+        if isinstance(toon, dict) and toon.get("success") and (toon.get("url") or toon.get("sources")):
+            if toon.get("url"):
+                servers.insert(0, {
+                    "key": "toonstream",
+                    "label": "ToonStream CDN",
+                    "type": "cdn" if any(x in str(toon.get("url")) for x in (".m3u8", ".mp4", "as-cdn")) else "iframe",
+                    "url": toon.get("url"),
+                    "play_url": toon.get("url"),
+                })
+            for s in toon.get("sources") or []:
+                if isinstance(s, dict) and s.get("url"):
+                    servers.append({
+                        "key": "toonstream",
+                        "label": s.get("label") or "ToonStream",
+                        "type": s.get("type") or "iframe",
+                        "url": s["url"],
+                        "play_url": s["url"],
+                    })
+    except Exception as e:
+        toon = {"error": str(e)[:120]}
+
+    # downloads relay
+    downloads = None
+    try:
+        params = {"type": "tv" if is_tv else "movie", "id": str(tmdb_id), "title": title or str(tmdb_id)}
+        if is_tv:
+            params["season"] = str(season)
+            params["episode"] = str(episode)
+        downloads = await _pb_get("/api/downloads", params)
+    except Exception as e:
+        downloads = {"error": str(e)[:120]}
+
+    return {
+        "ok": bool(servers),
+        "tmdb_id": tmdb_id,
+        "type": "tv" if is_tv else "movie",
+        "title": title,
+        "season": season if is_tv else 0,
+        "episode": episode if is_tv else 0,
+        "servers": servers,
+        "count": len(servers),
+        "toon_stream": toon,
+        "downloads": downloads,
+        "provider": "piratebot",
+        "note": "Embed servers from theogpiratebot registry; toon-stream CDN when resolved.",
+    }
+
+
+@app.get("/pb/anime/stream", tags=["PirateBot"])
+async def pb_anime_stream(
+    anilist_id: int = Query(...),
+    episode: int = Query(1, ge=1),
+):
+    """Anime multi-server embeds (MegaPlay / Zoko / 4animo)."""
+    servers = []
+    for key, tmpl in PB_ANIME_SERVERS:
+        url = tmpl.format(id=anilist_id, ep=episode)
+        servers.append({"key": key, "label": key, "type": "embed", "url": url, "play_url": url})
+    return {
+        "ok": True,
+        "anilist_id": anilist_id,
+        "episode": episode,
+        "servers": servers,
+        "count": len(servers),
+        "provider": "piratebot",
+    }
+
+
+@app.get("/pb/stream-check", tags=["PirateBot"])
+async def pb_stream_check(url: str = Query(...)):
+    data = await _pb_get("/api/stream-check", {"url": url})
+    return {"ok": True, "data": data, "provider": "piratebot"}
+
+
+@app.get("/pb/toon-stream", tags=["PirateBot"])
+async def pb_toon_stream(
+    type: str = Query(..., description="movie|tv"),
+    id: str = Query(...),
+    title: str = Query(...),
+    season: int = Query(1),
+    episode: int = Query(1),
+):
+    params = {"type": type, "id": id, "title": title}
+    if type in ("tv", "series"):
+        params["season"] = str(season)
+        params["episode"] = str(episode)
+    data = await _pb_get("/api/toon-stream", params)
+    return {"ok": True, "data": data, "provider": "piratebot"}
+
+
+@app.get("/pb/downloads", tags=["PirateBot"])
+async def pb_downloads(
+    type: str = Query("movie"),
+    id: str = Query(...),
+    title: str = Query(""),
+    season: int = Query(0),
+    episode: int = Query(0),
+):
+    params = {"type": type, "id": id, "title": title or id}
+    if type in ("tv", "series"):
+        params["season"] = str(season)
+        params["episode"] = str(episode)
+    data = await _pb_get("/api/downloads", params)
+    return {"ok": True, "data": data, "provider": "piratebot"}
+
+
+@app.get("/pb/anime-metadata", tags=["PirateBot"])
+async def pb_anime_metadata(title: str = Query(...)):
+    data = await _pb_get("/api/anime-metadata", {"title": title})
+    return {"ok": True, "data": data, "provider": "piratebot"}
+
+
+@app.get("/pb/anime-episodes", tags=["PirateBot"])
+async def pb_anime_episodes(anilist_id: int = Query(...)):
+    data = await _pb_get("/api/anime-episodes", {"anilist_id": anilist_id})
+    return {"ok": True, "data": data, "provider": "piratebot"}
+
+
+@app.get("/pb/anime-schedule", tags=["PirateBot"])
+async def pb_anime_schedule():
+    data = await _pb_get("/api/anime-schedule")
+    return {"ok": True, "data": data, "provider": "piratebot"}
+
+
+@app.get("/pb/anime-trending", tags=["PirateBot"])
+async def pb_anime_trending():
+    data = await _pb_get("/api/anime-trending")
+    return {"ok": True, "data": data, "provider": "piratebot"}
 
 
 # PaxSenix-compatible MovieBox routes (direct aoneroom — no API key, unlimited)
