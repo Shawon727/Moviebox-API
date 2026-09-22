@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0c0a18">
-<meta name="description" content="MovieAll — stream movies, series and anime with a fast, clean player.">
-<title>MovieAll — Movies, Series & Anime</title>
+<meta name="description" content="MovieAll — stream movies, series, anime & music. Separate video/audio tracks, quality switcher, lyrics, 4K downloads.">
+<title>MovieAll — Movies, Series, Anime & Music</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%23ffb62e'/%3E%3Cpath d='M26 18v28l22-14z' fill='%231c1300'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1442,7 +1442,7 @@ function wireSheet(){
 class VPlayer{
   constructor(host,o){
     this.host=host;
-    this.o=Object.assign({sources:[],subtitles:[],title:'',sub:'',poster:'',resume:0,preferAudio:null,autoplay:true,
+    this.o=Object.assign({sources:[],subtitles:[],externalAudio:[],title:'',sub:'',poster:'',resume:0,preferAudio:null,autoplay:true,
       onNext:null,onPrev:null,onProgress:null,onEnded:null,onBack:null,onExhausted:null,autoAdvance:false,errorExtra:'',debug:null},o||{});
     this.si=0;this.ai=0;this.attempts=[];this.seq=0;this.hls=null;this.dash=null;this.wd=null;
     this.started=false;this.dead=false;this.idle=false;this.menuOpen=false;this.menuPage='root';
@@ -1691,9 +1691,11 @@ class VPlayer{
   /* ---------- loading & fail-over ---------- */
   teardown(){
     clearTimeout(this.wd);
+    if(this._audioSync){clearInterval(this._audioSync);this._audioSync=null}
+    if(this.audioEl){try{this.audioEl.pause();this.audioEl.removeAttribute('src');this.audioEl.load();this.audioEl.remove()}catch(e){}this.audioEl=null}
     if(this.hls){try{this.hls.destroy()}catch(e){}this.hls=null}
     if(this.dash){try{this.dash.reset()}catch(e){}this.dash=null}
-    try{this.v.pause()}catch(e){}
+    try{this.v.pause();this.v.muted=false}catch(e){}
     this.v.removeAttribute('src');try{this.v.load()}catch(e){}
   }
   load(si){
@@ -1737,6 +1739,8 @@ class VPlayer{
     }catch(e){if(my===this.seq)this.fail(e.message||'error')}
   }
   autoStart(){
+    // apply external / preferred audio as soon as playback can begin
+    if((this.o.externalAudio&&this.o.externalAudio.length)||(this.hls&&this.hls.audioTracks&&this.hls.audioTracks.length))this.pickAudio();
     if(!this.o.autoplay)return;
     const p=this.v.play();
     if(p&&p.catch)p.catch(err=>{if(err&&err.name==='NotAllowedError'){this.setBusy(false);this.say('Tap play to start')}});
@@ -1820,7 +1824,12 @@ class VPlayer{
     return[];
   }
   audios(){
+    // 1) external separate audio tracks (anime style: video_url + audio_url)
+    const ext=this.o.externalAudio||[];
+    if(ext.length)return ext.map((t,i)=>({i,label:t.label||t.name||t.lang||('Track '+(i+1)),lang:t.lang||'',url:t.url,ext:true}));
+    // 2) HLS internal
     if(this.hls&&this.hls.audioTracks&&this.hls.audioTracks.length>1)return this.hls.audioTracks.map((t,i)=>({i,label:t.name||t.lang||('Track '+(i+1)),lang:(t.lang||'')+' '+(t.name||'')}));
+    // 3) DASH internal
     if(this.dash){try{const l=this.dash.getTracksFor('audio')||[];if(l.length>1)return l.map((t,i)=>({i,label:(t.labels&&t.labels[0]&&t.labels[0].text)||t.lang||('Track '+(i+1)),lang:t.lang||'',t}))}catch(e){}}
     return[];
   }
@@ -1834,13 +1843,49 @@ class VPlayer{
     }
     this.setAudio(i,true);
   }
+  ensureAudioEl(){
+    if(this.audioEl)return this.audioEl;
+    const a=document.createElement('audio');
+    a.preload='auto';a.playsInline=true;
+    a.style.display='none';
+    this.host.appendChild(a);
+    this.audioEl=a;
+    // keep video & audio in sync
+    this._on(this.v,'play',()=>{try{a.currentTime=this.v.currentTime;a.play().catch(()=>{})}catch(e){}});
+    this._on(this.v,'pause',()=>{try{a.pause()}catch(e){}});
+    this._on(this.v,'seeking',()=>{try{a.currentTime=this.v.currentTime}catch(e){}});
+    this._on(this.v,'ratechange',()=>{try{a.playbackRate=this.v.playbackRate}catch(e){}});
+    this._on(this.v,'volumechange',()=>{try{a.volume=this.v.volume;a.muted=this.v.muted}catch(e){}});
+    // drift correction every 2s
+    this._audioSync=setInterval(()=>{
+      if(this.dead||!this.audioEl||this.v.paused)return;
+      const drift=Math.abs(this.audioEl.currentTime-this.v.currentTime);
+      if(drift>0.35)try{this.audioEl.currentTime=this.v.currentTime}catch(e){}
+    },2000);
+    return a;
+  }
   setAudio(i,silent){
     this.audioSel=i;
+    const list=this.audios();
+    const track=list[i];
     try{
-      if(this.hls){this.hls.audioTrack=i}
-      else if(this.dash){const t=(this.dash.getTracksFor('audio')||[])[i];if(t)this.dash.setCurrentTrack(t)}
+      if(track&&track.ext&&track.url){
+        // separate audio file — mute the video track and play external audio
+        const a=this.ensureAudioEl();
+        if(a.src!==track.url){a.src=track.url;a.load()}
+        a.volume=this.v.volume;a.muted=this.v.muted;
+        a.currentTime=this.v.currentTime;
+        this.v.muted=true; // video carries only picture
+        if(!this.v.paused)a.play().catch(()=>{});
+      }else{
+        // restore video audio if we were on external
+        if(this.audioEl){try{this.audioEl.pause();this.audioEl.removeAttribute('src')}catch(e){}}
+        this.v.muted=false;
+        if(this.hls){this.hls.audioTrack=i}
+        else if(this.dash){const t=(this.dash.getTracksFor('audio')||[])[i];if(t)this.dash.setCurrentTrack(t)}
+      }
     }catch(e){}
-    if(!silent){const a=this.audios()[i];this.say('Audio: '+(a?a.label:i))}
+    if(!silent){this.say('Audio: '+(track?track.label:i))}
   }
   setQuality(i){
     this.qualitySel=i;
@@ -3547,12 +3592,81 @@ async function pageAnimeTitle(slug,tok){
   draw();
   const ss=$('#ss');if(ss)ss.onclick=e=>{const b=e.target.closest('[data-s]');if(!b)return;curS=+b.dataset.s;$$('#ss .pill').forEach(x=>x.classList.toggle('on',x===b));draw()};
 }
-async function animeResolve(ep){
+/* Anime stream can return:
+   - single url / stream_url / m3u8
+   - separate video_url + audio_url (or video + audio arrays)
+   - qualities[] with video/audio pairs
+   - /anime/tracks for extra audio tracks
+   We normalise everything into {video, audio, tracks, embeds, raw} */
+function pickAnimeUrl(s){
+  if(!s)return'';
+  if(typeof s==='string')return s;
+  return s.stream_url||s.streamUrl||s.url||s.m3u8||s.hls||s.master||s.video_url||s.videoUrl||s.play_url||s.playUrl||'';
+}
+function parseAnimeStream(d){
+  const out={video:'',audio:'',tracks:[],embeds:[],qualities:[],raw:d};
+  if(!d||typeof d!=='object')return out;
+  // direct fields
+  out.video=abs(pickAnimeUrl(d)||d.video||d.video_url||d.videoUrl||'');
+  out.audio=abs(d.audio_url||d.audioUrl||d.audio||(d.audio_tracks&&d.audio_tracks[0]&&(d.audio_tracks[0].url||d.audio_tracks[0].src))||'');
+  // arrays of qualities
+  const quals=d.qualities||d.sources||d.streams||d.videos||[];
+  if(Array.isArray(quals)){
+    quals.forEach(q=>{
+      if(!q)return;
+      if(q.type==='iframe'||q.type==='embed'||/embed|iframe/i.test(q.url||'')){out.embeds.push({label:q.name||q.label||'Embed',url:abs(q.url)});return}
+      const v=abs(pickAnimeUrl(q)||q.video_url||q.video||'');
+      const a=abs(q.audio_url||q.audioUrl||q.audio||'');
+      const label=q.quality||q.resolution||q.label||q.name||(q.height?q.height+'p':'Stream');
+      if(v)out.qualities.push({label,video:v,audio:a||out.audio,fmt:guessFmt(v,q.format||q.type)});
+    });
+  }
+  // audio tracks list
+  const ats=d.audio_tracks||d.tracks||d.audios||[];
+  if(Array.isArray(ats)){
+    ats.forEach((t,i)=>{
+      const u=abs(t.url||t.src||t.audio_url||t.stream_url||'');
+      if(u)out.tracks.push({i,label:t.label||t.name||t.lang||t.language||('Audio '+(i+1)),lang:t.lang||t.language||'',url:u});
+    });
+  }
+  if(!out.video&&out.qualities.length)out.video=out.qualities[0].video;
+  if(!out.audio&&out.qualities[0]&&out.qualities[0].audio)out.audio=out.qualities[0].audio;
+  if(!out.audio&&out.tracks[0])out.audio=out.tracks[0].url;
+  // servers style
+  (d.servers||[]).forEach(s=>{
+    if(!s||!s.url)return;
+    if(s.type==='iframe'||s.type==='embed')out.embeds.push({label:s.name||s.label||'Server',url:abs(s.url)});
+    else if(!out.video)out.video=abs(s.url);
+  });
+  return out;
+}
+async function animeResolve(ep,slug){
+  // 1) episode already carries a stream
   let url=ep.stream_url||ep.streamUrl||'';
-  const pick=s=>(s&&(s.stream_url||s.url||s.m3u8||s.hls||s.master||''))||'';
-  if(!url&&(ep.video_hash||ep.videoHash))url=pick(await api('/anime/stream?hash='+enc(ep.video_hash||ep.videoHash),{timeout:45000}));
-  if(!url&&(ep.url||ep.page_url))url=pick(await api('/anime/stream?url='+enc(ep.url||ep.page_url),{timeout:45000}));
-  return abs(url);
+  if(url)return{video:abs(url),audio:'',tracks:[],embeds:[],qualities:[],raw:ep};
+  // 2) hash / page url → /anime/stream
+  const hash=ep.video_hash||ep.videoHash||ep.hash||'';
+  const page=ep.url||ep.page_url||ep.link||'';
+  let raw=null;
+  try{
+    if(hash)raw=await api('/anime/stream?hash='+enc(hash),{timeout:45000});
+    else if(page)raw=await api('/anime/stream?url='+enc(page),{timeout:45000});
+    else if(slug&&(ep.episode!=null||ep.ep!=null)){
+      // try servers endpoint (TMDB / slug based)
+      try{
+        const se=ep.season||ep.se||1,epn=ep.episode||ep.ep||1;
+        raw=await api(`/anime/servers?slug=${enc(slug)}&se=${se}&ep=${epn}`,{timeout:30000,retries:0});
+      }catch(e){}
+    }
+  }catch(e){/* fall through */}
+  if(raw){
+    const p=parseAnimeStream(raw);
+    if(p.video||p.qualities.length||p.embeds.length)return p;
+    // last resort single url pick
+    const u=pickAnimeUrl(raw);
+    if(u)return{video:abs(u),audio:'',tracks:[],embeds:[],qualities:[],raw};
+  }
+  return{video:'',audio:'',tracks:[],embeds:[],qualities:[],raw};
 }
 async function pageAnimeWatch(slug,idx,tok){
   setNav('anime');
@@ -3585,29 +3699,80 @@ async function pageAnimeWatch(slug,idx,tok){
   };
   drawSide();
   const fail=(msg)=>{stage.innerHTML=`<div class="ld" style="background:#05040d">${ic('alert')}<span style="max-width:40ch;text-align:center">${esc(msg)}</span><div class="pills" style="justify-content:center"><button class="btn sm" id="rt">${ic('refresh')}Retry</button>${idx<eps.length-1?`<a class="btn sm glass" href="#/anime/watch/${enc(slug)}?ep=${idx+1}">Next episode</a>`:''}</div></div>`;const r=$('#rt');if(r)r.onclick=()=>route()};
-  let url='';
-  try{url=await animeResolve(ep)}catch(e){if(tok!==RT)return;fail(e.message);return}
+  let parsed;
+  try{parsed=await animeResolve(ep,slug)}catch(e){if(tok!==RT)return;fail(e.message);return}
   if(tok!==RT)return;
-  if(!url){fail('No stream is available for this episode yet.');return}
-  if(/embed|vidmoly|abyss|filesforever/i.test(url)&&!/\.m3u8/i.test(url)){
-    App.embed=mountEmbed(stage,url,{title});return;
+  // Build playable sources list (quality variants + embeds)
+  const sources=[];
+  const addSrc=(label,video,audio,fmt)=>{
+    if(!video)return;
+    const isMp4=/\.(mp4|webm|mkv)(\?|$)/i.test(video);
+    const isHls=!isMp4;
+    const already=/\/anime\/hls\?/.test(video);
+    let urls;
+    if(isMp4)urls=[{url:video,via:'direct'}];
+    else if(already){
+      urls=[{url:video,via:'proxy'}];
+      try{const inner=new URL(video).searchParams.get('u');if(inner&&/^https?:/i.test(inner))urls.push({url:inner,via:'direct'})}catch(e){}
+    }else urls=[{url:BASE+'/anime/hls?u='+enc(video),via:'proxy'},{url:video,via:'direct'}];
+    sources.push({label:label||(isHls?'HLS':'Video'),fmt:fmt||(isHls?'hls':guessFmt(video)),urls,raw:video,audio:audio||''});
+  };
+  if(parsed.qualities.length){
+    parsed.qualities.forEach(q=>addSrc(q.label,q.video,q.audio||parsed.audio,q.fmt));
+  }else if(parsed.video){
+    addSrc('Stream',parsed.video,parsed.audio);
   }
-  const isMp4=/\.(mp4|webm|mkv)(\?|$)/i.test(url);
-  const isHls=!isMp4;
-  const already=/\/anime\/hls\?/.test(url);
-  let urls;
-  if(isMp4)urls=[{url,via:'direct'}];
-  else if(already){
-    urls=[{url,via:'proxy'}];
-    try{const inner=new URL(url).searchParams.get('u');if(inner&&/^https?:/i.test(inner))urls.push({url:inner,via:'direct'})}catch(e){}
-  }else urls=[{url:BASE+'/anime/hls?u='+enc(url),via:'proxy'},{url,via:'direct'}];
+  // Panel for server / quality / audio selection
+  const panel=$('#wpanel');
+  const renderPanel=()=>{
+    let html='<div class="srv">';
+    sources.forEach((s,i)=>html+=`<button class="pill${i===0?' on':''}" data-src="${i}">${ic('play')}${esc(s.label)}</button>`);
+    parsed.embeds.forEach((e,i)=>html+=`<button class="pill" data-emb="${i}">${ic('server')}${esc(e.label)}</button>`);
+    html+='</div>';
+    if(parsed.tracks.length>1||parsed.audio){
+      html+=`<div class="note" style="margin-top:12px"><b>Audio tracks</b> available — open ⚙ in the player to switch language / quality. Separate video + audio streams are merged automatically when both are present.</div>`;
+    }
+    if(!sources.length&&!parsed.embeds.length)html=`<div class="note"><b>No stream found</b> for this episode yet. Try another episode or check System status.</div>`;
+    panel.innerHTML=html;
+    panel.onclick=ev=>{
+      const b=ev.target.closest('[data-src]');
+      if(b){playSrc(+b.dataset.src);$$('#wpanel [data-src]').forEach(x=>x.classList.toggle('on',x===b));$$('#wpanel [data-emb]').forEach(x=>x.classList.remove('on'));return}
+      const emb=ev.target.closest('[data-emb]');
+      if(emb){
+        $$('#wpanel [data-emb]').forEach(x=>x.classList.toggle('on',x===emb));
+        $$('#wpanel [data-src]').forEach(x=>x.classList.remove('on'));
+        if(App.player){App.player.destroy();App.player=null}
+        App.embed=mountEmbed(stage,parsed.embeds[+emb.dataset.emb].url,{title});
+      }
+    };
+  };
   const old=Hist.get(key);
-  stage.innerHTML='';
-  App.player=new VPlayer(stage,{title,sub:label+(ep.title?' — '+ep.title:''),poster:d.poster||animeThumb(ep),preferAudio:/hin|hindi/i,
-    resume:old&&old.epIdx===idx?old.pos:0,
-    sources:[{label:isHls?'HLS':'Video',fmt:isHls?'hls':guessFmt(url),urls,raw:url}],
-    onNext:idx<eps.length-1?()=>goIdx(idx+1):null,onPrev:idx>0?()=>goIdx(idx-1):null,
-    onProgress:(p,du)=>Hist.progress(key,p,du),onBack:()=>{location.hash=`#/anime/title/${enc(slug)}`}});
+  const playSrc=(i)=>{
+    const s=sources[i];if(!s)return;
+    if(App.embed){App.embed.destroy();App.embed=null}
+    if(App.player){App.player.destroy();App.player=null}
+    stage.innerHTML='';
+    // Extra audio tracks for the menu
+    const extraAudio=parsed.tracks.length?parsed.tracks.map(t=>({label:t.label,lang:t.lang,url:t.url})):[];
+    if(s.audio&&!extraAudio.some(x=>x.url===s.audio))extraAudio.unshift({label:'Default audio',lang:'',url:s.audio});
+    App.player=new VPlayer(stage,{
+      title,sub:label+(ep.title?' — '+ep.title:''),poster:d.poster||animeThumb(ep),preferAudio:/hin|hindi|bn|bengali/i,
+      resume:old&&old.epIdx===idx?old.pos:0,
+      sources:[s],
+      externalAudio:extraAudio,
+      onNext:idx<eps.length-1?()=>goIdx(idx+1):null,onPrev:idx>0?()=>goIdx(idx-1):null,
+      onProgress:(p,du)=>Hist.progress(key,p,du),onBack:()=>{location.hash=`#/anime/title/${enc(slug)}`}
+    });
+  };
+  renderPanel();
+  if(sources.length){
+    playSrc(0);
+  }else if(parsed.embeds.length){
+    App.embed=mountEmbed(stage,parsed.embeds[0].url,{title});
+    $$('#wpanel [data-emb]').forEach((x,i)=>x.classList.toggle('on',i===0));
+  }else{
+    fail('No stream is available for this episode yet.');
+  }
 }
 
 /* ---------------- MOVIEBOX ---------------- */
