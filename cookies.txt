@@ -1,0 +1,5 @@
+# Netscape HTTP Cookie File
+# PLACEHOLDER — not valid YouTube session cookies.
+# Export real cookies from browser (see cookies.example.txt) and REPLACE this file.
+# TEMPLATE
+# REPLACE_ME
