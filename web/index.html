@@ -1,4 +1,3 @@
-
 <!doctype html>
 <html lang="en">
 <head>
@@ -1247,7 +1246,7 @@ function cardHTML(o){
 }
 const cTmdb=n=>cardHTML({href:`#/title/${n.media}/${n.id}`,title:n.title,sub:[n.year,n.media==='tv'?'Series':'Movie'].filter(Boolean).join(' • '),poster:n.poster,rating:n.rating,kind:n.media==='tv'?'TV':''});
 const cMb=n=>cardHTML({href:`#/mb/title/${enc(n.id)}`,title:n.title,sub:[n.year,n.media==='tv'?'Series':'Movie'].filter(Boolean).join(' • '),poster:n.poster,rating:n.rating,kind:n.media==='tv'?'TV':''});
-const cAnime=it=>cardHTML({href:`#/anime/title/${enc(it.slug||it.id||'')}`,title:it.title||it.name||'Untitled',sub:it.subtitle||(it.episode?('Episode '+it.episode):(it.type||'')),poster:it.poster||it.thumb||it.image||'',kind:'Hindi'});
+const cAnime=it=>{const slug=String((it&&(it.slug||it.id||it.title||it.name))||'').trim();return cardHTML({href:`#/anime/title/${enc(slug)}`,title:(it&&(it.title||it.name))||'Untitled',sub:(it&&(it.subtitle||it.type))||'Anime',poster:(it&&(it.poster||it.thumb||it.image||it.thumbnail))||'',kind:'Anime'});};
 function rowHTML(title,cards,opt={}){
   if(!cards||!cards.length)return'';
   return`<section class="sec"><div class="sec-h"><h2 class="h2">${esc(title)}</h2>${opt.more?`<a href="${esc(opt.more)}">See all</a>`:''}</div>
@@ -3519,162 +3518,72 @@ const featureHTML=(o)=>`<section class="afeat"><div class="bgi" style="backgroun
   <div class="ap${o.poster?'':' noimg'}" data-i="${esc(initials(o.title))}">${imgTag(o.poster,o.title)}</div>
   <div class="tx">${o.meta?`<div class="dmeta">${o.meta}</div>`:''}<h1 class="h1">${esc(o.title)}</h1>${o.text?`<p class="dover">${esc(o.text.slice(0,300))}${o.text.length>300?'…':''}</p>`:''}<div class="dbtns">${o.btns||''}</div></div></div></section>`;
 
-/* ---------------- ANIME ---------------- */
-const animeSlug=it=>it.slug||it.id||'';
-/* Native /anime/* catalog is currently broken on the API (HA_BASE).
-   We serve anime via MovieBox (Hindi dubs) + /anime/servers embeds. */
-const ANIME_QUERIES=[
-  ['Popular Hindi anime','naruto hindi'],
-  ['Demon Slayer','demon slayer'],
-  ['One Piece','one piece hindi'],
-  ['Jujutsu Kaisen','jujutsu kaisen'],
-  ['Attack on Titan','attack on titan'],
-  ['Death Note','death note'],
-  ['Dragon Ball','dragon ball'],
-  ['Bleach','bleach hindi'],
-  ['Spy x Family','spy family'],
-  ['Solo Leveling','solo leveling']
+/* ---------------- ANIME ----------------
+   Uses ONLY /anime/* endpoints from StreamHub API.
+   Catalog endpoints (home/search/detail/catalog) may 500 when HA_BASE is down;
+   /anime/servers always works with slug|title and powers playback.
+   /anime/stream + /anime/tracks supply separate video/audio when a hash is known.
+   ---------------------------------------------------------------- */
+const animeSlug=it=>{
+  if(!it)return'';
+  if(typeof it==='string')return it;
+  return String(it.slug||it.id||it.title||it.name||'').trim();
+};
+const animeTitle=it=>String((it&&(it.title||it.name))||'').trim()||'Untitled';
+const animePoster=it=>(it&&(it.poster||it.thumb||it.image||it.thumbnail||it.cover))||'';
+const animeEpLabel=(e,i)=>`S${(e&&(e.season||e.se))||1} E${(e&&(e.episode||e.ep))||(i+1)}`;
+const animeThumb=e=>(e&&(e.thumb||e.thumbnail||e.image||e.poster||e.still))||'';
+
+/* Curated popular titles that /anime/servers resolves (slug → tmdb). Used when catalog APIs are down. */
+const ANIME_POPULAR=[
+  {slug:'naruto',title:'Naruto',tmdb:'31910'},
+  {slug:'naruto-shippuden',title:'Naruto Shippuden',tmdb:'31910'},
+  {slug:'one-piece',title:'One Piece',tmdb:'37854'},
+  {slug:'demon-slayer',title:'Demon Slayer',tmdb:'85937'},
+  {slug:'jujutsu-kaisen',title:'Jujutsu Kaisen',tmdb:'95479'},
+  {slug:'attack-on-titan',title:'Attack on Titan',tmdb:'1429'},
+  {slug:'death-note',title:'Death Note',tmdb:'13916'},
+  {slug:'bleach',title:'Bleach',tmdb:'30984'},
+  {slug:'dragon-ball',title:'Dragon Ball',tmdb:'12971'},
+  {slug:'dragon-ball-z',title:'Dragon Ball Z',tmdb:'12971'},
+  {slug:'solo-leveling',title:'Solo Leveling',tmdb:'205120'},
+  {slug:'spy-x-family',title:'Spy x Family',tmdb:'120089'},
+  {slug:'hunter-x-hunter',title:'Hunter x Hunter',tmdb:'46298'},
+  {slug:'fullmetal-alchemist-brotherhood',title:'Fullmetal Alchemist: Brotherhood',tmdb:'31911'},
+  {slug:'my-hero-academia',title:'My Hero Academia',tmdb:'65930'},
+  {slug:'tokyo-ghoul',title:'Tokyo Ghoul',tmdb:'61374'},
+  {slug:'black-clover',title:'Black Clover',tmdb:'71446'},
+  {slug:'chainsaw-man',title:'Chainsaw Man',tmdb:'114410'},
+  {slug:'vinland-saga',title:'Vinland Saga',tmdb:'88803'},
+  {slug:'mob-psycho-100',title:'Mob Psycho 100',tmdb:'67075'},
+  {slug:'one-punch-man',title:'One Punch Man',tmdb:'63926'},
+  {slug:'haikyuu',title:'Haikyuu!!',tmdb:'60866'},
+  {slug:'steins-gate',title:"Steins;Gate",tmdb:'42509'},
+  {slug:'cowboy-bebop',title:'Cowboy Bebop',tmdb:'30983'}
 ];
-async function pageAnimeHome(tok){
-  setNav('anime');setMode('anime');
-  mount(`<div class="sk" style="height:340px;border-radius:28px"></div>${skRow()}${skRow()}`);
-  // Try native home first; on failure fall back to MovieBox curated rows
-  let native=null;
-  try{native=await api('/anime/home',{ttl:180000,timeout:12000})}catch(e){native=null}
-  if(tok!==RT)return;
-  if(native&&!native.detail&&!native.error){
-    const feat=(native.top_airing||[]).find(x=>x&&animeSlug(x))||(native.most_popular||[]).find(x=>x&&animeSlug(x));
-    let html='';
-    if(feat)html+=featureHTML({title:feat.title||feat.name||'',poster:feat.poster||feat.thumb,text:feat.overview||feat.description||'',
-      meta:`<span class="tag">Hindi dub</span><span>Top airing</span>`,
-      btns:`<a class="btn play" href="#/anime/watch/${enc(animeSlug(feat))}?ep=0">${ic('play')}Play</a><a class="btn glass" href="#/anime/title/${enc(animeSlug(feat))}">${ic('info')}Details</a>`});
-    html+=`<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:22px 0 4px">${searchField('af','Search anime…','')}<a class="btn line" href="#/anime/catalog">${ic('layers')}Full catalog</a></div>`;
-    const known=[['top_airing','Top airing'],['most_popular','Most popular'],['latest_episodes','Latest episodes'],['latest_movies','Anime movies'],['completed','Completed']];
-    const used=new Set();
-    known.forEach(([k,t])=>{if(Array.isArray(native[k])&&native[k].length){used.add(k);html+=rowHTML(t,native[k].filter(x=>x&&animeSlug(x)).map(cAnime))}});
-    Object.keys(native).forEach(k=>{if(used.has(k)||!Array.isArray(native[k])||!native[k].length||typeof native[k][0]!=='object')return;
-      const items=native[k].filter(x=>x&&animeSlug(x)&&(x.title||x.name));
-      if(items.length&&!/genre/i.test(k))html+=rowHTML(prettyKey(k),items.map(cAnime))});
-    if(Array.isArray(native.genres)&&native.genres.length)html+=`<section class="sec"><div class="sec-h" style="padding:0"><h2 class="h2">Genres</h2></div><div class="pills">${native.genres.map(g=>{const n=typeof g==='string'?g:(g.name||g.title||'');return n?`<a class="pill" href="#/search/${enc(n)}?tab=anime">${esc(n)}</a>`:''}).join('')}</div></section>`;
-    if(html.indexOf('class="sec"')>=0||feat){mount(html);wireField('af',q=>{location.hash='#/search/'+enc(q)+'?tab=anime'});return}
-  }
-  // MovieBox fallback — reliable Hindi anime
-  const rows=[];
-  await Promise.all(ANIME_QUERIES.map(async([title,q])=>{
-    try{
-      const d=await api('/mb/search?q='+enc(q),{ttl:300000,timeout:25000});
-      const items=mbFlat(d).slice(0,18);
-      if(items.length)rows.push({title,items});
-    }catch(e){}
-  }));
-  if(tok!==RT)return;
-  let html='';
-  if(rows[0]&&rows[0].items[0]){
-    const feat=rows[0].items[0];
-    html+=featureHTML({title:feat.title,poster:feat.poster,text:feat.overview||'',
-      meta:`<span class="tag">Hindi dub</span><span>MovieBox</span>${feat.year?`<span>${esc(feat.year)}</span>`:''}`,
-      btns:`<a class="btn play" href="#/mb/watch/${enc(feat.id)}?se=${feat.media==='tv'?1:0}&ep=${feat.media==='tv'?1:0}&t=${enc(feat.title)}">${ic('play')}Play</a><a class="btn glass" href="#/mb/title/${enc(feat.id)}">${ic('info')}Details</a>`});
-  }
-  html+=`<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:22px 0 4px">${searchField('af','Search anime…','')}<a class="btn line" href="#/mb?q=${enc('anime')}">${ic('box')}Browse MovieBox</a></div>`;
-  html+=`<div class="note" style="margin:8px 0 16px">Native anime catalog is temporarily offline — showing <b>MovieBox Hindi dubs</b> instead. Streams include quality, audio and subtitle options.</div>`;
-  rows.forEach(r=>{html+=rowHTML(r.title,r.items.map(cMb))});
-  if(!rows.length)html+=stateHTML('anime','Anime catalog unavailable','Both the native anime API and MovieBox search failed. Check System status.',retryBtn);
-  mount(html);
-  wireField('af',q=>{location.hash='#/search/'+enc(q)+'?tab=anime'});
-}
-async function pageAnimeCatalog(tok){
-  // Native catalog is down — redirect UX to MovieBox anime search
-  setNav('anime');setMode('anime');
-  mount(`<div class="phead"><div><h1 class="h1">Anime catalog</h1><p>Search Hindi-dubbed anime on MovieBox (native catalog is temporarily offline).</p></div><a class="btn line" href="#/anime">${ic('back')}Anime home</a></div>
-    ${searchField('cf','Search anime title…','','Search')}
-    <div class="pills" style="margin-top:14px">${['Naruto','One Piece','Demon Slayer','Jujutsu Kaisen','Death Note','Bleach','Dragon Ball','Attack on Titan'].map(t=>`<a class="pill" href="#/search/${enc(t)}?tab=anime">${esc(t)}</a>`).join('')}</div>
-    <div id="cg" style="margin-top:22px">${skGrid(12)}</div>`);
-  wireField('cf',q=>{location.hash='#/search/'+enc(q)+'?tab=anime'});
-  try{
-    const d=await api('/mb/search?q='+enc('anime hindi'),{ttl:300000,timeout:30000});
-    if(tok!==RT)return;
-    const items=mbFlat(d);
-    $('#cg').innerHTML=items.length?`<div class="grid">${items.map(cMb).join('')}</div>`:stateHTML('search','No titles found','Try a specific anime name above.');
-  }catch(e){if(tok===RT)$('#cg').innerHTML=stateHTML('alert','Could not load catalog',e.message,retryBtn)}
-}
-const animeEpLabel=(e,i)=>`S${e.season||1} E${e.episode||i+1}`;
-const animeThumb=e=>e.thumb||e.thumbnail||e.image||e.poster||'';
-async function getAnime(slug){
-  try{return await api('/anime/detail/'+enc(slug),{ttl:600000,timeout:20000})}
-  catch(e){
-    // Fallback: treat numeric/long ids as MovieBox subjects
-    if(/^\d{10,}$/.test(String(slug))){
-      const d=await api('/mb/detail/'+enc(slug),{ttl:600000,timeout:25000});
-      return{__mb:true,slug,raw:d};
-    }
-    throw e;
-  }
-}
-async function pageAnimeTitle(slug,tok){
-  setNav('anime');setMode('anime');
-  mount(`<div class="sk" style="height:340px;border-radius:28px"></div>${skGrid(8)}`);
-  let d;
-  try{d=await getAnime(slug)}catch(e){if(tok!==RT)return;mount(stateHTML('alert','This anime could not be loaded',e.message,retryBtn+` <a class="btn line" href="#/search/${enc(slug)}?tab=anime">${ic('search')}Search instead</a>`));return}
-  if(tok!==RT)return;
-  // MovieBox subject fallback
-  if(d&&d.__mb){
-    location.replace(`#/mb/title/${enc(slug)}`);
-    return;
-  }
-  const eps=d.episodes||[];
-  const title=d.title||slug,poster=d.poster||(eps[0]&&animeThumb(eps[0]))||'';
-  document.title=title+' — MovieAll';
-  const key='anime:'+slug,h=Hist.get(key);
-  const item={k:key,href:`#/anime/title/${enc(slug)}`,title,poster,sub:'Anime'};
-  const seasons=[...new Set(eps.map(e=>e.season||1))].sort((a,b)=>a-b);
-  let curS=seasons[0]||1;
-  const meta=`<span class="tag">Hindi dub</span>${eps.length?`<span>${eps.length} episodes</span>`:''}${(d.genres||[]).slice(0,4).map(g=>`<span>${esc(g)}</span>`).join('')}${(d.languages||[]).length?`<span>${esc(d.languages.join(', '))}</span>`:''}`;
-  mount(featureHTML({title,poster,text:d.overview||d.description||'',meta,
-    btns:`<a class="btn play" href="#/anime/watch/${enc(slug)}?ep=${h&&h.epIdx?h.epIdx:0}">${ic('play')}${h&&h.epIdx?'Continue · '+esc(h.sub||''):'Play episode 1'}</a>${listBtn(item,'btn glass','My list')}<a class="btn line" href="#/search/${enc(title)}?tab=mb">${ic('box')}MovieBox</a>`})
-    +`<section class="sec"><div class="sec-h" style="padding:0"><h2 class="h2">Episodes</h2></div>
-      ${seasons.length>1?`<div class="seasons" id="ss">${seasons.map(s=>`<button class="pill${s===curS?' on':''}" data-s="${s}">Season ${s}</button>`).join('')}</div>`:''}
-      <div id="ae"></div></section>`);
-  const hasThumbs=eps.some(e=>animeThumb(e));
-  const draw=()=>{
-    const rows=eps.map((e,i)=>({e,i})).filter(x=>(x.e.season||1)===curS);
-    $('#ae').innerHTML=rows.length?(hasThumbs
-      ?`<div class="eps">${rows.map(({e,i})=>`<a class="ep${h&&h.epIdx===i?' on':''}" href="#/anime/watch/${enc(slug)}?ep=${i}"><div class="th">${animeThumb(e)?imgTag(animeThumb(e),''):'E'+(e.episode||i+1)}</div><div style="min-width:0"><b>${esc(e.title||('Episode '+(e.episode||i+1)))}</b><small>${animeEpLabel(e,i)}</small></div></a>`).join('')}</div>`
-      :`<div class="epnum">${rows.map(({e,i})=>`<a class="pill${h&&h.epIdx===i?' on':''}" href="#/anime/watch/${enc(slug)}?ep=${i}">${e.episode||i+1}</a>`).join('')}</div>`)
-      :`<div class="note">No episodes listed. Try <a href="#/search/${enc(title)}?tab=mb" style="color:var(--accent)">MovieBox</a> or use the play button — embed servers may still work.</div>`;
-  };
-  draw();
-  const ss=$('#ss');if(ss)ss.onclick=e=>{const b=e.target.closest('[data-s]');if(!b)return;curS=+b.dataset.s;$$('#ss .pill').forEach(x=>x.classList.toggle('on',x===b));draw()};
-}
-/* Anime stream can return:
-   - single url / stream_url / m3u8
-   - separate video_url + audio_url (or video + audio arrays)
-   - qualities[] with video/audio pairs
-   - /anime/tracks for extra audio tracks
-   We normalise everything into {video, audio, tracks, embeds, raw} */
+/* ---- stream / tracks parsers (video + audio separate) ---- */
 function pickAnimeUrl(s){
   if(!s)return'';
   if(typeof s==='string')return s;
-  return s.stream_url||s.streamUrl||s.url||s.m3u8||s.hls||s.master||s.video_url||s.videoUrl||s.play_url||s.playUrl||'';
+  return s.stream_url||s.streamUrl||s.url||s.m3u8||s.hls||s.master||s.video_url||s.videoUrl||s.play_url||s.playUrl||s.src||'';
 }
 function parseAnimeStream(d){
-  const out={video:'',audio:'',tracks:[],embeds:[],qualities:[],raw:d};
+  const out={video:'',audio:'',tracks:[],embeds:[],qualities:[],hash:'',raw:d};
   if(!d||typeof d!=='object')return out;
-  // direct fields
+  out.hash=d.hash||d.video_hash||d.videoHash||'';
   out.video=abs(pickAnimeUrl(d)||d.video||d.video_url||d.videoUrl||'');
-  out.audio=abs(d.audio_url||d.audioUrl||d.audio||(d.audio_tracks&&d.audio_tracks[0]&&(d.audio_tracks[0].url||d.audio_tracks[0].src))||'');
-  // arrays of qualities
+  out.audio=abs(d.audio_url||d.audioUrl||d.audio||'');
   const quals=d.qualities||d.sources||d.streams||d.videos||[];
   if(Array.isArray(quals)){
     quals.forEach(q=>{
       if(!q)return;
-      if(q.type==='iframe'||q.type==='embed'||/embed|iframe/i.test(q.url||'')){out.embeds.push({label:q.name||q.label||'Embed',url:abs(q.url)});return}
+      if(q.type==='iframe'||q.type==='embed'||/embed|iframe/i.test(String(q.url||''))){out.embeds.push({label:q.name||q.label||'Embed',url:abs(q.url)});return}
       const v=abs(pickAnimeUrl(q)||q.video_url||q.video||'');
       const a=abs(q.audio_url||q.audioUrl||q.audio||'');
       const label=q.quality||q.resolution||q.label||q.name||(q.height?q.height+'p':'Stream');
       if(v)out.qualities.push({label,video:v,audio:a||out.audio,fmt:guessFmt(v,q.format||q.type)});
     });
   }
-  // audio tracks list
   const ats=d.audio_tracks||d.tracks||d.audios||[];
   if(Array.isArray(ats)){
     ats.forEach((t,i)=>{
@@ -3682,73 +3591,293 @@ function parseAnimeStream(d){
       if(u)out.tracks.push({i,label:t.label||t.name||t.lang||t.language||('Audio '+(i+1)),lang:t.lang||t.language||'',url:u});
     });
   }
-  if(!out.video&&out.qualities.length)out.video=out.qualities[0].video;
-  if(!out.audio&&out.qualities[0]&&out.qualities[0].audio)out.audio=out.qualities[0].audio;
-  if(!out.audio&&out.tracks[0])out.audio=out.tracks[0].url;
-  // servers style
   (d.servers||[]).forEach(s=>{
     if(!s||!s.url)return;
     if(s.type==='iframe'||s.type==='embed')out.embeds.push({label:s.name||s.label||'Server',url:abs(s.url)});
     else if(!out.video)out.video=abs(s.url);
   });
+  if(!out.video&&out.qualities.length)out.video=out.qualities[0].video;
+  if(!out.audio&&out.qualities[0]&&out.qualities[0].audio)out.audio=out.qualities[0].audio;
+  if(!out.audio&&out.tracks[0])out.audio=out.tracks[0].url;
+  if(!out.video){const u=pickAnimeUrl(d);if(u)out.video=abs(u)}
   return out;
 }
+async function animeFetchServers(slug,se,ep){
+  const q=`slug=${enc(slug)}&se=${se||1}&ep=${ep||1}`;
+  return api('/anime/servers?'+q,{timeout:30000,retries:1});
+}
 async function animeResolve(ep,slug){
-  // 1) episode already carries a stream
-  let url=ep.stream_url||ep.streamUrl||'';
-  if(url)return{video:abs(url),audio:'',tracks:[],embeds:[],qualities:[],raw:ep};
-  // 2) hash / page url → /anime/stream
-  const hash=ep.video_hash||ep.videoHash||ep.hash||'';
-  const page=ep.url||ep.page_url||ep.link||'';
+  // 1) episode already has stream
+  let url=ep&&(ep.stream_url||ep.streamUrl||'');
+  if(url)return{video:abs(url),audio:abs(ep.audio_url||ep.audioUrl||''),tracks:[],embeds:[],qualities:[],hash:ep.video_hash||ep.hash||'',raw:ep};
+  const hash=ep&&(ep.video_hash||ep.videoHash||ep.hash)||'';
+  const page=ep&&(ep.url||ep.page_url||ep.link)||'';
   let raw=null;
+  // 2) /anime/stream by hash or page url
   try{
-    if(hash)raw=await api('/anime/stream?hash='+enc(hash),{timeout:45000});
-    else if(page)raw=await api('/anime/stream?url='+enc(page),{timeout:45000});
-    else if(slug&&(ep.episode!=null||ep.ep!=null)){
-      // try servers endpoint (TMDB / slug based)
-      try{
-        const se=ep.season||ep.se||1,epn=ep.episode||ep.ep||1;
-        raw=await api(`/anime/servers?slug=${enc(slug)}&se=${se}&ep=${epn}`,{timeout:30000,retries:0});
-      }catch(e){}
-    }
-  }catch(e){/* fall through */}
+    if(hash)raw=await api('/anime/stream?hash='+enc(hash),{timeout:45000,retries:0});
+    else if(page)raw=await api('/anime/stream?url='+enc(page),{timeout:45000,retries:0});
+  }catch(e){}
   if(raw){
     const p=parseAnimeStream(raw);
-    if(p.video||p.qualities.length||p.embeds.length)return p;
-    // last resort single url pick
-    const u=pickAnimeUrl(raw);
-    if(u)return{video:abs(u),audio:'',tracks:[],embeds:[],qualities:[],raw};
+    if(p.video||p.qualities.length||p.embeds.length){
+      // also pull tracks
+      try{
+        const tr=await api('/anime/tracks?'+(hash?'hash='+enc(hash):'url='+enc(page||p.video)),{timeout:20000,retries:0});
+        const extra=parseAnimeStream(tr);
+        if(extra.tracks.length)p.tracks=extra.tracks;
+        if(extra.audio&&!p.audio)p.audio=extra.audio;
+      }catch(e){}
+      return p;
+    }
   }
-  return{video:'',audio:'',tracks:[],embeds:[],qualities:[],raw};
+  // 3) /anime/servers (always available)
+  try{
+    const se=(ep&&(ep.season||ep.se))||1, epn=(ep&&(ep.episode||ep.ep))||1;
+    raw=await animeFetchServers(slug,se,epn);
+    const p=parseAnimeStream(raw);
+    if(p.embeds.length||p.video||p.qualities.length)return p;
+  }catch(e){}
+  return{video:'',audio:'',tracks:[],embeds:[],qualities:[],hash:'',raw};
 }
+
+/* ---- HOME ---- */
+async function pageAnimeHome(tok){
+  setNav('anime');setMode('anime');
+  mount(`<div class="sk" style="height:340px;border-radius:28px"></div>${skRow()}${skRow()}`);
+
+  // Fire all discovery endpoints in parallel — use whatever responds
+  const tries=await Promise.allSettled([
+    api('/anime/home',{ttl:180000,timeout:15000}),
+    api('/anime/hero',{ttl:180000,timeout:12000}),
+    api('/anime/top10',{ttl:180000,timeout:12000}),
+    api('/anime/spotlights',{ttl:180000,timeout:12000}),
+    api('/anime/status',{ttl:60000,timeout:8000})
+  ]);
+  if(tok!==RT)return;
+  const home=tries[0].status==='fulfilled'?tries[0].value:null;
+  const hero=tries[1].status==='fulfilled'?tries[1].value:null;
+  const top10=tries[2].status==='fulfilled'?tries[2].value:null;
+  const spots=tries[3].status==='fulfilled'?tries[3].value:null;
+  const status=tries[4].status==='fulfilled'?tries[4].value:null;
+
+  const hasCatalog=home&&!home.detail&&!home.error&&typeof home==='object';
+  let html='';
+
+  // Featured from native home/hero
+  let feat=null;
+  if(hasCatalog){
+    feat=(home.top_airing||home.spotlight||[]).find(x=>x&&animeSlug(x))
+      ||(home.most_popular||[]).find(x=>x&&animeSlug(x));
+  }
+  if(!feat&&hero){
+    const h=Array.isArray(hero)?hero[0]:(hero.item||hero.hero||hero);
+    if(h&&animeSlug(h))feat=h;
+  }
+  if(feat){
+    html+=featureHTML({title:animeTitle(feat),poster:animePoster(feat),text:feat.overview||feat.description||'',
+      meta:`<span class="tag">Anime</span><span>Hindi · Sub</span>`,
+      btns:`<a class="btn play" href="#/anime/watch/${enc(animeSlug(feat))}?ep=0">${ic('play')}Play</a><a class="btn glass" href="#/anime/title/${enc(animeSlug(feat))}">${ic('info')}Details</a>`});
+  }else{
+    // Curated featured
+    const f=ANIME_POPULAR[0];
+    html+=featureHTML({title:f.title,poster:'',text:'Stream via /anime/servers — pick any title below.',
+      meta:`<span class="tag">Anime API</span>${status&&status.ok?`<span class="rate">${ic('check')} Streaming online</span>`:''}`,
+      btns:`<a class="btn play" href="#/anime/watch/${enc(f.slug)}?ep=0">${ic('play')}Play ${esc(f.title)}</a><a class="btn glass" href="#/anime/catalog">${ic('layers')}Browse all</a>`});
+  }
+
+  html+=`<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:22px 0 4px">${searchField('af','Search anime (slug or title)…','')}<a class="btn line" href="#/anime/catalog">${ic('layers')}Catalog</a></div>`;
+
+  if(status){
+    html+=`<div class="note" style="margin:8px 0 16px"><b>Anime API:</b> ${esc(status.provider||'hindianime')} · ${status.ok?'Streaming available':'Offline'}${status.note?' — '+esc(status.note):''}</div>`;
+  }
+
+  // Native rows
+  if(hasCatalog){
+    const known=[['top_airing','Top airing'],['most_popular','Most popular'],['latest_episodes','Latest episodes'],['latest_movies','Anime movies'],['completed','Completed'],['trending','Trending']];
+    const used=new Set();
+    known.forEach(([k,t])=>{
+      if(Array.isArray(home[k])&&home[k].length){used.add(k);html+=rowHTML(t,home[k].filter(x=>x&&animeSlug(x)).map(cAnime))}
+    });
+    Object.keys(home).forEach(k=>{
+      if(used.has(k)||!Array.isArray(home[k])||!home[k].length||typeof home[k][0]!=='object')return;
+      const items=home[k].filter(x=>x&&animeSlug(x)&&(x.title||x.name));
+      if(items.length&&!/genre/i.test(k))html+=rowHTML(prettyKey(k),items.map(cAnime));
+    });
+    if(Array.isArray(home.genres)&&home.genres.length){
+      html+=`<section class="sec"><div class="sec-h" style="padding:0"><h2 class="h2">Genres</h2></div><div class="pills">${home.genres.map(g=>{const n=typeof g==='string'?g:(g.name||g.title||'');return n?`<a class="pill" href="#/search/${enc(n)}?tab=anime">${esc(n)}</a>`:''}).join('')}</div></section>`;
+    }
+  }
+
+  // top10 / spotlights
+  const listify=d=>{
+    if(!d)return[];
+    if(Array.isArray(d))return d;
+    return d.items||d.results||d.list||d.anime||d.data||[];
+  };
+  const t10=listify(top10).filter(x=>x&&animeSlug(x));
+  if(t10.length)html+=rowHTML('Top 10',t10.map(cAnime));
+  const sp=listify(spots).filter(x=>x&&animeSlug(x));
+  if(sp.length)html+=rowHTML('Spotlights',sp.map(cAnime));
+
+  // Always show curated popular (works even when catalog is down)
+  html+=rowHTML('Popular (Anime servers)',ANIME_POPULAR.map(x=>cAnime(x)));
+
+  if(!hasCatalog&&!t10.length&&!sp.length){
+    html+=`<div class="note" style="margin-top:12px">Native catalog endpoints are temporarily unavailable. You can still <b>search by title/slug</b> or open any Popular title — playback uses <code>/anime/servers</code>.</div>`;
+  }
+
+  mount(html);
+  wireField('af',q=>{location.hash='#/search/'+enc(q)+'?tab=anime'});
+}
+
+/* ---- CATALOG ---- */
+async function pageAnimeCatalog(tok){
+  setNav('anime');setMode('anime');
+  mount(`<div class="phead"><div><h1 class="h1">Anime catalog</h1><p>From the Anime API · A–Z.</p></div><a class="btn line" href="#/anime">${ic('back')}Anime home</a></div>${skGrid(12)}`);
+  let all=[];
+  try{
+    const d=await api('/anime/catalog?type=all',{ttl:300000,timeout:45000});
+    if(tok!==RT)return;
+    all=(d.items||d.catalog||d.results||(Array.isArray(d)?d:[])).filter(x=>x&&animeSlug(x))
+      .sort((a,b)=>String(a.title||a.name||'').localeCompare(String(b.title||b.name||'')));
+  }catch(e){
+    // Catalog down — show curated + search
+    if(tok!==RT)return;
+    all=ANIME_POPULAR.slice();
+  }
+  let f={t:'all',l:'',q:''},shown=60,list=all;
+  const letters='#ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
+  mount(`<div class="phead"><div><h1 class="h1">Anime catalog</h1><p id="cnt"></p></div><a class="btn line" href="#/anime">${ic('back')}Anime home</a></div>
+    ${searchField('cf','Filter or jump to a slug…','','Go')}
+    <div class="pills" style="margin-top:14px" id="ct"><button class="pill on" data-t="all">All</button><button class="pill" data-t="series">Series</button><button class="pill" data-t="movie">Movies</button></div>
+    <div class="alpha" id="cl">${letters.map(l=>`<button class="pill" data-l="${l}" style="height:32px;padding:0 12px">${l}</button>`).join('')}</div>
+    <div id="cg"></div><div class="sentinel" id="cs"></div>`);
+  function apply(){
+    list=all.filter(it=>{
+      const t=String(it.title||it.name||it.slug||'').trim();
+      if(f.q&&!normTitle(t).includes(normTitle(f.q))&&!normTitle(animeSlug(it)).includes(normTitle(f.q)))return false;
+      if(f.l){const c=(t[0]||'').toUpperCase();if(f.l==='#'?/[A-Z]/.test(c):c!==f.l)return false}
+      if(f.t!=='all'){const ty=String(it.type||it.kind||'').toLowerCase();if(ty){if(f.t==='movie'?!/movie|film/.test(ty):/movie|film/.test(ty))return false}}
+      return true;
+    });
+    shown=60;draw();
+  }
+  function draw(){
+    $('#cnt').textContent=list.length+' title'+(list.length===1?'':'s');
+    $('#cg').innerHTML=list.length?`<div class="grid">${list.slice(0,shown).map(cAnime).join('')}</div>`:stateHTML('search','No matches','Try a different filter, or type a slug above and press Go.');
+    $('#cs').innerHTML=shown<list.length?'<div class="spin"></div>':'';
+  }
+  const io=new IntersectionObserver(es=>{if(es.some(x=>x.isIntersecting)&&shown<list.length){shown+=60;draw()}},{rootMargin:'600px'});
+  io.observe($('#cs'));App.leave.push(()=>io.disconnect());
+  $('#ct').onclick=e=>{const b=e.target.closest('[data-t]');if(!b)return;f.t=b.dataset.t;$$('#ct .pill').forEach(x=>x.classList.toggle('on',x===b));apply()};
+  $('#cl').onclick=e=>{const b=e.target.closest('[data-l]');if(!b)return;f.l=f.l===b.dataset.l?'':b.dataset.l;$$('#cl .pill').forEach(x=>x.classList.toggle('on',x.dataset.l===f.l));apply()};
+  wireField('cf',q=>{
+    // If exact slug-like input, jump to title page
+    const s=q.trim().toLowerCase().replace(/\s+/g,'-');
+    if(/^[a-z0-9][a-z0-9-]{1,60}$/.test(s)&&!list.some(x=>normTitle(animeTitle(x)).includes(normTitle(q)))){
+      location.hash='#/anime/title/'+enc(s);return;
+    }
+    f.q=q;apply();
+  });
+  const cfi=$('#cf input');if(cfi)cfi.addEventListener('input',e=>{if(!e.target.value.trim()&&f.q){f.q='';apply()}});
+  draw();
+}
+
+/* ---- DETAIL ---- */
+async function getAnime(slug){
+  return api('/anime/detail/'+enc(slug),{ttl:300000,timeout:25000});
+}
+async function pageAnimeTitle(slug,tok){
+  setNav('anime');setMode('anime');
+  mount(`<div class="sk" style="height:340px;border-radius:28px"></div>${skGrid(8)}`);
+  let d=null, detailErr=null;
+  try{d=await getAnime(slug)}catch(e){detailErr=e}
+
+  // Probe servers so we know the title resolves even without detail
+  let serversMeta=null;
+  try{serversMeta=await animeFetchServers(slug,1,1)}catch(e){}
+  if(tok!==RT)return;
+
+  if(!d&&!(serversMeta&&serversMeta.ok)){
+    mount(stateHTML('alert','This anime could not be loaded',
+      (detailErr&&detailErr.message)||'Detail and servers both failed for this slug.',
+      retryBtn+` <a class="btn line" href="#/anime">${ic('back')}Anime home</a>`));
+    return;
+  }
+
+  // Build a minimal detail object from servers + optional detail
+  const eps=(d&&d.episodes)||[];
+  const title=(d&&(d.title||d.name))||(serversMeta&&serversMeta.title)||slug.replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+  const poster=(d&&(d.poster||d.image))||'';
+  const overview=(d&&(d.overview||d.description))||'';
+  const tmdbId=(d&&(d.tmdb_id||d.tmdbId))||(serversMeta&&serversMeta.tmdb_id)||'';
+  document.title=title+' — MovieAll';
+  const key='anime:'+slug,h=Hist.get(key);
+  const item={k:key,href:`#/anime/title/${enc(slug)}`,title,poster,sub:'Anime'};
+  const seasons=[...new Set((eps.length?eps:[{season:1}]).map(e=>e.season||1))].sort((a,b)=>a-b);
+  let curS=seasons[0]||1;
+  const meta=`<span class="tag">Anime</span>${tmdbId?`<span>TMDB ${esc(String(tmdbId))}</span>`:''}${eps.length?`<span>${eps.length} episodes</span>`:''}${((d&&d.genres)||[]).slice(0,4).map(g=>`<span>${esc(typeof g==='string'?g:(g.name||''))}</span>`).join('')}`;
+
+  mount(featureHTML({title,poster,text:overview||(serversMeta&&serversMeta.ok?'Play via Anime servers — episodes load from the player.':''),meta,
+    btns:`<a class="btn play" href="#/anime/watch/${enc(slug)}?ep=${h&&h.epIdx!=null?h.epIdx:0}">${ic('play')}${h&&h.epIdx!=null?'Continue · '+esc(h.sub||''):'Play episode 1'}</a>${listBtn(item,'btn glass','My list')}`})
+    +`<section class="sec"><div class="sec-h" style="padding:0"><h2 class="h2">Episodes</h2></div>
+      ${seasons.length>1?`<div class="seasons" id="ss">${seasons.map(s=>`<button class="pill${s===curS?' on':''}" data-s="${s}">Season ${s}</button>`).join('')}</div>`:''}
+      <div id="ae"></div></section>`);
+
+  const hasThumbs=eps.some(e=>animeThumb(e));
+  const draw=()=>{
+    if(eps.length){
+      const rows=eps.map((e,i)=>({e,i})).filter(x=>(x.e.season||1)===curS);
+      $('#ae').innerHTML=rows.length?(hasThumbs
+        ?`<div class="eps">${rows.map(({e,i})=>`<a class="ep${h&&h.epIdx===i?' on':''}" href="#/anime/watch/${enc(slug)}?ep=${i}"><div class="th">${animeThumb(e)?imgTag(animeThumb(e),''):'E'+(e.episode||i+1)}</div><div style="min-width:0"><b>${esc(e.title||('Episode '+(e.episode||i+1)))}</b><small>${animeEpLabel(e,i)}</small></div></a>`).join('')}</div>`
+        :`<div class="epnum">${rows.map(({e,i})=>`<a class="pill${h&&h.epIdx===i?' on':''}" href="#/anime/watch/${enc(slug)}?ep=${i}">${e.episode||i+1}</a>`).join('')}</div>`)
+        :`<div class="note">No episodes in this season.</div>`;
+    }else{
+      // No episode list from API — offer a number picker that still hits /anime/servers
+      const n=24;
+      $('#ae').innerHTML=`<div class="note" style="margin-bottom:12px">Episode list not provided by the API. Pick an episode number — playback uses <code>/anime/servers</code>.</div>
+        <div class="epnum">${Array.from({length:n},(_,i)=>`<a class="pill${h&&h.epIdx===i?' on':''}" href="#/anime/watch/${enc(slug)}?ep=${i}">${i+1}</a>`).join('')}</div>
+        <form class="field" id="aep" style="margin-top:14px;max-width:360px"><input name="ep" type="number" min="1" value="1" aria-label="Episode" placeholder="Episode #"><button class="btn sm" type="submit">Play</button></form>`;
+      const f=$('#aep');if(f)f.addEventListener('submit',e=>{e.preventDefault();const n=Math.max(1,+f.ep.value||1);location.hash=`#/anime/watch/${enc(slug)}?ep=${n-1}`});
+    }
+  };
+  draw();
+  const ss=$('#ss');if(ss)ss.onclick=e=>{const b=e.target.closest('[data-s]');if(!b)return;curS=+b.dataset.s;$$('#ss .pill').forEach(x=>x.classList.toggle('on',x===b));draw()};
+}
+
+/* ---- WATCH ---- */
 async function pageAnimeWatch(slug,idx,tok){
   setNav('anime');setMode('anime');
   document.body.classList.add('watching');
-  mount(`<div class="wgrid has-side"><section class="wmain"><div class="stage" id="stage"><div class="ld"><div class="spin"></div><span>Loading episode…</span></div></div><div class="wbar" id="wbar"><div class="sk" style="height:42px;width:min(420px,70%)"></div></div><div id="wpanel"></div></section><aside class="wside" id="wside"></aside></div>`,'watch');
-  let d;
-  try{d=await getAnime(slug)}catch(e){
-    // Still try embed servers with the slug as title
-    d={title:slug,episodes:[{season:1,episode:(idx||0)+1,title:'Episode '+(idx+1)}]};
-  }
+  mount(`<div class="wgrid has-side"><section class="wmain"><div class="stage" id="stage"><div class="ld"><div class="spin"></div><span>Loading from Anime API…</span></div></div><div class="wbar" id="wbar"><div class="sk" style="height:42px;width:min(420px,70%)"></div></div><div id="wpanel"></div></section><aside class="wside" id="wside"></aside></div>`,'watch');
+
+  let d=null;
+  try{d=await getAnime(slug)}catch(e){d=null}
   if(tok!==RT)return;
-  if(d&&d.__mb){location.replace(`#/mb/watch/${enc(slug)}?se=1&ep=${(idx||0)+1}&t=${enc(slug)}`);return}
-  let eps=d.episodes||[];
+
+  let eps=(d&&d.episodes)||[];
   if(!eps.length){
-    // Synthetic episode list so /anime/servers can still be tried
-    eps=Array.from({length:24},(_,i)=>({season:1,episode:i+1,title:'Episode '+(i+1)}));
-    d.episodes=eps;
+    // Synthetic list — user can still pick episode; servers API takes se/ep
+    eps=Array.from({length:50},(_,i)=>({season:1,episode:i+1,title:'Episode '+(i+1)}));
   }
   idx=clamp(idx,0,eps.length-1);
-  const ep=eps[idx],title=d.title||slug,key='anime:'+slug;
+  const ep=eps[idx];
+  const title=(d&&(d.title||d.name))||slug.replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+  const key='anime:'+slug;
   const label=animeEpLabel(ep,idx);
   const stage=$('#stage');
   const goIdx=i=>{if(i>=0&&i<eps.length)location.hash=`#/anime/watch/${enc(slug)}?ep=${i}`};
   document.title=`${title} ${label} — MovieAll`;
-  Hist.put({k:key,href:`#/anime/watch/${enc(slug)}?ep=${idx}`,title,poster:d.poster||animeThumb(ep),sub:label,epIdx:idx,ep:idx,pos:(Hist.get(key)||{}).epIdx===idx?(Hist.get(key)||{}).pos:0,dur:(Hist.get(key)||{}).epIdx===idx?(Hist.get(key)||{}).dur:0});
+  Hist.put({k:key,href:`#/anime/watch/${enc(slug)}?ep=${idx}`,title,poster:(d&&d.poster)||'',sub:label,epIdx:idx,ep:idx,
+    pos:(Hist.get(key)||{}).epIdx===idx?(Hist.get(key)||{}).pos:0,
+    dur:(Hist.get(key)||{}).epIdx===idx?(Hist.get(key)||{}).dur:0});
+
   $('#wbar').innerHTML=`<div style="min-width:0"><h1 class="h2">${esc(title)}<small>${esc(label)}${ep.title?' — '+esc(ep.title):''}</small></h1></div><div class="wact">
     ${idx>0?`<a class="btn sm glass" href="#/anime/watch/${enc(slug)}?ep=${idx-1}">${ic('prev')}Previous</a>`:''}
     ${idx<eps.length-1?`<a class="btn sm" href="#/anime/watch/${enc(slug)}?ep=${idx+1}">Next episode ${ic('next')}</a>`:''}
     <a class="btn sm glass" href="#/anime/title/${enc(slug)}">${ic('info')}Details</a></div>`;
+
   const seasons=[...new Set(eps.map(e=>e.season||1))].sort((a,b)=>a-b);
   let curS=ep.season||1;
   const drawSide=()=>{
@@ -3759,11 +3888,14 @@ async function pageAnimeWatch(slug,idx,tok){
     const on=$('#wside .ep.on');if(on)on.scrollIntoView({block:'nearest'});
   };
   drawSide();
+
   const fail=(msg)=>{stage.innerHTML=`<div class="ld" style="background:#05040d">${ic('alert')}<span style="max-width:40ch;text-align:center">${esc(msg)}</span><div class="pills" style="justify-content:center"><button class="btn sm" id="rt">${ic('refresh')}Retry</button>${idx<eps.length-1?`<a class="btn sm glass" href="#/anime/watch/${enc(slug)}?ep=${idx+1}">Next episode</a>`:''}</div></div>`;const r=$('#rt');if(r)r.onclick=()=>route()};
+
+  // Resolve via Anime API only
   let parsed;
   try{parsed=await animeResolve(ep,slug)}catch(e){if(tok!==RT)return;fail(e.message);return}
   if(tok!==RT)return;
-  // Build playable sources list (quality variants + embeds)
+
   const sources=[];
   const addSrc=(label,video,audio,fmt)=>{
     if(!video)return;
@@ -3778,12 +3910,9 @@ async function pageAnimeWatch(slug,idx,tok){
     }else urls=[{url:BASE+'/anime/hls?u='+enc(video),via:'proxy'},{url:video,via:'direct'}];
     sources.push({label:label||(isHls?'HLS':'Video'),fmt:fmt||(isHls?'hls':guessFmt(video)),urls,raw:video,audio:audio||''});
   };
-  if(parsed.qualities.length){
-    parsed.qualities.forEach(q=>addSrc(q.label,q.video,q.audio||parsed.audio,q.fmt));
-  }else if(parsed.video){
-    addSrc('Stream',parsed.video,parsed.audio);
-  }
-  // Panel for server / quality / audio selection
+  if(parsed.qualities.length)parsed.qualities.forEach(q=>addSrc(q.label,q.video,q.audio||parsed.audio,q.fmt));
+  else if(parsed.video)addSrc('Stream',parsed.video,parsed.audio);
+
   const panel=$('#wpanel');
   const renderPanel=()=>{
     let html='<div class="srv">';
@@ -3791,9 +3920,10 @@ async function pageAnimeWatch(slug,idx,tok){
     parsed.embeds.forEach((e,i)=>html+=`<button class="pill" data-emb="${i}">${ic('server')}${esc(e.label)}</button>`);
     html+='</div>';
     if(parsed.tracks.length>1||parsed.audio){
-      html+=`<div class="note" style="margin-top:12px"><b>Audio tracks</b> available — open ⚙ in the player to switch language / quality. Separate video + audio streams are merged automatically when both are present.</div>`;
+      html+=`<div class="note" style="margin-top:12px"><b>Separate audio tracks</b> from <code>/anime/tracks</code> — open ⚙ in the player to switch language. Video + audio are kept in sync.</div>`;
     }
-    if(!sources.length&&!parsed.embeds.length)html=`<div class="note"><b>No stream found</b> for this episode yet. Try another episode or check System status.</div>`;
+    if(!sources.length&&!parsed.embeds.length)html=`<div class="note"><b>No stream from Anime API</b> for this episode. Try another episode number.</div>`;
+    else html+=`<div class="note" style="margin-top:12px">Source: <code>/anime/servers</code>${parsed.hash?' + /anime/stream':''}. If an embed is black, switch server.</div>`;
     panel.innerHTML=html;
     panel.onclick=ev=>{
       const b=ev.target.closest('[data-src]');
@@ -3813,11 +3943,10 @@ async function pageAnimeWatch(slug,idx,tok){
     if(App.embed){App.embed.destroy();App.embed=null}
     if(App.player){App.player.destroy();App.player=null}
     stage.innerHTML='';
-    // Extra audio tracks for the menu
     const extraAudio=parsed.tracks.length?parsed.tracks.map(t=>({label:t.label,lang:t.lang,url:t.url})):[];
     if(s.audio&&!extraAudio.some(x=>x.url===s.audio))extraAudio.unshift({label:'Default audio',lang:'',url:s.audio});
     App.player=new VPlayer(stage,{
-      title,sub:label+(ep.title?' — '+ep.title:''),poster:d.poster||animeThumb(ep),preferAudio:/hin|hindi|bn|bengali/i,
+      title,sub:label+(ep.title?' — '+ep.title:''),poster:(d&&d.poster)||'',preferAudio:/hin|hindi|bn|bengali/i,
       resume:old&&old.epIdx===idx?old.pos:0,
       sources:[s],
       externalAudio:extraAudio,
@@ -3832,7 +3961,7 @@ async function pageAnimeWatch(slug,idx,tok){
     App.embed=mountEmbed(stage,parsed.embeds[0].url,{title});
     $$('#wpanel [data-emb]').forEach((x,i)=>x.classList.toggle('on',i===0));
   }else{
-    fail('No stream is available for this episode yet.');
+    fail('No stream is available for this episode from the Anime API.');
   }
 }
 
@@ -4213,14 +4342,22 @@ async function pageSearch(q,tab,tok){
   const secs=[
     {k:'mb',t:'Movies & series',load:()=>api('/mb/search?q='+enc(q),{ttl:180000,timeout:35000}),cards:d=>mbFlat(d).map(cMb)},
     {k:'anime',t:'Anime',load:async()=>{
-      try{const d=await api('/anime/search?q='+enc(q),{ttl:180000,timeout:20000});const items=((d&&d.items)||[]).filter(x=>x&&animeSlug(x));if(items.length)return{__anime:items}}catch(e){}
-      const d=await api('/mb/search?q='+enc(q+' anime'),{ttl:180000,timeout:35000});
-      return{__mb:mbFlat(d).filter(x=>/anime|cartoon|naruto|one piece|demon|jujutsu|attack on|bleach|dragon ball/i.test(x.title+' '+x.genre)||x.media==='tv')};
-    },cards:d=>{
-      if(d&&d.__anime)return d.__anime.map(cAnime);
-      if(d&&d.__mb)return d.__mb.map(cMb);
-      return mbFlat(d).map(cMb);
-    }},
+      // Only /anime/* endpoints
+      try{
+        const d=await api('/anime/search?q='+enc(q),{ttl:180000,timeout:20000});
+        const items=((d&&d.items)||d.results||(Array.isArray(d)?d:[])).filter(x=>x&&(x.slug||x.id||x.title));
+        if(items.length)return items;
+      }catch(e){}
+      // Fallback: treat query as slug and verify via /anime/servers
+      const slug=q.trim().toLowerCase().replace(/\s+/g,'-');
+      try{
+        const s=await api('/anime/servers?slug='+enc(slug)+'&se=1&ep=1',{timeout:20000,retries:0});
+        if(s&&s.ok)return[{slug:slug,title:s.title||q,type:'series',tmdb_id:s.tmdb_id}];
+      }catch(e){}
+      // Match curated popular list
+      const hit=(typeof ANIME_POPULAR!=='undefined'?ANIME_POPULAR:[]).filter(x=>normTitle(x.title).includes(normTitle(q))||x.slug.includes(slug));
+      return hit;
+    },cards:d=>(Array.isArray(d)?d:[]).map(cAnime)},
     {k:'tmdb',t:'TMDB catalog',load:()=>api('/api/search?q='+enc(q),{ttl:180000}),cards:d=>{
       const mb=mbFlat(d);if(mb.length)return mb.map(cMb);
       return tmdbList(d).map(cTmdb);
