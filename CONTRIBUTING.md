@@ -2,7 +2,8 @@
 
 Thanks for taking the time to contribute.
 
-This project is maintained at **[Shawon727/Moviebox-API](https://github.com/Shawon727/Moviebox-API)**.  
+This project is maintained at **[Shawon727/StreamHub-Api](https://github.com/Shawon727/StreamHub-Api)**  
+
 Guidelines below are recommendations, not hard rules — use good judgment, and feel free to improve this document in a PR.
 
 ---
@@ -11,12 +12,12 @@ Guidelines below are recommendations, not hard rules — use good judgment, and 
 
 ### Reporting bugs
 
-- Open an issue: [github.com/Shawon727/Moviebox-API/issues](https://github.com/Shawon727/Moviebox-API/issues)
+- Open an issue on the repo’s **Issues** page
 - Include:
   - Expected vs actual behavior
   - Steps to reproduce
-  - Endpoint or UI path (e.g. `/api/play`, `/music/play/...`, `#/watch/...`)
-  - Environment: Python version, OS, deploy target (local / Termux / Railway / FastAPI Cloud)
+  - Endpoint or UI path (e.g. `/mb/stream/...`, `/yt-music/play/...`, `/pb/stream?...`)
+  - Environment: Python version, OS, deploy target (local / Termux / Railway / Vercel / FastAPI Cloud)
   - Relevant logs (no secrets or full cookies)
 
 ### Suggesting enhancements
@@ -30,7 +31,7 @@ Guidelines below are recommendations, not hard rules — use good judgment, and 
 2. Keep changes focused (one concern per PR when possible)
 3. If you change behavior, update `readme.md` / docs notes when relevant
 4. Run a quick local check (see below)
-5. Prefer **PEP 8**-style Python; keep the embedded SPA readable
+5. Prefer **PEP 8**-style Python; keep helpers readable
 6. Open a PR with a clear summary of *what* and *why*
 
 ---
@@ -40,8 +41,8 @@ Guidelines below are recommendations, not hard rules — use good judgment, and 
 ### 1. Clone & install
 
 ```bash
-git clone https://github.com/Shawon727/Moviebox-API.git
-cd Moviebox-API
+git clone https://github.com/Shawon727/StreamHub-Api.git
+cd StreamHub-Api
 pip install -r requirements.txt
 ```
 
@@ -54,6 +55,8 @@ httpx==0.27.2
 beautifulsoup4==4.12.3
 yt-dlp>=2024.8.0
 ```
+
+(`yt-dlp` is optional; InnerTube / JioSaavn work without it.)
 
 ### 2. Run the app
 
@@ -69,9 +72,9 @@ python main.py
 
 | URL | Purpose |
 |-----|---------|
-| http://127.0.0.1:8000/ | Web UI |
 | http://127.0.0.1:8000/docs | Swagger |
 | http://127.0.0.1:8000/health | Health |
+| http://127.0.0.1:8000/ | Web UI (if embedded SPA is present) |
 
 ### 3. Smoke-test before PR
 
@@ -79,13 +82,16 @@ python main.py
 # health
 curl -s http://127.0.0.1:8000/health
 
-# catalog
-curl -s "http://127.0.0.1:8000/api/home" | head -c 200
+# MovieBox
+curl -s "http://127.0.0.1:8000/mb/search?q=avatar" | head -c 200
 
-# fast play (embeds)
-curl -s "http://127.0.0.1:8000/api/play?tmdb_id=19995&media=movie&fast=1" | head -c 300
+# PirateBot
+curl -s "http://127.0.0.1:8000/pb/stream?tmdb_id=550&type=movie" | head -c 300
 
-# music
+# YouTube Music CDN
+curl -s "http://127.0.0.1:8000/yt-music/play/dQw4w9WgXcQ" | head -c 300
+
+# Music search
 curl -s "http://127.0.0.1:8000/music/search?q=One%20Love" | head -c 200
 
 # optional full verify script (if present)
@@ -95,22 +101,28 @@ python verify.py
 ### 4. Project map
 
 ```text
-api.py          # API routes + embedded SPA (main surface)
-main.py         # entry: from api import app
+api.py              # Full API (all providers)
+main.py             # entry: from api import app
 requirements.txt
 readme.md
 CONTRIBUTING.md
+LICENSE
+cookies.txt         # optional (YouTube / YT Music)
 ```
 
 **Areas of the codebase**
 
 | Area | Prefix / location | Notes |
 |------|-------------------|--------|
-| Web SPA | `SPA_HTML` in `api.py`, `/` | Avoid duplicate `let` bindings in JS |
-| Catalog / play | `/api/*` | Prefer `fast=1` for embeds; 4K is optional |
-| MovieBox | `/mb/*` | HMAC + host rotation; proxy for DASH |
-| 4KHDHub | `/fk/*`, `/tools/resolve` | Scraping can break when sites change |
-| Music | `/music/*` | JioSaavn + stream proxy; don’t hardcode CDN URLs |
+| MovieBox | `/mb/*` · `/moviebox/*` | HMAC + host rotation; Cookie for DASH |
+| MovieBox New | `/mbn/*` | play-info + signCookie → sbcdn |
+| PirateBot | `/pb/*` | TMDB edge proxy + embed servers |
+| CineStream | `/cs/*` | ToonStream catalog + multi-source |
+| Anime | `/anime/*` | HLS proxy for CORS / 410 issues |
+| Music | `/music/*` · `/yt-music/*` | JioSaavn + InnerTube CDN + lyrics |
+| YouTube | `/yt/*` | InnerTube googlevideo streams |
+| Downloader | `/dl/*` | Multi-site extract |
+| Tools | `/tools/*` | Hub resolve, translate, TTS, … |
 
 ---
 
@@ -118,10 +130,11 @@ CONTRIBUTING.md
 
 - **Single-file design**: most logic lives in `api.py` for easy deploy — keep helpers near their routes
 - **Async I/O**: use `httpx.AsyncClient`; don’t block the event loop (heavy work → `asyncio.to_thread`)
-- **Secrets**: no committed cookies, tokens, or private API keys; use env vars when adding new keys
-- **Providers change**: scrapers (4KHDHub, HubCloud) and YouTube extraction fail often — handle errors in responses (`errors` field) instead of crashing
-- **SPA**: after JS edits, ensure the script parses (no duplicate `let MSTATE`, etc.)
-- **Music**: browser playback should use `/music/stream/{token}` (`play_url`), not expired Saavn CDN links
+- **Secrets**: no committed cookies, tokens, or private API keys; use env vars (`YT_MUSIC_COOKIE`, `YTDLP_COOKIES`, …)
+- **Providers change**: scrapers and YouTube extraction fail often — return structured `errors` instead of crashing
+- **Streaming**: prefer native CDN (InnerTube, Saavn, MovieBox DASH); then resolvers; then embeds
+- **Music in browser**: use `/music/stream/{token}` (`play_url`), not expired raw CDN links
+- **YT Music radio**: next queue uses `playlistId=RDAMVM{videoId}`
 
 ---
 
@@ -138,6 +151,6 @@ By contributing, you agree that your contributions are licensed under the same *
 
 ---
 
-Thank you for helping improve **StreamHub / MovieBox API**.
+Thank you for helping improve **StreamHub API**.
 
-**Maintainer:** Shawon · [github.com/Shawon727/Moviebox-API](https://github.com/Shawon727/Moviebox-API)
+**Maintainer:** Shawon · [github.com/Shawon727/StreamHub-Api](https://github.com/Shawon727/StreamHub-Api)
