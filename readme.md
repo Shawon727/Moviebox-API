@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/Version-5.x-orange?style=for-the-badge" alt="Version"/>
 </p>
 
-> **Made by Shawon** · Repo: [github.com/Shawon727/Moviebox-API](https://github.com/Shawon727/StreamHub-Api)
+> **Made by Shawon** · Repo: [github.com/Shawon727/StreamHub-Api](https://github.com/Shawon727/StreamHub-Api)
 
 ---
 
