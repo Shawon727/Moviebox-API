@@ -1,1 +1,857 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>StreamHub — Ultimate Movies & Anime</title>
+  <meta name="theme-color" content="#0a0a12" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            outfit: ['Outfit', 'sans-serif'],
+            space: ['Space Grotesk', 'sans-serif'],
+          },
+          colors: {
+            void: '#05050a',
+            surface: '#0c0c16',
+            card: '#12121f',
+            accent: '#7c5cfc',
+            cyan: '#22d3ee',
+            pink: '#f472b6',
+          },
+          boxShadow: {
+            glow: '0 0 40px rgba(124, 92, 252, 0.35)',
+            'glow-sm': '0 0 20px rgba(124, 92, 252, 0.25)',
+            card: '0 8px 32px rgba(0,0,0,0.45)',
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    :root {
+      --bg: #05050a;
+      --glass: rgba(18, 18, 31, 0.65);
+      --border: rgba(124, 92, 252, 0.18);
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: 'Outfit', system-ui, sans-serif;
+      background: var(--bg);
+      color: #e2e8f0;
+      min-height: 100dvh;
+      overflow-x: hidden;
+    }
+    /* Animated mesh background */
+    .mesh-bg {
+      position: fixed; inset: 0; z-index: -1;
+      background:
+        radial-gradient(ellipse 80% 50% at 20% -10%, rgba(124,92,252,0.18), transparent 50%),
+        radial-gradient(ellipse 60% 40% at 90% 10%, rgba(34,211,238,0.12), transparent 45%),
+        radial-gradient(ellipse 50% 30% at 50% 100%, rgba(244,114,182,0.08), transparent 40%),
+        #05050a;
+    }
+    .glass {
+      background: var(--glass);
+      backdrop-filter: blur(20px) saturate(1.4);
+      -webkit-backdrop-filter: blur(20px) saturate(1.4);
+      border: 1px solid var(--border);
+    }
+    .glass-strong {
+      background: rgba(12, 12, 22, 0.85);
+      backdrop-filter: blur(28px) saturate(1.5);
+      border: 1px solid rgba(124, 92, 252, 0.25);
+    }
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(124,92,252,0.4); border-radius: 99px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(124,92,252,0.7); }
+    /* Hide scrollbar for shelves */
+    .shelf-scroll { scrollbar-width: none; -ms-overflow-style: none; }
+    .shelf-scroll::-webkit-scrollbar { display: none; }
+    /* Card hover */
+    .poster-card {
+      transition: transform 0.35s cubic-bezier(0.22,1,0.36,1), box-shadow 0.35s ease;
+    }
+    .poster-card:hover {
+      transform: translateY(-8px) scale(1.03);
+      box-shadow: 0 20px 40px rgba(0,0,0,0.5), 0 0 30px rgba(124,92,252,0.2);
+    }
+    .poster-card img { transition: transform 0.5s ease; }
+    .poster-card:hover img { transform: scale(1.08); }
+    /* Skeleton */
+    @keyframes shimmer {
+      0% { background-position: -200% 0; }
+      100% { background-position: 200% 0; }
+    }
+    .skeleton {
+      background: linear-gradient(90deg, #12121f 25%, #1a1a2e 50%, #12121f 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.4s infinite linear;
+      border-radius: 12px;
+    }
+    /* Hero gradient overlay */
+    .hero-overlay {
+      background: linear-gradient(to top, #05050a 0%, rgba(5,5,10,0.7) 40%, transparent 70%),
+                  linear-gradient(to right, rgba(5,5,10,0.85) 0%, transparent 55%);
+    }
+    /* Player */
+    #player-wrap {
+      aspect-ratio: 16/9;
+      background: #000;
+      border-radius: 16px;
+      overflow: hidden;
+      position: relative;
+    }
+    #video-el, #iframe-player {
+      width: 100%; height: 100%; border: none; display: none;
+    }
+    #video-el.active, #iframe-player.active { display: block; }
+    /* Episode chip */
+    .ep-chip {
+      transition: all 0.2s ease;
+    }
+    .ep-chip:hover, .ep-chip.active {
+      background: linear-gradient(135deg, #7c5cfc, #22d3ee);
+      color: #fff;
+      border-color: transparent;
+      box-shadow: 0 0 20px rgba(124,92,252,0.4);
+    }
+    /* Server btn */
+    .server-btn.active {
+      background: linear-gradient(135deg, #7c5cfc, #6366f1);
+      border-color: transparent;
+      box-shadow: 0 0 16px rgba(124,92,252,0.45);
+    }
+    /* Nav active */
+    .nav-item.active {
+      color: #22d3ee;
+    }
+    .nav-item.active svg { stroke: #22d3ee; filter: drop-shadow(0 0 6px rgba(34,211,238,0.6)); }
+    /* Fade in */
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(16px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .fade-up { animation: fadeUp 0.45s ease forwards; }
+    /* Modal */
+    .modal-backdrop {
+      background: rgba(0,0,0,0.75);
+      backdrop-filter: blur(8px);
+    }
+    /* Toast */
+    .toast {
+      animation: fadeUp 0.3s ease;
+    }
+    /* Focus ring */
+    input:focus, button:focus-visible {
+      outline: 2px solid rgba(124,92,252,0.6);
+      outline-offset: 2px;
+    }
+  </style>
+</head>
+<body class="font-outfit antialiased">
+  <div class="mesh-bg"></div>
 
+  <!-- ========== TOP NAV ========== -->
+  <header id="top-nav" class="fixed top-0 inset-x-0 z-50 transition-all duration-300">
+    <div class="glass-strong mx-auto max-w-7xl px-4 sm:px-6 py-3 flex items-center gap-4">
+      <button id="logo-btn" class="flex items-center gap-2 group shrink-0">
+        <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-accent to-cyan flex items-center justify-center shadow-glow-sm">
+          <svg class="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.2"><path stroke-linecap="round" stroke-linejoin="round" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path stroke-linecap="round" stroke-linejoin="round" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        </div>
+        <span class="font-space font-bold text-lg tracking-tight bg-gradient-to-r from-white via-cyan to-accent bg-clip-text text-transparent hidden sm:block">StreamHub</span>
+      </button>
+
+      <div class="flex-1 max-w-xl relative">
+        <input id="search-input" type="search" placeholder="সার্চ করুন মুভি, অ্যানিমে, সিরিজ..." 
+          class="w-full bg-void/60 border border-white/10 rounded-2xl py-2.5 pl-11 pr-4 text-sm placeholder:text-slate-500 focus:border-accent/50 transition" />
+        <svg class="absolute left-3.5 top-1/2 -translate-y-1/2 w-4.5 h-4.5 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+      </div>
+
+      <nav class="hidden md:flex items-center gap-1">
+        <button data-view="home" class="nav-item active px-3 py-2 rounded-xl text-sm font-medium text-slate-300 hover:text-white transition">Home</button>
+        <button data-view="movies" class="nav-item px-3 py-2 rounded-xl text-sm font-medium text-slate-300 hover:text-white transition">Movies</button>
+        <button data-view="anime" class="nav-item px-3 py-2 rounded-xl text-sm font-medium text-slate-300 hover:text-white transition">Anime</button>
+      </nav>
+    </div>
+  </header>
+
+  <!-- ========== MAIN ========== -->
+  <main id="app" class="pt-20 pb-28 min-h-screen max-w-7xl mx-auto px-4 sm:px-6">
+
+    <!-- HOME VIEW -->
+    <section id="view-home" class="space-y-10">
+      <!-- Hero -->
+      <div id="hero" class="relative rounded-3xl overflow-hidden h-[42vw] min-h-[280px] max-h-[480px] glass">
+        <div class="skeleton w-full h-full absolute inset-0"></div>
+      </div>
+
+      <!-- Dynamic shelves -->
+      <div id="shelves" class="space-y-10">
+        <!-- populated by JS -->
+      </div>
+    </section>
+
+    <!-- SEARCH VIEW -->
+    <section id="view-search" class="hidden space-y-6">
+      <div class="flex items-center justify-between">
+        <h2 class="font-space text-2xl font-bold">Search Results</h2>
+        <button id="clear-search" class="text-sm text-slate-400 hover:text-white">Clear</button>
+      </div>
+      <div id="search-results" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4"></div>
+    </section>
+
+    <!-- DETAIL / PLAYER VIEW -->
+    <section id="view-detail" class="hidden space-y-6">
+      <button id="back-btn" class="flex items-center gap-2 text-slate-400 hover:text-white transition text-sm font-medium">
+        <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/></svg>
+        Back
+      </button>
+
+      <!-- Player -->
+      <div id="player-wrap" class="shadow-card">
+        <video id="video-el" controls playsinline crossorigin="anonymous"></video>
+        <iframe id="iframe-player" allowfullscreen allow="autoplay; encrypted-media; picture-in-picture"></iframe>
+        <div id="player-placeholder" class="absolute inset-0 flex flex-col items-center justify-center bg-void text-slate-400 gap-3">
+          <svg class="w-16 h-16 opacity-40" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.348a1.125 1.125 0 010 1.971l-11.54 6.347a1.125 1.125 0 01-1.667-.985V5.653z"/></svg>
+          <p class="text-sm">Select an episode & server to play</p>
+        </div>
+      </div>
+
+      <!-- Title + meta -->
+      <div id="detail-meta" class="space-y-3"></div>
+
+      <!-- Servers -->
+      <div>
+        <h3 class="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3">Servers</h3>
+        <div id="servers-list" class="flex flex-wrap gap-2"></div>
+      </div>
+
+      <!-- Episodes -->
+      <div>
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="text-sm font-semibold text-slate-400 uppercase tracking-wider">Episodes</h3>
+          <select id="season-select" class="bg-card border border-white/10 rounded-xl px-3 py-1.5 text-sm focus:border-accent/50"></select>
+        </div>
+        <div id="episodes-list" class="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-10 gap-2 max-h-64 overflow-y-auto pr-1"></div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Bottom mobile nav -->
+  <nav class="fixed bottom-0 inset-x-0 z-50 md:hidden glass-strong border-t border-white/5">
+    <div class="flex justify-around py-2">
+      <button data-view="home" class="nav-item active flex flex-col items-center gap-0.5 px-4 py-1 text-xs text-slate-400">
+        <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8"><path stroke-linecap="round" stroke-linejoin="round" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-4 0a1 1 0 01-1-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 01-1 1h-2z"/></svg>
+        Home
+      </button>
+      <button data-view="movies" class="nav-item flex flex-col items-center gap-0.5 px-4 py-1 text-xs text-slate-400">
+        <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8"><path stroke-linecap="round" stroke-linejoin="round" d="M7 4v16M17 4v16M3 8h4m10 0h4M3 12h18M3 16h4m10 0h4M4 20h16a1 1 0 001-1V5a1 1 0 00-1-1H4a1 1 0 00-1 1v14a1 1 0 001 1z"/></svg>
+        Movies
+      </button>
+      <button data-view="anime" class="nav-item flex flex-col items-center gap-0.5 px-4 py-1 text-xs text-slate-400">
+        <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8"><path stroke-linecap="round" stroke-linejoin="round" d="M14.828 14.828a4 4 0 01-5.656 0M9 10h.01M15 10h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        Anime
+      </button>
+      <button id="mobile-search-btn" class="flex flex-col items-center gap-0.5 px-4 py-1 text-xs text-slate-400">
+        <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8"><path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+        Search
+      </button>
+    </div>
+  </nav>
+
+  <!-- Toast -->
+  <div id="toast" class="fixed bottom-24 md:bottom-8 left-1/2 -translate-x-1/2 z-[100] hidden"></div>
+
+  <script>
+  /* ============================================================
+     StreamHub — Full Frontend powered by movieallshawon.vercel.app
+     ============================================================ */
+  const API = 'https://movieallshawon.vercel.app';
+  const $ = (s, el = document) => el.querySelector(s);
+  const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+
+  // State
+  let currentView = 'home';
+  let currentItem = null;
+  let currentSources = [];
+  let currentEpisodes = [];
+  let hls = null;
+  let searchTimeout = null;
+
+  // ---------- Utils ----------
+  function toast(msg, type = 'info') {
+    const t = $('#toast');
+    t.className = `fixed bottom-24 md:bottom-8 left-1/2 -translate-x-1/2 z-[100] toast glass-strong px-5 py-3 rounded-2xl text-sm font-medium shadow-glow ${type === 'error' ? 'border-pink/40 text-pink' : 'text-white'}`;
+    t.textContent = msg;
+    t.classList.remove('hidden');
+    setTimeout(() => t.classList.add('hidden'), 3200);
+  }
+
+  function escapeHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function decodeHtml(html) {
+    const t = document.createElement('textarea');
+    t.innerHTML = html || '';
+    return t.value;
+  }
+
+  async function api(path, params = {}) {
+    const url = new URL(API + path);
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, v);
+    });
+    try {
+      const res = await fetch(url.toString());
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      console.error('API error', path, e);
+      throw e;
+    }
+  }
+
+  // ---------- Navigation ----------
+  function showView(name) {
+    currentView = name;
+    ['home', 'search', 'detail'].forEach(v => {
+      const el = $(`#view-${v}`);
+      if (el) el.classList.toggle('hidden', v !== name);
+    });
+    $$('.nav-item').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.view === name || (name === 'home' && btn.dataset.view === 'home'));
+    });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  $$('[data-view]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const v = btn.dataset.view;
+      if (v === 'movies' || v === 'anime') {
+        showView('home');
+        loadHome(v);
+      } else {
+        showView(v);
+        if (v === 'home') loadHome();
+      }
+    });
+  });
+
+  $('#logo-btn').addEventListener('click', () => { showView('home'); loadHome(); });
+  $('#back-btn').addEventListener('click', () => { showView('home'); stopPlayer(); });
+  $('#clear-search').addEventListener('click', () => {
+    $('#search-input').value = '';
+    showView('home');
+  });
+  $('#mobile-search-btn').addEventListener('click', () => {
+    $('#search-input').focus();
+  });
+
+  // ---------- Poster Card ----------
+  function posterCard(item, large = false) {
+    const id = item.id || item.slug || item.link || '';
+    const title = decodeHtml(item.title || 'Untitled');
+    const poster = item.poster || item.thumb || item.banner || '';
+    const rating = item.rating ? Number(item.rating).toFixed(1) : '';
+    const year = item.year || '';
+    const type = (item.type || '').toLowerCase();
+    const isAnime = item.provider === 'hindianime' || type.includes('anime') || type === 'series' && item.provider === 'hindianime';
+
+    return `
+      <button class="poster-card group relative flex-shrink-0 w-[130px] sm:w-[150px] text-left rounded-2xl overflow-hidden bg-card shadow-card focus:outline-none"
+        data-id="${escapeHtml(id)}" data-slug="${escapeHtml(item.slug || '')}" data-provider="${escapeHtml(item.provider || 'cinestream')}" data-type="${escapeHtml(type)}" data-title="${escapeHtml(title)}">
+        <div class="relative aspect-[2/3] overflow-hidden bg-void">
+          ${poster ? `<img src="${escapeHtml(poster)}" alt="" loading="lazy" class="w-full h-full object-cover" onerror="this.style.display='none'" />` : '<div class="w-full h-full skeleton"></div>'}
+          <div class="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition"></div>
+          ${rating ? `<span class="absolute top-2 right-2 glass px-1.5 py-0.5 rounded-lg text-[10px] font-semibold text-cyan">${rating}</span>` : ''}
+        </div>
+        <div class="p-2.5">
+          <p class="text-xs font-medium line-clamp-2 leading-snug text-slate-200 group-hover:text-white transition">${escapeHtml(title)}</p>
+          <p class="text-[10px] text-slate-500 mt-0.5">${year}${type ? ' · ' + type : ''}</p>
+        </div>
+      </button>`;
+  }
+
+  function bindPosterClicks(container) {
+    container.querySelectorAll('.poster-card').forEach(btn => {
+      btn.addEventListener('click', () => {
+        openDetail({
+          id: btn.dataset.id,
+          slug: btn.dataset.slug,
+          provider: btn.dataset.provider,
+          type: btn.dataset.type,
+          title: btn.dataset.title
+        });
+      });
+    });
+  }
+
+  // ---------- Home ----------
+  async function loadHome(filter = 'all') {
+    showView('home');
+    const shelvesEl = $('#shelves');
+    const heroEl = $('#hero');
+    shelvesEl.innerHTML = `
+      <div class="space-y-4">
+        <div class="skeleton h-6 w-40"></div>
+        <div class="flex gap-3 overflow-hidden">
+          ${Array(6).fill('<div class="skeleton w-[130px] h-[220px] flex-shrink-0"></div>').join('')}
+        </div>
+      </div>`.repeat(3);
+
+    try {
+      const [csHome, animeHome, animeHero] = await Promise.all([
+        api('/cs/home').catch(() => null),
+        api('/anime/home').catch(() => null),
+        api('/anime/hero').catch(() => null)
+      ]);
+
+      // Hero
+      let heroItems = [];
+      if (animeHero?.items?.length) heroItems = animeHero.items;
+      else if (csHome?.shelves?.trending) heroItems = csHome.shelves.trending.slice(0, 5);
+      else if (animeHome?.top_airing) heroItems = animeHome.top_airing.slice(0, 5);
+
+      if (heroItems.length) {
+        const h = heroItems[0];
+        const bg = h.banner || h.poster || h.thumb || '';
+        heroEl.innerHTML = `
+          <img src="${escapeHtml(bg)}" class="absolute inset-0 w-full h-full object-cover" alt="" onerror="this.remove()" />
+          <div class="hero-overlay absolute inset-0"></div>
+          <div class="absolute bottom-0 left-0 right-0 p-6 sm:p-10 max-w-2xl">
+            <p class="text-cyan text-xs font-semibold tracking-widest uppercase mb-2">Featured</p>
+            <h1 class="font-space text-2xl sm:text-4xl font-bold leading-tight mb-3 drop-shadow-lg">${escapeHtml(decodeHtml(h.title))}</h1>
+            <p class="text-slate-300 text-sm line-clamp-2 mb-5 hidden sm:block">${escapeHtml(decodeHtml(h.overview || h.description || ''))}</p>
+            <button class="hero-play inline-flex items-center gap-2 bg-gradient-to-r from-accent to-cyan text-white font-semibold px-6 py-3 rounded-2xl shadow-glow hover:scale-105 transition"
+              data-id="${escapeHtml(h.id || h.slug || '')}" data-slug="${escapeHtml(h.slug || '')}" data-provider="${escapeHtml(h.provider || 'hindianime')}" data-title="${escapeHtml(h.title)}">
+              <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+              Watch Now
+            </button>
+          </div>`;
+        $('.hero-play', heroEl)?.addEventListener('click', (e) => {
+          const b = e.currentTarget;
+          openDetail({ id: b.dataset.id, slug: b.dataset.slug, provider: b.dataset.provider, title: b.dataset.title });
+        });
+      } else {
+        heroEl.innerHTML = `<div class="flex items-center justify-center h-full text-slate-500">No featured content</div>`;
+      }
+
+      // Build shelves
+      let html = '';
+
+      if (filter !== 'anime' && csHome?.shelves) {
+        const order = ['trending', 'popular', 'top_rated', 'fresh-drop', 'upcoming', 'hindi-dubbed'];
+        for (const key of order) {
+          const items = csHome.shelves[key];
+          if (!items?.length) continue;
+          const label = key.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+          html += shelfHTML(label, items);
+        }
+        // remaining
+        for (const [key, items] of Object.entries(csHome.shelves)) {
+          if (order.includes(key) || !items?.length) continue;
+          html += shelfHTML(key.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()), items);
+        }
+      }
+
+      if (filter !== 'movies' && animeHome) {
+        const map = [
+          ['top_airing', 'Top Airing'],
+          ['most_popular', 'Most Popular Anime'],
+          ['latest_episodes', 'Latest Episodes'],
+          ['latest_movies', 'Anime Movies'],
+          ['upcoming', 'Upcoming Anime'],
+          ['completed', 'Completed'],
+          ['popular_week', 'Popular This Week']
+        ];
+        for (const [key, label] of map) {
+          const items = animeHome[key];
+          if (items?.length) html += shelfHTML(label, items.map(i => ({ ...i, provider: i.provider || 'hindianime' })));
+        }
+      }
+
+      shelvesEl.innerHTML = html || '<p class="text-slate-500 text-center py-20">No content available</p>';
+      bindPosterClicks(shelvesEl);
+
+    } catch (e) {
+      console.error(e);
+      shelvesEl.innerHTML = `<p class="text-pink text-center py-20">Failed to load. Check your connection.</p>`;
+      toast('Failed to load home', 'error');
+    }
+  }
+
+  function shelfHTML(title, items) {
+    return `
+      <section class="fade-up">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="font-space text-lg sm:text-xl font-bold tracking-tight">${escapeHtml(title)}</h2>
+        </div>
+        <div class="shelf-scroll flex gap-3 overflow-x-auto pb-2 -mx-1 px-1">
+          ${items.slice(0, 24).map(i => posterCard(i)).join('')}
+        </div>
+      </section>`;
+  }
+
+  // ---------- Search ----------
+  $('#search-input').addEventListener('input', (e) => {
+    clearTimeout(searchTimeout);
+    const q = e.target.value.trim();
+    if (q.length < 2) {
+      if (currentView === 'search') showView('home');
+      return;
+    }
+    searchTimeout = setTimeout(() => doSearch(q), 400);
+  });
+
+  $('#search-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      clearTimeout(searchTimeout);
+      doSearch(e.target.value.trim());
+    }
+  });
+
+  async function doSearch(q) {
+    if (!q) return;
+    showView('search');
+    const box = $('#search-results');
+    box.innerHTML = Array(12).fill('<div class="skeleton aspect-[2/3] rounded-2xl"></div>').join('');
+
+    try {
+      const [cs, anime] = await Promise.all([
+        api('/cs/search', { q }).catch(() => null),
+        api('/anime/search', { q }).catch(() => null)
+      ]);
+      let items = [];
+      if (cs?.items) items = items.concat(cs.items.map(i => ({ ...i, provider: 'cinestream' })));
+      if (anime?.results) items = items.concat(anime.results.map(i => ({ ...i, provider: 'hindianime' })));
+      else if (anime?.items) items = items.concat(anime.items.map(i => ({ ...i, provider: 'hindianime' })));
+      else if (Array.isArray(anime)) items = items.concat(anime.map(i => ({ ...i, provider: 'hindianime' })));
+
+      // dedupe by title
+      const seen = new Set();
+      items = items.filter(i => {
+        const t = (i.title || '').toLowerCase();
+        if (seen.has(t)) return false;
+        seen.add(t);
+        return true;
+      });
+
+      if (!items.length) {
+        box.innerHTML = `<p class="col-span-full text-center text-slate-500 py-16">No results for “${escapeHtml(q)}”</p>`;
+        return;
+      }
+      box.innerHTML = items.map(i => posterCard(i)).join('');
+      bindPosterClicks(box);
+    } catch (e) {
+      box.innerHTML = `<p class="col-span-full text-center text-pink py-16">Search failed</p>`;
+      toast('Search failed', 'error');
+    }
+  }
+
+  // ---------- Detail + Player ----------
+  async function openDetail(item) {
+    currentItem = item;
+    showView('detail');
+    stopPlayer();
+    $('#detail-meta').innerHTML = `<div class="skeleton h-8 w-2/3 mb-2"></div><div class="skeleton h-4 w-1/2"></div>`;
+    $('#servers-list').innerHTML = '';
+    $('#episodes-list').innerHTML = Array(12).fill('<div class="skeleton h-10 rounded-xl"></div>').join('');
+    $('#season-select').innerHTML = '';
+
+    try {
+      let detail = null;
+      let episodes = [];
+
+      if (item.provider === 'hindianime' || (item.slug && !item.id?.startsWith('toon_'))) {
+        // Anime path
+        const slug = item.slug || item.id?.replace(/^https?:\/\/[^/]+\/series\//, '').replace(/\/$/, '') || '';
+        detail = await api(`/anime/detail/${encodeURIComponent(slug)}`);
+        if (detail?.seasons) {
+          const seasons = Object.keys(detail.seasons).sort((a,b) => a-b);
+          $('#season-select').innerHTML = seasons.map(s => `<option value="${s}">Season ${s}</option>`).join('');
+          episodes = detail.seasons[seasons[0]] || [];
+          currentEpisodes = detail.seasons;
+        } else if (detail?.episodes) {
+          episodes = detail.episodes;
+          currentEpisodes = { 1: episodes };
+          $('#season-select').innerHTML = '<option value="1">Season 1</option>';
+        }
+        renderDetailMeta(detail || item);
+        renderEpisodes(episodes, 'anime');
+      } else {
+        // CineStream path
+        const id = item.id;
+        detail = await api('/cs/detail', { id });
+        renderDetailMeta(detail || item);
+
+        const epData = await api('/cs/episodes', { animeId: id });
+        episodes = epData?.episodes || [];
+        currentEpisodes = {};
+        episodes.forEach(ep => {
+          const s = ep.season || 1;
+          if (!currentEpisodes[s]) currentEpisodes[s] = [];
+          currentEpisodes[s].push(ep);
+        });
+        const seasons = Object.keys(currentEpisodes).sort((a,b) => a-b);
+        $('#season-select').innerHTML = seasons.map(s => `<option value="${s}">Season ${s}</option>`).join('');
+        renderEpisodes(currentEpisodes[seasons[0]] || episodes, 'cs');
+      }
+
+      $('#season-select').onchange = () => {
+        const s = $('#season-select').value;
+        const list = currentEpisodes[s] || [];
+        const mode = item.provider === 'hindianime' ? 'anime' : 'cs';
+        renderEpisodes(list, mode);
+      };
+
+    } catch (e) {
+      console.error(e);
+      toast('Could not load details', 'error');
+      $('#detail-meta').innerHTML = `<h1 class="font-space text-2xl font-bold">${escapeHtml(item.title)}</h1><p class="text-pink text-sm">Failed to load full details</p>`;
+    }
+  }
+
+  function renderDetailMeta(d) {
+    const title = decodeHtml(d.title || currentItem.title || '');
+    const desc = decodeHtml(d.description || d.overview || '');
+    const genres = (d.genres || []).map(g => decodeHtml(g)).join(' · ');
+    const rating = d.rating ? Number(d.rating).toFixed(1) : '';
+    const year = d.year || '';
+    const status = d.status || '';
+    const eps = d.episode_count || d.episodes?.length || '';
+
+    $('#detail-meta').innerHTML = `
+      <h1 class="font-space text-2xl sm:text-3xl font-bold leading-tight">${escapeHtml(title)}</h1>
+      <div class="flex flex-wrap items-center gap-2 text-sm text-slate-400">
+        ${rating ? `<span class="text-cyan font-semibold">★ ${rating}</span>` : ''}
+        ${year ? `<span>${year}</span>` : ''}
+        ${status ? `<span class="px-2 py-0.5 rounded-full bg-white/5 text-xs">${escapeHtml(status)}</span>` : ''}
+        ${eps ? `<span>${eps} eps</span>` : ''}
+      </div>
+      ${genres ? `<p class="text-xs text-slate-500">${escapeHtml(genres)}</p>` : ''}
+      ${desc ? `<p class="text-sm text-slate-300 leading-relaxed max-w-3xl line-clamp-4">${escapeHtml(desc)}</p>` : ''}
+    `;
+  }
+
+  function renderEpisodes(list, mode) {
+    const box = $('#episodes-list');
+    if (!list?.length) {
+      box.innerHTML = '<p class="col-span-full text-slate-500 text-sm">No episodes found</p>';
+      return;
+    }
+    box.innerHTML = list.map((ep, idx) => {
+      const num = ep.episode || ep.ep || (idx + 1);
+      const title = ep.title || ep.name || `Ep ${num}`;
+      return `<button class="ep-chip glass rounded-xl px-2 py-2.5 text-xs font-medium text-center truncate border border-white/5"
+        data-season="${ep.season || 1}" data-episode="${num}" data-hash="${escapeHtml(ep.videoHash || '')}" data-url="${escapeHtml(ep.url || ep.streamUrl || '')}" data-mode="${mode}">
+        ${num}
+      </button>`;
+    }).join('');
+
+    box.querySelectorAll('.ep-chip').forEach(btn => {
+      btn.addEventListener('click', () => {
+        box.querySelectorAll('.ep-chip').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        loadServers(btn.dataset);
+      });
+    });
+
+    // Auto-select first
+    const first = box.querySelector('.ep-chip');
+    if (first) {
+      first.classList.add('active');
+      loadServers(first.dataset);
+    }
+  }
+
+  async function loadServers(ep) {
+    const serversEl = $('#servers-list');
+    serversEl.innerHTML = '<span class="text-slate-500 text-sm">Loading servers...</span>';
+    currentSources = [];
+
+    try {
+      let sources = [];
+
+      if (ep.mode === 'cs') {
+        const data = await api('/cs/stream', {
+          animeId: currentItem.id,
+          season: ep.season,
+          episode: ep.episode
+        });
+        sources = (data?.sources || []).map(s => ({
+          label: s.label || s.name || 'Server',
+          type: s.type || s.kind || 'iframe',
+          url: s.play_url || s.url
+        }));
+      } else {
+        // Anime: try stream + servers + hash
+        const params = {
+          slug: currentItem.slug || currentItem.id,
+          season: ep.season,
+          episode: ep.episode,
+          type: 'series'
+        };
+        if (ep.hash) params.hash = ep.hash;
+
+        const [streamRes, serversRes] = await Promise.all([
+          api('/anime/stream', params).catch(() => null),
+          api('/anime/servers', params).catch(() => null)
+        ]);
+
+        if (streamRes?.play_url || streamRes?.url) {
+          sources.push({
+            label: 'Native HLS',
+            type: 'hls',
+            url: streamRes.play_url || streamRes.url
+          });
+        }
+        if (serversRes?.servers) {
+          sources = sources.concat(serversRes.servers.map(s => ({
+            label: s.name || s.label || 'Server',
+            type: s.type || 'iframe',
+            url: s.url || s.play_url
+          })));
+        }
+        // Also try play/cdn
+        const cdn = await api('/play/cdn', {
+          title: currentItem.title,
+          type: 'series',
+          season: ep.season,
+          episode: ep.episode
+        }).catch(() => null);
+        if (cdn?.streams) {
+          sources = sources.concat(cdn.streams.map(s => ({
+            label: s.label || 'CDN',
+            type: s.type || 'hls',
+            url: s.url || s.direct
+          })));
+        }
+      }
+
+      // Fallback: try play/cdn always
+      if (!sources.length) {
+        const cdn = await api('/play/cdn', {
+          title: currentItem.title,
+          type: currentItem.type === 'movie' ? 'movie' : 'series',
+          season: ep.season || 1,
+          episode: ep.episode || 1
+        }).catch(() => null);
+        if (cdn?.streams) {
+          sources = cdn.streams.map(s => ({
+            label: s.label || 'CDN',
+            type: s.type || 'hls',
+            url: s.url || s.direct
+          }));
+        }
+      }
+
+      currentSources = sources.filter(s => s.url);
+      if (!currentSources.length) {
+        serversEl.innerHTML = '<span class="text-pink text-sm">No playable servers found</span>';
+        return;
+      }
+
+      serversEl.innerHTML = currentSources.map((s, i) => `
+        <button class="server-btn glass rounded-xl px-4 py-2 text-sm font-medium border border-white/10 hover:border-accent/40 transition ${i === 0 ? 'active' : ''}"
+          data-idx="${i}">${escapeHtml(s.label)}</button>
+      `).join('');
+
+      serversEl.querySelectorAll('.server-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          serversEl.querySelectorAll('.server-btn').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+          playSource(currentSources[Number(btn.dataset.idx)]);
+        });
+      });
+
+      // Auto play first
+      playSource(currentSources[0]);
+
+    } catch (e) {
+      console.error(e);
+      serversEl.innerHTML = '<span class="text-pink text-sm">Failed to load servers</span>';
+      toast('Server load failed', 'error');
+    }
+  }
+
+  function stopPlayer() {
+    if (hls) { hls.destroy(); hls = null; }
+    const video = $('#video-el');
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+    video.classList.remove('active');
+    const iframe = $('#iframe-player');
+    iframe.src = 'about:blank';
+    iframe.classList.remove('active');
+    $('#player-placeholder').style.display = 'flex';
+  }
+
+  function playSource(src) {
+    if (!src?.url) return;
+    stopPlayer();
+    $('#player-placeholder').style.display = 'none';
+
+    const url = src.url;
+    const isHls = src.type === 'hls' || url.includes('.m3u8') || url.includes('master');
+
+    if (isHls) {
+      const video = $('#video-el');
+      video.classList.add('active');
+      if (Hls.isSupported()) {
+        hls = new Hls({ enableWorker: true, lowLatencyMode: false });
+        hls.loadSource(url);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          video.play().catch(() => {});
+        });
+        hls.on(Hls.Events.ERROR, (_, data) => {
+          if (data.fatal) {
+            console.error('HLS fatal', data);
+            toast('Stream error — try another server', 'error');
+          }
+        });
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = url;
+        video.play().catch(() => {});
+      } else {
+        // fallback iframe
+        playIframe(url);
+      }
+    } else {
+      playIframe(url);
+    }
+  }
+
+  function playIframe(url) {
+    const iframe = $('#iframe-player');
+    iframe.classList.add('active');
+    iframe.src = url;
+  }
+
+  // ---------- Init ----------
+  loadHome();
+
+  // Scroll effect on nav
+  window.addEventListener('scroll', () => {
+    const nav = $('#top-nav');
+    if (window.scrollY > 20) nav.classList.add('shadow-lg');
+    else nav.classList.remove('shadow-lg');
+  }, { passive: true });
+  </script>
+</body>
+</html>
